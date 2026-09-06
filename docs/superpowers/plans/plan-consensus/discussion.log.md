@@ -47,3 +47,10 @@ Max kol: 10
 - IMPORTANT: merge_draft_and_guide výstup = finální názvy polí (cz/render/style/address) předvyplněné z draft suggested_*; apply_answer syntaxe "cz | alt1 | alt2" → accepted_alt; scout.chunk_chapters greedy packing pod SCOUT_CHUNK_WORD_LIMIT=40000 + CLI; cost guard new_limit >= spent+est; drift scheduling přesně (po done/flagged commitu, count % N); Task 16 validace vyjmenovat required pole.
 - NIT: test counts (Task 14→7, Task 11→7, Task 5→8).
 - Sporné: nic.
+
+## Kolo 6 — 2026-09-06T18:43:56Z
+- Codex: CHANGES_NEEDED (3 BLOCKING, 4 IMPORTANT) → round-6-codex.md
+- Claude: CHANGES_NEEDED (0 vlastních) → round-6-claude.md
+- BLOCKING: merge test vs interface rozpor (newguy render) → test opraven na "translate". chunk_chapters čekal objekt, CLI předává dict → přijímá oboje. validation PŘED apply_must_decide → nesmyslná odpověď se uloží → POST pořadí: answered-check → apply_must_decide → PLNÁ validace výsledku → save.
+- IMPORTANT: Task 11 code fence neuzavřený → doplněn. critic failure action:"note" nespustí flagged → explicitní critic_failed flag. scan ValueError bublá jako stacktrace → except (OutputTruncated,ValueError)→FatalRunError. must_decide routing testy jen term → přidány name/relationship/style/update-existing.
+- Sporné: nic.

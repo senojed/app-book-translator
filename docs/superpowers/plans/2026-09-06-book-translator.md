@@ -1160,7 +1160,7 @@ def test_merge_keeps_human_decisions(tmp_path):
     harry = [c for c in merged["characters"] if c["name_en"] == "Harry"][0]
     assert harry["render"] == "keep"  # lidské rozhodnutí zůstalo
     newguy = [c for c in merged["characters"] if c["name_en"] == "NewGuy"][0]
-    assert "render" not in newguy or newguy.get("render") in (None, "")  # nepotvrzené
+    assert newguy["render"] == "translate"  # předvyplněno z draft.suggested
 
 
 def test_prompt_block_has_no_cz_pairs(tmp_path):
@@ -1515,7 +1515,7 @@ git commit -m "feat: state questions (upsert_open_question), term_mentions, drif
 - Produces:
   - `SYSTEM_PROMPT` (konstanta) - instruuje vrátit čistý JSON dle §Scout výstupu, `must_decide` jako strukturované objekty
   - `scan_book(book_text: str, client: LLMClient, *, model=config.MODEL_SCOUT, max_tokens=config.MAX_TOKENS_SCOUT) -> dict` - jedno volání; když `completion.truncated` → `raise OutputTruncated` (scout truncated = fatal, řeší volající); parsuje `extract_json`; validuje že jsou klíče `characters/places/terms/relationships/style_notes/must_decide` (chybí → `ValueError`)
-  - `chunk_chapters(chapters: list, word_limit: int) -> list[str]` - deterministicky: greedy packing - přidávej `chapter.raw_text` do aktuálního chunku (spojené `"\n\n"`), dokud by přidáním další kapitoly chunk nepřesáhl `word_limit` slov (`len(text.split())`); pak nový chunk. Jedna kapitola delší než limit = vlastní chunk sama. `config.SCOUT_CHUNK_WORD_LIMIT = 40000` (přidat do Task 1 config).
+  - `chunk_chapters(chapters: list, word_limit: int) -> list[str]` - deterministicky: greedy packing. `raw = ch["raw_text"] if isinstance(ch, dict) else ch.raw_text` (přijímá dict/Row i objekt). Přidávej `raw` do aktuálního chunku (spojené `"\n\n"`), dokud by přidáním další kapitoly chunk nepřesáhl `word_limit` slov (`len(text.split())`); pak nový chunk. Jedna kapitola delší než limit = vlastní chunk sama. `config.SCOUT_CHUNK_WORD_LIMIT = 40000`.
   - `scan_chunks(chunks: list[str], client, **kw) -> dict` - volá `scan_book` na každý chunk, pak `merge_scout_facts`
   - `merge_scout_facts(partials: list[dict]) -> dict` - deterministicky, klíč je section-specific:
     - `characters` dedup dle `name_en.strip().casefold()`
@@ -1592,9 +1592,15 @@ def test_chunk_chapters_greedy_packs_under_limit():
     assert len(chunks) == 2
     assert len(chunks[0].split()) == 90
 
+
+def test_chunk_chapters_accepts_dict_rows():
+    rows = [{"raw_text": "slovo " * 20}, {"raw_text": "slovo " * 20}]
+    assert len(scout.chunk_chapters(rows, word_limit=100)) == 1
+```
+
 - [ ] **Step 2: Run to verify fail** — FAIL.
 - [ ] **Step 3: Implement `src/agents/scout.py`.**
-- [ ] **Step 4: Run to verify pass** — PASS (7 tests).
+- [ ] **Step 4: Run to verify pass** — PASS (8 tests).
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -1821,14 +1827,18 @@ git commit -m "feat: agents/critic (nezávislá revize, Finding s action routing
       Pak `state.commit_chapter_result(db, idx, translated_text=cz, revision_rounds=rounds,
       notes_json=json.dumps(findings, ensure_ascii=False), status=status,
       new_candidates=new_candidates, mentions=mentions, questions=questions)` JEDNOU.
-    - status: `needs_human` když je blocking `question` (translator severity=blocking); `flagged` když `has_revise_triggers(findings)` po vyčerpání `MAX_REVIZE`; jinak `done`
+    - status: `needs_human` když je blocking `question`; `flagged` když
+      `critic_failed OR has_revise_triggers(findings)` po vyčerpání `MAX_REVIZE`;
+      jinak `done`. `critic_failed` = bool flag nastavený v handleru chyby kritika
+      (viz níže) - pseudo-Finding s `action="note"` sám o sobě `flagged` nespustí.
     - **Chyby v `process_chapter`:** `FatalRunError` (z translatora i kritika) →
       NEchytat, propaguj (volající `run` → ukončí celý běh). `OutputTruncated` /
       `ValueError` z translatora → propaguj (→ kapitola `error`). `OutputTruncated`
       / `ValueError` / jiná výjimka z `critic.review` → chyť **až po**
-      `except FatalRunError: raise`, `status="flagged"`, findings dostane
+      `except FatalRunError: raise`; nastav `critic_failed = True`, přidej
       pseudo-Finding `{source:"critic", type:"fluency", severity:"critical",
-      action:"note", issue:"kritik selhal: <e>"}`
+      action:"note", issue:"kritik selhal: <e>"}` do findings (pro `notes`),
+      a přeruš revizní smyčku. Konečný status pak `flagged` (viz status pravidlo).
   - `run_drift_check(db_path, up_to_chapter: int) -> list[dict]` - načti `term_mentions` JOIN chapters WHERE status IN ('done','flagged') AND idx <= up_to_chapter; `concordance.check_drift(rows)`; `state.save_drift_report(db, up_to_chapter, {"drift": drifts})`; pro každý DriftFinding `state.upsert_open_question({chapter_idx: None, kind: "term", scope_key: term_id, text: "Drift: <formy>", guess_answer: <nejčastější tvar>, severity: "guess"})`
   - `has_revise_triggers(findings) -> bool` - `any(f["action"] == "revise" for f in findings)`
   - `_glossary_block(db)` / `_guide_block(guide)` - helpery pro promptové bloky (`glossary.as_prompt_block(db)`, `guide.guide_as_prompt_block(guide)`)
@@ -1948,6 +1958,18 @@ def test_critic_fatal_error_propagates_not_flagged(tmp_path, monkeypatch):
     assert state.get_chapter(db, 1)["status"] != "flagged"
 
 
+def test_critic_recoverable_failure_flags_chapter(tmp_path, monkeypatch):
+    db = _db(tmp_path)
+    monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
+        "překlad", [], [], []))
+    def boom(*a, **k): raise ValueError("rozbitý JSON od kritika")
+    monkeypatch.setattr(C, "review", boom)
+    out = pipeline.process_chapter(db, state.get_chapter(db, 1), client_factory=_factory,
+        guide={"characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    assert out["status"] == "flagged"
+    assert "kritik selhal" in state.get_chapter(db, 1)["notes"]
+
+
 def test_run_drift_check_creates_global_question(tmp_path):
     db = _db(tmp_path)
     with state.connect(db) as conn:
@@ -1986,7 +2008,7 @@ def test_commit_chapter_result_is_atomic(tmp_path):
 ```
 
 - [ ] **Step 3b: Implement `src/pipeline.py`.** Pipeline importuje `from src.agents import translator, critic` a `from src import concordance, glossary, guide as guide_mod, state, ingest` - agenty volá modulově-kvalifikovaně (`translator.translate_scene`) kvůli monkeypatch.
-- [ ] **Step 4: Run to verify pass** — PASS (7 pipeline testů + atomicity test).
+- [ ] **Step 4: Run to verify pass** — PASS (8 pipeline testů + atomicity test).
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -2051,7 +2073,7 @@ git commit -m "feat: pipeline (process_chapter, revizní smyčka, transakce A/B,
     - `scan [--chunked]` → `recover_processing`; `chs = state.chapters_by_status(db, ("pending","processing","done","flagged","needs_human","error"))` (všechny, ORDER BY idx); `cf = lambda a: PipelineLLMClient(AnthropicClient(), run_id=rid, agent=a, db_path=db, config_mod=config, interactive=False)`;
       - bez `--chunked`: `scout.scan_book("\n\n".join(c["raw_text"] for c in chs), cf("scout"))`
       - `--chunked`: `scout.scan_chunks(scout.chunk_chapters(chs, config.SCOUT_CHUNK_WORD_LIMIT), cf("scout"))`
-      `OutputTruncated` → `raise FatalRunError("scout výstup useknutý, zkus `scan --chunked` nebo zvyš MAX_TOKENS_SCOUT")`; jinak `guide.save_draft(config.GUIDE_DRAFT_PATH, result)`.
+      `except (OutputTruncated, ValueError) as e: raise FatalRunError(f"scout výstup je neúplný/rozbitý ({e}). Zkus `scan --chunked` nebo zvyš MAX_TOKENS_SCOUT.")`; jinak `guide.save_draft(config.GUIDE_DRAFT_PATH, result)`.
     - `run [--retry-flagged [IDX...]]` → `recover_processing`; `--retry-flagged` → `state.retry_flagged(db, idxs)`; `cf = lambda a: PipelineLLMClient(AnthropicClient(), run_id=rid, agent=a, db_path=db, config_mod=config, interactive=True)` (**`run` je interaktivní - cost guard se ptá; jen `scan` má `interactive=False`**); pro každou `queue_for_run(db)` kapitolu:
       ```
       try:
@@ -2301,7 +2323,11 @@ git commit -m "feat: CLI (init/scan/run/status/questions/answer/export) + requeu
     - každá `places` / `terms` položka: `name_en`/`term_en` neprázdné, `cz` neprázdné
     - každá `relationships` položka: `a`, `b` neprázdné, `address ∈ {tyka, vyka}`
     - každý `must_decide` s neprázdnou `question`: `answer` neprázdné
-  - `server.build_app(draft_path, guide_path, on_saved) -> FastAPI` - `GET /` → `index.html`; `GET /api/guide` → `merge_draft_and_guide`; `POST /api/guide` → `validate` → chyba `422`; jinak `apply_must_decide` → `save_guide` → `on_saved()` → `{"ok": true}`
+  - `server.build_app(draft_path, guide_path, on_saved) -> FastAPI` - `GET /` → `index.html`; `GET /api/guide` → `merge_draft_and_guide`; `POST /api/guide`:
+    1. `_check_must_decide_answered(payload)` - jen "každý must_decide má neprázdnou answer" → chyba `422`
+    2. `payload = apply_must_decide(payload)` - zapíše odpovědi do polí, smaže `must_decide`
+    3. `errs = validate(payload)` - PLNÁ schema validace VÝSLEDNÉHO payloadu (i address ∈ {tyka,vyka} atd. - chytí nesmyslnou must_decide odpověď) → chyba `422`
+    4. `save_guide` → `on_saved()` → `{"ok": true}`
   - `server.run_review_server(draft_path, guide_path) -> int` - uvicorn + `webbrowser.open`; po úspěšném POST `should_exit=True` → return 0; SIGINT/zavření bez uložení → return 1
   - `main` `review` subcommand: `with state.run_lock(config.LOCK_PATH):` → `rc = server.run_review_server(config.GUIDE_DRAFT_PATH, config.GUIDE_PATH)`; `if rc == 0: glossary.seed_from_guide(config.DB_PATH, guide.load_guide(config.GUIDE_PATH))` (reseed dělá CLI, ne UI - drží izolaci); `return rc`
 
@@ -2373,11 +2399,59 @@ def test_post_routes_must_decide_answer_into_terms(tmp_path):
     assert any(t["term_en"] == "The White Council" and t["cz"] == "Bílá rada"
                for t in saved["terms"])
     assert saved.get("must_decide", []) == []  # rozhodnutí zapsaná, must_decide pryč
+
+
+def _post(tmp_path, extra):
+    dp, gp = _paths(tmp_path)
+    app = server.build_app(dp, gp, on_saved=lambda: None)
+    base = {"characters": [], "places": [], "terms": [], "relationships": [],
+            "style": "", "rules": [], "must_decide": []}
+    base.update(extra)
+    return TestClient(app).post("/api/guide", json=base), gp
+
+
+def test_must_decide_name_routes_to_characters(tmp_path):
+    r, gp = _post(tmp_path, {"must_decide": [{"kind": "name", "scope_key": "Aria",
+        "question": "?", "answer": "Ária"}]})
+    assert r.status_code == 200
+    saved = json.load(open(gp, encoding="utf-8"))
+    c = [x for x in saved["characters"] if x["name_en"] == "Aria"][0]
+    assert c["render"] == "translate" and c["cz"] == "Ária"
+
+
+def test_must_decide_relationship_routes_and_rejects_invalid_answer(tmp_path):
+    ok, gp = _post(tmp_path, {"must_decide": [{"kind": "relationship",
+        "scope_key": "harry|murphy", "question": "?", "answer": "vyka"}]})
+    assert ok.status_code == 200
+    assert json.load(open(gp, encoding="utf-8"))["relationships"][0]["address"] == "vyka"
+    bad, _ = _post(tmp_path, {"must_decide": [{"kind": "relationship",
+        "scope_key": "a|b", "question": "?", "answer": "možná"}]})
+    assert bad.status_code == 422   # neplatný address chycen plnou validací PO apply
+
+
+def test_must_decide_style_routes_to_rules(tmp_path):
+    r, gp = _post(tmp_path, {"must_decide": [{"kind": "style", "scope_key": "",
+        "question": "?", "answer": "vypravěč je sarkastický"}]})
+    assert r.status_code == 200
+    assert "vypravěč je sarkastický" in json.load(open(gp, encoding="utf-8"))["rules"]
+
+
+def test_must_decide_updates_existing_term_not_duplicate(tmp_path):
+    dp, gp = _paths(tmp_path)
+    app = server.build_app(dp, gp, on_saved=lambda: None)
+    payload = {"characters": [], "places": [],
+               "terms": [{"term_en": "Council", "cz": "Rada"}],
+               "relationships": [], "style": "", "rules": [],
+               "must_decide": [{"kind": "term", "scope_key": "Council",
+                                "question": "?", "answer": "Koncil"}]}
+    assert TestClient(app).post("/api/guide", json=payload).status_code == 200
+    terms = json.load(open(gp, encoding="utf-8"))["terms"]
+    assert len(terms) == 1 and terms[0]["cz"] == "Koncil"
 ```
 
 - [ ] **Step 2: Run to verify fail** — FAIL (`httpx` v dev deps).
 - [ ] **Step 3: Implement `server.py` + minimal `index.html`** (vanilla JS: fetch `/api/guide`, sekce s `<select>`/`<input type=checkbox>`/`<textarea>`, must_decide zvýrazněné nahoře, "Ulož a zavři" → POST → na `ok` "hotovo, zavři okno").
-- [ ] **Step 4: Run to verify pass** — PASS (5 tests).
+- [ ] **Step 4: Run to verify pass** — PASS (9 tests).
 - [ ] **Step 5: Test CLI `review` reseed** — `tests/test_cli.py`:
 
 ```python
