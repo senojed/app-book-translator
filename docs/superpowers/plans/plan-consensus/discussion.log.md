@@ -54,3 +54,11 @@ Max kol: 10
 - BLOCKING: merge test vs interface rozpor (newguy render) → test opraven na "translate". chunk_chapters čekal objekt, CLI předává dict → přijímá oboje. validation PŘED apply_must_decide → nesmyslná odpověď se uloží → POST pořadí: answered-check → apply_must_decide → PLNÁ validace výsledku → save.
 - IMPORTANT: Task 11 code fence neuzavřený → doplněn. critic failure action:"note" nespustí flagged → explicitní critic_failed flag. scan ValueError bublá jako stacktrace → except (OutputTruncated,ValueError)→FatalRunError. must_decide routing testy jen term → přidány name/relationship/style/update-existing.
 - Sporné: nic.
+
+## Kolo 7 — 2026-09-06T18:50:44Z
+- Codex: CHANGES_NEEDED (2 BLOCKING, 6 IMPORTANT, 2 NIT) → round-7-codex.md
+- Claude: CHANGES_NEEDED (0 vlastních) → round-7-claude.md
+- BLOCKING: run nenačítá g=guide.load_guide → doplněno + test bez guide.json. apply_answer nedefinované scope_key → scope_key=q["scope_key"].
+- IMPORTANT: apply_answer ordering (guide atomicky → DB v jedné transakci); save_guide/save_draft atomické temp+os.replace; lock os.open(O_CREAT|O_EXCL) atomické; seed_from_guide u approved nesahá na cz/status/accepted_alt (jen aliasy); blocking scope_key neztrácí velikost písmen (jen strip, ne lower); count_tokens fail → len/2 konzervativní nadhad; scan lifecycle testy (truncated/bad json → fatal, žádný draft).
+- NIT: neparsovatelný lock ts = stale.
+- Sporné: nic.
