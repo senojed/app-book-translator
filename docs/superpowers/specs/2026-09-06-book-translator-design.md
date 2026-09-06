@@ -541,9 +541,11 @@ questions (id PK, chapter_idx NULL, kind, text, scope_key, guess_answer,
     kind:     term | name | relationship | style | other
     scope_key: term_id (term/name), relationship_key(a,b) (relationship),
       hash(text) (style/other) - nikdy NULL/"" aby UNIQUE fungoval
-      relationship_key(a,b) = "|".join(sorted(
-        normalize(resolve_surface(a)), normalize(resolve_surface(b))))
-      - používá se v scout merge, answer i questions, jedna definice
+      relationship_key(a,b) = "|".join(sorted(normalize(a), normalize(b)))
+      - jedna definice, používá se v scout merge, answer i questions
+      - **v1 omezení:** klíč je podle jména, ne přes resolve_surface (alias).
+        "Harry|Murphy" a "Dresden|Murphy" se nespárují. Přijatelné pro pilot;
+        alias-resolve případně později.
     severity: guess | blocking
     chapter_idx = NULL u globálních otázek (drift); jinak kapitola vzniku
     dedup jen mezi OTEVŘENÝMI otázkami - dva partial unique indexy

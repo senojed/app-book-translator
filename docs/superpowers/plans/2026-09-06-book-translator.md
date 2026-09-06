@@ -698,8 +698,8 @@ git commit -m "feat: llm/client (LLMClient protocol, AnthropicClient, FakeLLMCli
   - `state.record_llm_call(db, *, run_id, agent, provider, model, input_tokens, output_tokens, cost_usd, truncated, status, error_class)`
   - `state.spent_so_far(db, run_id) -> float` - suma `cost_usd` (NULL = 0) přes daný run
   - `state.get_run_spend_ceiling(db, run_id) -> float | None`, `state.set_run_spend_ceiling(db, run_id, value)`
-  - `client.PipelineLLMClient(inner, *, run_id, agent, db_path, config_mod, confirm=input)` - implementuje `LLMClient`. `confirm` je injektovatelná funkce pro cost guard prompt (default `input`), aby šla testovat.
-  - Cost guard: efektivní strop = `max(config.MAX_SPEND_USD, ceiling or 0)`. Odhad = `count_tokens(system,user)/1e6*price_in + max_tokens/1e6*price_out`. `spent_so_far + odhad > strop` → zavolej `confirm(prompt)`; prázdná odpověď → `FatalRunError`; číslo → `set_run_spend_ceiling`.
+  - `client.PipelineLLMClient(inner, *, run_id, agent, db_path, config_mod, confirm=input, interactive=True)` - implementuje `LLMClient`. `confirm` = injektovatelná funkce pro cost guard prompt (default `input`), testovatelnost. `interactive=False` (pro `scan`) → cost guard se neptá, rovnou `FatalRunError`.
+  - Cost guard: efektivní strop = `max(config.MAX_SPEND_USD, ceiling or 0)`. Odhad = `count_tokens(system,user)/1e6*price_in + max_tokens/1e6*price_out`. `spent_so_far + odhad > strop`: pokud `interactive` → `confirm(prompt)`, prázdná odpověď → `FatalRunError`, číslo → `set_run_spend_ceiling`; pokud `not interactive` → rovnou `FatalRunError`.
   - `complete` volá `inner.complete` v `try/finally`; ve `finally` `record_llm_call` (status `ok`/`truncated`/`error`, error_class u výjimky, tokeny/cost NULL u výjimky). Truncated NEvyhazuje - vrací `Completion(truncated=True)`; rozhodnutí co s tím dělá volající (translator agent / pipeline).
 
 - [ ] **Step 1: Write failing tests** — `tests/test_pipeline_client.py`
@@ -771,6 +771,17 @@ def test_cost_guard_new_ceiling_persists_and_stops_asking(tmp_path, monkeypatch)
     c.complete(system="s", user="u", max_tokens=10, model="claude-sonnet-5")
     assert calls["n"] == 1  # zeptá se jen jednou
     assert state.get_run_spend_ceiling(db, rid) == 999.0
+
+
+def test_cost_guard_non_interactive_hard_stops(tmp_path, monkeypatch):
+    db = _db(tmp_path)
+    rid = state.create_run(db, "scan")
+    monkeypatch.setattr(config, "MAX_SPEND_USD", 0.0)
+    c = PipelineLLMClient(FakeLLMClient([Completion("x", False, 1, 1)]),
+                          run_id=rid, agent="scout", db_path=db,
+                          config_mod=config, interactive=False)
+    with pytest.raises(FatalRunError):
+        c.complete(system="s", user="u", max_tokens=10, model="claude-sonnet-5")
 ```
 
 - [ ] **Step 2: Run to verify fail** — `python -m pytest tests/test_pipeline_client.py -v` → FAIL.
@@ -827,13 +838,14 @@ def set_run_spend_ceiling(db_path: str, run_id: int, value: float) -> None:
 ```python
 class PipelineLLMClient:
     def __init__(self, inner: LLMClient, *, run_id: int, agent: str,
-                 db_path: str, config_mod, confirm=input):
+                 db_path: str, config_mod, confirm=input, interactive: bool = True):
         self._inner = inner
         self._run_id = run_id
         self._agent = agent
         self._db = db_path
         self._cfg = config_mod
         self._confirm = confirm
+        self._interactive = interactive
 
     def count_tokens(self, *, system: str, user: str, model: str) -> int:
         return self._inner.count_tokens(system=system, user=user, model=model)
@@ -855,6 +867,10 @@ class PipelineLLMClient:
         limit = max(self._cfg.MAX_SPEND_USD, ceiling)
         if spent + est <= limit:
             return
+        if not self._interactive:
+            raise FatalRunError(
+                f"Cost guard: strop ${limit:.2f} překročen (utraceno ~${spent:.2f} "
+                f"+ odhad ~${est:.2f}). Non-interactive režim, zastavuji.")
         ans = self._confirm(
             f"Cost guard: utraceno ~${spent:.2f}, odhad tohoto volání ~${est:.2f}, "
             f"strop ${limit:.2f}. Nový strop v $ [prázdné = stop]: ")
@@ -893,7 +909,7 @@ Poznámka: `from src import state` uvnitř metod (ne top-level) je záměr - `cl
 nesmí mít `state` jako top-level import kvůli hranicím modulů a možnému cyklu
 (state nezná client, client zná state jen pro logging). Lazy import to řeší.
 
-- [ ] **Step 5: Run to verify pass** — `python -m pytest tests/test_pipeline_client.py tests/test_state_schema.py -v` → PASS.
+- [ ] **Step 5: Run to verify pass** — `python -m pytest tests/test_pipeline_client.py tests/test_state_schema.py -v` → PASS (5 pipeline_client testů + schema testy).
 
 - [ ] **Step 6: Commit**
 
@@ -993,7 +1009,7 @@ def test_as_prompt_block_separates_candidate(tmp_path):
 
 - [ ] **Step 3: Implement `src/glossary.py`** (logika nad `state.connect`; `slugify` regex; JSON parse/serialize `aliases`/`accepted_alt`; `resolve_surface` čte všechny řádky a porovnává `canonical_en.lower()` + každý alias `.lower()`).
 
-- [ ] **Step 4: Run to verify pass** — PASS (5 tests).
+- [ ] **Step 4: Run to verify pass** — PASS (6 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -1015,7 +1031,7 @@ git commit -m "feat: glossary (SQLite, deterministické term_id, párování pod
 - Produces:
   - `normalize(name: str) -> str` - lower + strip
   - `relationship_key(a: str, b: str) -> str` - `"|".join(sorted([normalize(a), normalize(b)]))`. **v1 omezení:** klíč je podle jména, ne přes `resolve_surface` (alias-resolve). Když scout jednou napíše "Harry" a jindy "Dresden" pro tutéž dvojici, klíče se nespárují. Přijatelné pro pilot; alias-resolve případně později.
-  - `load_guide(path) -> dict` - vrací `{"characters":[], "places":[], "terms":[], "relationships":[], "style":"", "rules":[]}` když soubor chybí
+  - `load_guide(path) -> dict` - vrací plný shape `{"characters":[], "places":[], "terms":[], "relationships":[], "style":"", "rules":[]}` když soubor chybí. **I když soubor existuje** ale nemá některý klíč (starší tvar), `load_guide` ho doplní defaultem před vrácením (žádný `KeyError` downstream).
   - `save_guide(path, guide: dict) -> None`
   - `load_draft(path) -> dict` - výstup scouta (bohatší), default `{"characters":[], "places":[], "terms":[], "relationships":[], "style_notes":"", "must_decide":[]}`
   - `merge_draft_and_guide(draft: dict, guide: dict) -> dict` - pro GET /api/guide: lidská rozhodnutí z `guide` mají přednost, nové položky z `draft` se přidají jako nepotvrzené (`suggested`/`note` zůstávají, `render`/`cz`/`address` nevyplněné). Sekce: `characters` (klíč `name_en`), `places` (`name_en`), `terms` (`term_en`), `relationships` (`relationship_key`), `style`, `must_decide`.
@@ -1046,6 +1062,14 @@ def test_merge_carries_draft_terms(tmp_path):
          "style": "", "rules": []}
     merged = guide.merge_draft_and_guide(draft, g)
     assert any(t["term_en"] == "Nevernever" for t in merged["terms"])
+
+
+def test_load_guide_normalizes_partial_existing_file(tmp_path):
+    import json
+    p = str(tmp_path / "g.json")
+    json.dump({"characters": [{"name_en": "X"}]}, open(p, "w", encoding="utf-8"))
+    g = guide.load_guide(p)   # starý tvar bez terms/places/...
+    assert g["terms"] == [] and g["places"] == [] and g["rules"] == []
 
 
 def test_save_and_load_roundtrip(tmp_path):
@@ -1086,7 +1110,7 @@ def test_prompt_block_has_no_cz_pairs(tmp_path):
 
 - [ ] **Step 2: Run to verify fail** — FAIL.
 - [ ] **Step 3: Implement `src/guide.py`** (json load/save s `ensure_ascii=False, indent=2`; merge iteruje sekce, klíč = `name_en` / `relationship_key`).
-- [ ] **Step 4: Run to verify pass** — PASS (6 tests).
+- [ ] **Step 4: Run to verify pass** — PASS (8 tests).
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -1694,7 +1718,27 @@ git commit -m "feat: agents/critic (nezávislá revize, Finding s action routing
     - Krok 2: `split_into_scenes(chapter["raw_text"], config.CHAPTER_SPLIT_WORD_THRESHOLD)` → per scéna `translator.translate_scene(scene, guide_block, glossary_block, client_factory("translator"))`; agregace: `new_terms` union podle `term_en.casefold()`, `questions` concat, `rendered_terms` = list `{term_id, cz_as_used, scene_idx}` (pipeline doplní `scene_idx`)
     - Krok 3-4: `concordance.check_chapter(en, cz, glossary.all_terms(db), rendered_terms)` + `critic.review(en, cz, client_factory("critic"))` → `findings` = spojený list
     - Krok 5: `while has_revise_triggers(findings) and rounds < config.MAX_REVIZE`: `translator.revise_chapter(en, cz, [f for f in findings if f["action"]=="revise"], guide_block, glossary_block, client_factory("translator"))` → nový `cz`; jeho metadata NAHRADÍ agregát (`rendered_terms`, `questions`), `new_terms` se kumulují; `check_chapter` + `review` znovu; `rounds += 1`
-    - Krok 6-8 (**transakce B**): PŘED transakcí pipeline: (a) ověř `rendered_terms` substringem proti finálnímu `cz`, neověřené zahoď; (b) `mentions = concordance.build_mentions(en, cz, glossary.all_terms(db), rendered_terms_ověřené)`; (c) pro každý `new_term` `glossary.resolve_surface(db, term_en)` → shoda: přeskoč; jinak přidej do `new_candidates` s `term_id="cand_"+glossary.slugify(term_en)` a přidej question `{chapter_idx: idx, kind:"term", scope_key: term_id, text:..., guess_answer: cz, severity:"guess"}`; (d) posbírej `questions` = translator guess/blocking + Findings s `action=="question"` (→ `{chapter_idx: idx, kind:"term", scope_key: f["term_id"], guess_answer: f["actual"], severity:"guess", text: f["issue"]}`) + new-term questions. Pak `state.commit_chapter_result(db, idx, translated_text=cz, revision_rounds=rounds, notes_json=json.dumps(findings, ensure_ascii=False), status=status, new_candidates=new_candidates, mentions=mentions, questions=questions)` JEDNOU.
+    - Krok 6-8 (**transakce B**): PŘED transakcí pipeline:
+      (a) ověř `rendered_terms` substringem proti finálnímu `cz`, neověřené zahoď;
+      (b) pro každý `new_term` `glossary.resolve_surface(db, term_en)` → shoda: přeskoč;
+          jinak přidej do `new_candidates` řádek `{term_id: "cand_"+glossary.slugify(term_en),
+          canonical_en: term_en, aliases: [], cz: nt["cz"], accepted_alt: [],
+          note: nt.get("note",""), type: nt.get("type","term"), status: "candidate"}`
+          a question `{chapter_idx: idx, kind:"term", scope_key: term_id,
+          text: "Nový termín ... → ...?", guess_answer: nt["cz"], severity:"guess"}`;
+      (c) `glossary_rows = glossary.all_terms(db) + new_candidates`;
+      (d) `mentions = concordance.build_mentions(en, cz, glossary_rows, rendered_terms_ověřené)`;
+          navíc pro KAŽDÝ `new_candidate` přidej explicitní mention
+          `{term_id, cz_form: nt["cz"], chapter_idx: idx, scene_idx: None,
+          source: "rendered"}` (translator ho v téhle kapitole použil - víme to
+          jistě; nespoléhat na to, že jeho EN povrch je v `en` textu, requeue ho
+          jinak nenajde);
+      (e) `questions` = translator guess/blocking + Findings s `action=="question"`
+          (→ `{chapter_idx: idx, kind:"term", scope_key: f["term_id"], guess_answer: f["actual"],
+          severity:"guess", text: f["issue"]}`) + new-term questions z (b).
+      Pak `state.commit_chapter_result(db, idx, translated_text=cz, revision_rounds=rounds,
+      notes_json=json.dumps(findings, ensure_ascii=False), status=status,
+      new_candidates=new_candidates, mentions=mentions, questions=questions)` JEDNOU.
     - status: `needs_human` když je blocking `question` (translator severity=blocking); `flagged` když `has_revise_triggers(findings)` po vyčerpání `MAX_REVIZE`; jinak `done`
     - `OutputTruncated`/`ValueError` z translatora → propaguj (volající `run` → kapitola `error`); z `critic.review` → chyť, `status="flagged"`, findings dostane pseudo-Finding `{source:"critic", type:"fluency", severity:"critical", action:"note", issue:"kritik selhal: <e>"}`
   - `run_drift_check(db_path, up_to_chapter: int) -> list[dict]` - načti `term_mentions` JOIN chapters WHERE status IN ('done','flagged') AND idx <= up_to_chapter; `concordance.check_drift(rows)`; `state.save_drift_report(db, up_to_chapter, {"drift": drifts})`; pro každý DriftFinding `state.upsert_open_question({chapter_idx: None, kind: "term", scope_key: term_id, text: "Drift: <formy>", guess_answer: <nejčastější tvar>, severity: "guess"})`
@@ -1788,9 +1832,12 @@ def test_new_term_creates_candidate_and_question(tmp_path, monkeypatch):
     pipeline.process_chapter(db, ch, client_factory=_factory, guide={
         "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
     terms = glossary.all_terms(db)
-    assert any(t["canonical_en"] == "Nevernever" and t["status"] == "candidate"
-               for t in terms)
+    cand = [t for t in terms if t["canonical_en"] == "Nevernever"]
+    assert cand and cand[0]["status"] == "candidate"
     assert any(q["kind"] == "term" for q in state.unanswered_questions(db))
+    # nový kandidát MUSÍ mít term_mentions řádek (jinak ho requeue nenajde),
+    # i když jeho EN povrch není v EN textu kapitoly
+    assert state.chapters_mentioning_term(db, cand[0]["term_id"]) == [1]
 
 
 def test_processing_recovered_before_next_run(tmp_path, monkeypatch):
@@ -1864,23 +1911,36 @@ git commit -m "feat: pipeline (process_chapter, revizní smyčka, transakce A/B,
     3. blocking: `state.set_status(chapter_idx, "pending")` jen když `not state.chapter_has_open_blocking(chapter_idx)`
     4. guess & `answer != guess_answer`: spočti `affected_chapters` (term/name → `state.chapters_mentioning_term(scope_key)`; relationship → done/flagged kde obě jména v `raw_text`; style/other → done/flagged s `idx >= chapter_idx`), každou `set_status("pending")`
     Vrací `{"requeued": [idx...], "chapter_status_changed": bool}`
-  - `main.main(argv=None) -> int` - argparse subcommands. `main()` první řádek: `_bootstrap_stdout()`. Každý mutující příkaz: `with state.run_lock(config.LOCK_PATH):`. `run`/`scan`: `rid = state.create_run(db, cmd)`; celé tělo v `try/except/finally`, `finally: state.finish_run(db, rid, status)` kde `status ∈ {"ok","fatal","interrupted"}` (nikdy nezůstane run bez `ended_at`).
-    - `init PATH` → `ingest.load_book` + `state.seed_chapters` (žádný run/klient)
-    - `scan [--chunked]` → `recover_processing`; načti `raw_text` všech kapitol, spoj; `client_factory("scout")`; `scout.scan_book` nebo `scan_chunks`; `OutputTruncated` → vypiš "scout výstup useknutý, zkus `scan --chunked` nebo zvyš MAX_TOKENS_SCOUT", `finish_run(rid,"fatal")`, return 1; jinak zapiš `guide.draft.json`, `finish_run(rid,"ok")`
-    - `run [--retry-flagged [IDX...]]` → `recover_processing`; `--retry-flagged` → `state.retry_flagged(db, idxs)`; pro každou `queue_for_run(db)` kapitolu:
+  - `main.main(argv=None) -> int` - argparse subcommands. `main()` první řádek: `_bootstrap_stdout()`. Každý mutující příkaz: `with state.run_lock(config.LOCK_PATH):`.
+  - **Jednotný lifecycle pattern pro `run`/`scan`** (závazný, jeden `finish_run`):
+    ```
+    rid = state.create_run(db, cmd)
+    status = "fatal"           # pesimistický default
+    try:
+        ... tělo příkazu ...
+        status = "ok"          # jen po úspěchu
+        return 0
+    except FatalRunError as e:
+        print(e); return 1     # status zůstane "fatal"
+    except KeyboardInterrupt:
+        status = "interrupted"; raise
+    finally:
+        state.finish_run(db, rid, status)   # JEDINÝ finish_run
+    ```
+    - `init PATH` → `ingest.load_book` + `state.seed_chapters` (žádný run/klient, žádný lifecycle)
+    - `scan [--chunked]` → `recover_processing`; načti `raw_text` všech kapitol, spoj; `cf = lambda a: PipelineLLMClient(AnthropicClient(), run_id=rid, agent=a, db_path=db, config_mod=config, interactive=False)`; `scout.scan_book(text, cf("scout"))` nebo `scan_chunks`; `OutputTruncated` → `raise FatalRunError("scout výstup useknutý, zkus `scan --chunked` nebo zvyš MAX_TOKENS_SCOUT")`; jinak zapiš `guide.draft.json`. (cost guard přes strop u `interactive=False` sám vyhodí `FatalRunError`.)
+    - `run [--retry-flagged [IDX...]]` → `recover_processing`; `--retry-flagged` → `state.retry_flagged(db, idxs)`; `cf` jako u `scan`; pro každou `queue_for_run(db)` kapitolu:
       ```
       try:
           summary = pipeline.process_chapter(db, ch, client_factory=cf, guide=g)
       except FatalRunError:
-          state.finish_run(db, rid, "fatal"); raise   # ukonči celý run, exit 1
-      except (OutputTruncated, ValueError) as e:
+          raise                        # bublá do lifecycle try, status zůstane "fatal", exit 1
+      except (OutputTruncated, ValueError, Exception) as e:
           state.update_chapter(db, ch["idx"], status="error",
-                               notes=json.dumps({"error": f"{type(e).__name__}: {e}"}))
-      except Exception as e:
-          state.update_chapter(db, ch["idx"], status="error",
-                               notes=json.dumps({"error": f"{type(e).__name__}: {e}"}))
+                               notes=json.dumps({"error": f"{type(e).__name__}: {e}"},
+                                                ensure_ascii=False))
       ```
-      **Pořadí `except` je závazné - `FatalRunError` PRVNÍ** (je to `Exception`, naivní `except Exception` by fatal chyby označil jako `error` kapitoly). Každých `config.CROSS_REF_EVERY_N` hotových kapitol → `pipeline.run_drift_check(db, ch["idx"])`. Na konci: report (`state.counts_by_status`) + `_print_usage(db, rid)` (suma z `llm_calls`), `finish_run(db, rid, "ok")`.
+      **Pořadí `except` je závazné - `FatalRunError` PRVNÍ a jen `raise`** (je to `Exception`; `except Exception` by fatal chybu jinak označil jako `error` kapitoly). Nechytat `KeyboardInterrupt` tady - patří do lifecycle. Každých `config.CROSS_REF_EVERY_N` hotových kapitol → `pipeline.run_drift_check(db, ch["idx"])`. Po smyčce: report (`state.counts_by_status`) + `_print_usage(db, rid)` (suma z `llm_calls`). `finish_run` řeší lifecycle `finally`.
     - `questions` → vypiš `state.unanswered_questions`
     - `answer QID TEXT` → `requeue.apply_answer`, vypiš co se requeue
     - `status` → `state.counts_by_status` + seznam s markery (`OK/../!!/??/XX/~~` pro done/pending/flagged/needs_human/error/processing)
@@ -1938,6 +1998,32 @@ def test_blocking_answer_requeues_only_after_last_blocking(tmp_path):
     requeue.apply_answer(db, gp, q1, "Alice")
     assert state.get_chapter(db, 1)["status"] == "needs_human"  # ještě q2
     requeue.apply_answer(db, gp, q2, "Bob")
+    assert state.get_chapter(db, 1)["status"] == "pending"
+
+
+def test_process_chapter_then_answer_requeues_original_chapter(tmp_path, monkeypatch):
+    """End-to-end: pipeline vytvoří kandidáta + mention, answer != guess → kapitola pending."""
+    from src import pipeline, glossary
+    from src.agents import translator as T, critic as C
+    db = str(tmp_path / "s.sqlite3"); state.init_db(db)
+    gp = str(tmp_path / "guide.json")
+    guide.save_guide(gp, {"characters": [], "places": [], "terms": [],
+                          "relationships": [], "style": "", "rules": []})
+    state.seed_chapters(db, [type("Ch", (), {"index": 1, "title": "K1",
+                                             "raw_text": "Foo appeared."})()])
+    monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
+        "Fů se objevil.", [{"term_en": "Foo", "cz": "Fů", "note": "", "type": "term"}],
+        [], []))
+    monkeypatch.setattr(C, "review", lambda *a, **k: [])
+    def cf(_a):
+        from src.llm.client import FakeLLMClient, Completion
+        return FakeLLMClient([Completion("x", False, 1, 1)])
+    pipeline.process_chapter(db, state.get_chapter(db, 1), client_factory=cf,
+                             guide=guide.load_guide(gp))
+    q = [x for x in state.unanswered_questions(db) if x["kind"] == "term"][0]
+    assert q["guess_answer"] == "Fů"
+    out = requeue.apply_answer(db, gp, q["id"], "Fúa")   # jiné než guess
+    assert 1 in out["requeued"]
     assert state.get_chapter(db, 1)["status"] == "pending"
 ```
 
