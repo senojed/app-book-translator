@@ -23,3 +23,11 @@ Max kol: 10
 - IMPORTANT: relationship_key plán vs spec rozpor → SPEC upraven (bez resolve_surface, v1 omezení, plán+spec souhlasí). load_guide KeyError na chybějícím terms → load_guide normalizuje plný shape i pro starý soubor. cost guard scan má tvrdě zastavit → PipelineLLMClient interactive param (False = FatalRunError bez ptaní), scan/run předává interactive=False. Task 14 chybí requeue-po-kandidátovi test → end-to-end test v Task 15.
 - NIT: test counts Task 6→6, Task 7→8, Task 5 doplněn.
 - Sporné: nic.
+
+## Kolo 3 — 2026-09-06T18:26:20Z
+- Codex: CHANGES_NEEDED (3 BLOCKING, 3 IMPORTANT, 2 NIT) → round-3-codex.md
+- Claude: CHANGES_NEEDED (0 vlastních) → round-3-claude.md
+- BLOCKING: run používal interactive=False (jako scan) → run=interactive=True, jen scan hard-stop. apply_answer promote na scope_key blocking otázek co nejsou term_id → blocking scope_key = povrch, apply_answer má resolve_term_or_surface + add_approved (nové glossary helpery). must_decide odpovědi se nikam nezapisovaly → server.apply_must_decide routuje do terms/characters/relationships/rules podle kind, pak must_decide smaže.
+- IMPORTANT: nové termíny v kapitole exempt z concordance té kapitoly (v1 chování explicitní); review reseed automatizovaný test (monkeypatch run_review_server 0/1); INSERT + IntegrityError remap místo INSERT OR IGNORE (visící FK).
+- NIT: nt/cand naming sjednoceno; test count review UI.
+- Sporné: nic.
