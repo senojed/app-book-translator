@@ -50,3 +50,9 @@ Max kol: 10
 - Claude: CHANGES_NEEDED (0 vlastních) → round-7-claude.md
 - Vše schema precision, ne architektura. Opraveno: glossary term_id PK + canonical_en + aliases JSON (proteklo do term_mentions FK, DriftFinding, questions.scope_key, Mention); rendered_terms = seznam výskytů {term_id,cz_as_used,scene_idx} bez last-wins; questions.scope_key="" sentinel místo NULL (SQL UNIQUE s NULL nefunguje); questions.chapter_idx nullable + partial UNIQUE pro globální drift otázky; PipelineLLMClient loguje ve finally (status ok/truncated/error, error_class, tokeny nullable) - selhaná volání nezmizí z auditu; transakce A (krok 0) / LLM mimo / transakce B (kroky 6-8) explicitně; pilot checklist: ověřit model+ceny proti docs.
 - Sporné: nic.
+
+## Kolo 8 — 2026-09-06T16:11:57Z
+- Codex: CHANGES_NEEDED (1 BLOCKING, 5 IMPORTANT, 2 NIT) → round-8-codex.md
+- Claude: CHANGES_NEEDED (0 vlastních) → round-8-claude.md
+- Vše precizace term_id/schema, architektura beze změny 4 kola. Opraveno: prompt glosáře nese term_id + translator hlásí rendered_terms přes term_id (dotažení kola 7); term_mentions = 1 řádek/výskyt + scene_idx + source(rendered|detected|omission); scope_key style/other = hash(text) ne ""; partial UNIQUE jen WHERE answer IS NULL (zodpovězená otázka neblokuje novou); llm_calls +error_class +status ok/truncated/error; fatal/kanárek wording sjednocen; glossary API na term_id + resolve_surface(); review server exit-code jako signál pro reseed.
+- Sporné: nic. Doporučeno kolo 9 jako finální sweep, pak uzavřít.
