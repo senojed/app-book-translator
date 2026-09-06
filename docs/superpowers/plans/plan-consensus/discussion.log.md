@@ -39,3 +39,11 @@ Max kol: 10
 - IMPORTANT: _price 0.0 pro neznámý model = cost guard tiše off → raise FatalRunError. float(ans) na strop ValueError → reprompt 1x, pak FatalRunError. Export coverage tenká → full-marker/only-done/read-only testy. Review reseed negative test neefektivní → rozděleno pozitivní/negativní (fresh DB, guide uložen ale rc=1 → žádný reseed).
 - NIT: except Exception (ne trojice); Task 16 spouští test_cli.py.
 - Sporné: nic. Rozsah klesá.
+
+## Kolo 5 — 2026-09-06T18:39:37Z
+- Codex: CHANGES_NEEDED (1 BLOCKING, 6 IMPORTANT, 3 NIT) → round-5-codex.md
+- Claude: CHANGES_NEEDED (0 vlastních) → round-5-claude.md
+- BLOCKING: os.kill(pid,0) na Windows = TerminateProcess → _pid_alive platform-specific (POSIX os.kill, Windows ctypes OpenProcess), lock přebírá zámek starší 6h.
+- IMPORTANT: merge_draft_and_guide výstup = finální názvy polí (cz/render/style/address) předvyplněné z draft suggested_*; apply_answer syntaxe "cz | alt1 | alt2" → accepted_alt; scout.chunk_chapters greedy packing pod SCOUT_CHUNK_WORD_LIMIT=40000 + CLI; cost guard new_limit >= spent+est; drift scheduling přesně (po done/flagged commitu, count % N); Task 16 validace vyjmenovat required pole.
+- NIT: test counts (Task 14→7, Task 11→7, Task 5→8).
+- Sporné: nic.
