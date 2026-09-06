@@ -77,3 +77,10 @@ Max kol: 10
 - Poprvé bez BLOCKING. IMPORTANT: must_decide place kind + apply_must_decide place větev; blocking term/name s alternativami target_tid deterministické ("term_"+slug); extra_mentions ověřit nt["cz"] proti finálnímu překladu (contains_form), jinak source="omission" ne fake "rendered"; atomicity test posílen (new_candidates + FK-vadná mention → assert vše rollbacknuto).
 - NIT: Task 7 payloady + terms; must_decide konflikt objekty všechna pole.
 - Sporné: nic. Konverguje.
+
+## Kolo 10 — 2026-09-06T19:07:10Z (finální)
+- Codex: CHANGES_NEEDED (1 BLOCKING, 3 IMPORTANT) → round-10-codex.md
+- Claude: CONSENSUS (0 vlastních) → round-10-claude.md
+- BLOCKING: rendered_terms konzumovány neověřené před check_chapter → filtrace přes contains_form IHNED v kroku 2 + po každé revizi.
+- IMPORTANT: slug kolize remap jen při surface-match, jinak deterministický suffix. init --reset + odmítnutí neprázdné DB (state.reset_book). apply_answer validuje prázdnou odpověď → ValueError → main exit 1.
+- VÝSLEDEK: MAX_ROUNDS (10/10). Konvergence prakticky dosažena - Claude CONSENSUS, struktura plánu (17 tasků, 122 test funkcí) nezměněná celý proces, Codex bez BLOCKING v kole 9. Viz final-verdict.md.

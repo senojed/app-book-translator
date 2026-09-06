@@ -1349,6 +1349,8 @@ git commit -m "feat: concordance (build_mentions, check_chapter leak/inconsisten
   - `set_status(db_path, idx, status)` a `update_chapter(db_path, idx, **fields)` (allowlist sloupců: translated_text, status, revision_rounds, notes; vždy `updated_at=CURRENT_TIMESTAMP`)
   - `retry_flagged(db_path, idxs: list[int] | None) -> int` - `flagged → pending`, `revision_rounds=0`; `idxs=None` = všechny flagged
   - `counts_by_status(db_path) -> dict[str,int]`
+  - `reset_book(db_path) -> None` - `DELETE FROM` `chapters`, `questions`, `term_mentions`, `drift_reports`, `glossary`, `runs`, `llm_calls` (v pořadí respektujícím FK). Pro `init --reset`.
+  - `is_db_empty(db_path) -> bool` - `chapters` tabulka je prázdná
   - **Lock:** `acquire_lock(lock_path) -> None` (raise `LockError` když drží živý PID; přebere zastaralý), `release_lock(lock_path)`, context manager `run_lock(lock_path)`. Lock soubor = JSON `{"pid": os.getpid(), "ts": <ISO>}`.
     - `_pid_alive(pid: int) -> bool`:
       - POSIX: `try: os.kill(pid, 0); return True; except ProcessLookupError: return False; except PermissionError: return True`
@@ -1847,11 +1849,15 @@ git commit -m "feat: agents/critic (nezávislá revize, Finding s action routing
 - Produces (pipeline):
   - `process_chapter(db_path, chapter: dict, *, client_factory, guide: dict) -> dict` - jedna kapitola celým flow. `client_factory(agent: str) -> LLMClient` vytváří `PipelineLLMClient` per agent (v testu monkeypatch obchází). Vrací summary `{idx, status, revision_rounds, new_terms, questions_created, findings}`.
     - Krok 0 (**transakce A**, `state.begin_chapter(db, idx)`): `status → processing` + `delete_open_questions_for_chapter`
-    - Krok 2: `split_into_scenes(chapter["raw_text"], config.CHAPTER_SPLIT_WORD_THRESHOLD)` → per scéna `translator.translate_scene(scene, guide_block, glossary_block, client_factory("translator"))`; agregace: `new_terms` union podle `term_en.casefold()`, `questions` concat, `rendered_terms` = list `{term_id, cz_as_used, scene_idx}` (pipeline doplní `scene_idx`)
-    - Krok 3-4: `concordance.check_chapter(en, cz, glossary.all_terms(db), rendered_terms)` + `critic.review(en, cz, client_factory("critic"))` → `findings` = spojený list. **Nové termíny objevené v TÉTO kapitole se concordance-checkem v její revizní smyčce neřeší** (ještě neznáme jejich schválené `cz`); kontrolují se až od další kapitoly. Explicitní v1 chování.
-    - Krok 5: `while has_revise_triggers(findings) and rounds < config.MAX_REVIZE`: `translator.revise_chapter(en, cz, [f for f in findings if f["action"]=="revise"], guide_block, glossary_block, client_factory("translator"))` → nový `cz`; jeho metadata NAHRADÍ agregát (`rendered_terms`, `questions`), `new_terms` se kumulují; `check_chapter` + `review` znovu; `rounds += 1`
-    - Krok 6-8 (**transakce B**): PŘED transakcí pipeline:
-      (a) ověř `rendered_terms` substringem proti finálnímu `cz`, neověřené zahoď;
+    - Krok 2: `split_into_scenes(...)` → per scéna `translator.translate_scene(...)`;
+      agregace: `new_terms` union podle `term_en.casefold()`, `questions` concat,
+      `rendered_terms` = list `{term_id, cz_as_used, scene_idx}` (pipeline doplní `scene_idx`).
+      **Ihned filtruj `rendered_terms`:** `rendered_terms = [r for r in rendered_terms
+      if concordance.contains_form(cz, r["cz_as_used"])]` - halucinovaný `cz_as_used`
+      (není ve výsledném CZ) se zahodí PŘED jakýmkoli `check_chapter`.
+    - Krok 3-4: `concordance.check_chapter(en, cz, glossary.all_terms(db), rendered_terms)` + `critic.review(en, cz, client_factory("critic"))` → `findings` = spojený list. **Nové termíny objevené v TÉTO kapitole se concordance-checkem v její revizní smyčce neřeší** (ještě neznáme jejich schválené `cz`); kontrolují se až od další kapitoly.
+    - Krok 5: `while has_revise_triggers(findings) and rounds < config.MAX_REVIZE`: `translator.revise_chapter(...)` → nový `cz`; metadata NAHRADÍ agregát, `new_terms` kumulují; **znovu filtruj `rendered_terms` přes `contains_form(nový cz, ...)`**; `check_chapter` + `review` znovu; `rounds += 1`
+    - Krok 6-8 (**transakce B**): PŘED transakcí pipeline (rendered_terms už jsou filtrované z kroku 2/5):
       (b) `extra_mentions = []`; pro každý `nt` v `new_terms`:
           `existing = glossary.resolve_surface(db, nt["term_en"])`:
           `mention_form = nt["cz"] if concordance.contains_form(cz, nt["cz"]) else None`
@@ -1896,7 +1902,14 @@ git commit -m "feat: agents/critic (nezávislá revize, Finding s action routing
 - Produces (rozšíření `state.py` v tomto tasku):
   - `state.begin_chapter(db_path, idx) -> None` - transakce A: `UPDATE chapters SET status='processing'` + `DELETE FROM questions WHERE chapter_idx=? AND answer IS NULL`, jeden `connect` blok
   - `state.commit_chapter_result(db_path, idx, *, translated_text: str, revision_rounds: int, notes_json: str, status: str, new_candidates: list[dict], mentions: list, questions: list[dict]) -> dict` - **celá transakce B v jednom `connect` bloku** (state zůstává čisté - concordance volá pipeline PŘED touto funkcí):
-    1. pro každý řádek v `new_candidates` (`{term_id, canonical_en, aliases, cz, accepted_alt, note, type, status}`, pipeline je připravil přes `glossary.resolve_surface` = jen ty, co v glosáři nejsou): `INSERT INTO glossary ...`. Na `sqlite3.IntegrityError` (slug kolize / kandidát vznikl mezi přípravou a commitem): NEignoruj tiše - `SELECT term_id FROM glossary WHERE term_id=? OR lower(canonical_en)=lower(?)`, přemapuj `mentions` a `questions` toho kandidáta na nalezené `term_id`, pokračuj. (Nikdy nezůstane mention/question ukazující na neexistující řádek.)
+    1. pro každý řádek v `new_candidates` (pipeline je připravil přes `glossary.resolve_surface` = jen ty, co v glosáři nejsou): `INSERT INTO glossary ...`. Na `sqlite3.IntegrityError` (kolize `term_id`):
+       - `SELECT canonical_en FROM glossary WHERE term_id=?`. Pokud se rovná
+         `canonical_en` kandidáta (ci) NEBO je mezi jeho aliasy → je to táž entita:
+         přemapuj `mentions`+`questions` kandidáta na tento `term_id`, pokračuj.
+       - Jinak (slug kolize dvou RŮZNÝCH povrchů): zkoušej `term_id + "_2"`,
+         `"_3"`, ... dokud `INSERT` neprojde; přemapuj mentions+questions na
+         finální `term_id`.
+       Nikdy visící FK, nikdy mention na cizí entitě.
     2. `DELETE FROM term_mentions WHERE chapter_idx=?`; INSERT každý z `mentions` (`term_id`, `cz_form`, `chapter_idx=idx`, `scene_idx`, `source`)
     3. pro každou otázku v `questions` (`{chapter_idx, kind, text, scope_key, guess_answer, severity}`): upsert-open-question logika NAD `conn` (SELECT dle správného partial-index predikátu podle `chapter_idx is None` → UPDATE nebo INSERT)
     4. `UPDATE chapters SET translated_text=?, revision_rounds=?, notes=?, status=?, updated_at=CURRENT_TIMESTAMP WHERE idx=?`
@@ -2009,6 +2022,22 @@ def test_critic_fatal_error_propagates_not_flagged(tmp_path, monkeypatch):
     assert state.get_chapter(db, 1)["status"] != "flagged"
 
 
+def test_hallucinated_rendered_term_does_not_trigger_revision(tmp_path, monkeypatch):
+    db = _db(tmp_path)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE glossary SET canonical_en='Grey Cloak', cz='Šedý plášť', "
+                     "status='approved' WHERE term_id='t1'")
+    # translator hlásí rendered_term, který ve výsledném CZ NENÍ
+    monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
+        "Šedý plášť promluvil.",   # CZ obsahuje kanonický tvar
+        [], [{"term_id": "t1", "cz_as_used": "Popelář"}], []))   # ale hlásí "Popelář"
+    monkeypatch.setattr(C, "review", lambda *a, **k: [])
+    out = pipeline.process_chapter(db, state.get_chapter(db, 1), client_factory=_factory,
+        guide={"characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    assert out["status"] == "done"          # žádná falešná inconsistency/revize
+    assert out["revision_rounds"] == 0
+
+
 def test_critic_recoverable_failure_flags_chapter(tmp_path, monkeypatch):
     db = _db(tmp_path)
     monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
@@ -2067,7 +2096,7 @@ def test_commit_chapter_result_is_atomic(tmp_path):
 ```
 
 - [ ] **Step 3b: Implement `src/pipeline.py`.** Pipeline importuje `from src.agents import translator, critic` a `from src import concordance, glossary, guide as guide_mod, state, ingest` - agenty volá modulově-kvalifikovaně (`translator.translate_scene`) kvůli monkeypatch.
-- [ ] **Step 4: Run to verify pass** — PASS (8 pipeline testů + atomicity test).
+- [ ] **Step 4: Run to verify pass** — PASS (9 pipeline testů + atomicity test).
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -2089,7 +2118,10 @@ git commit -m "feat: pipeline (process_chapter, revizní smyčka, transakce A/B,
 - Consumes: `state`, `glossary`, `guide`, `pipeline`, `ingest`, `agents.scout`, `config`, `llm.client`
 - Produces:
   - `requeue.apply_answer(db_path, guide_path, qid: int, answer_text: str) -> dict`:
-    `q = state.get_question(db, qid)`; `scope_key = q["scope_key"]`.
+    `if not answer_text.strip(): raise ValueError("prázdná odpověď")` (main chytí,
+    vypíše, exit 1). `q = state.get_question(db, qid)`; `if q is None: raise
+    ValueError(f"otázka {qid} neexistuje")`. `scope_key = q["scope_key"]`.
+    U `term`/`name` navíc: `if not parts: raise ValueError("odpověď musí mít CZ tvar")`.
     **Fáze 1 - guide.json** (jen `relationship`/`style`/`other`): atomický zápis
     přes `guide.save_guide` (temp+`os.replace`). Idempotentní.
     - `relationship` (`scope_key = "a|b"`): `a, b = scope_key.split("|", 1)`;
@@ -2138,7 +2170,12 @@ git commit -m "feat: pipeline (process_chapter, revizní smyčka, transakce A/B,
     finally:
         state.finish_run(db, rid, status)   # JEDINÝ finish_run
     ```
-    - `init PATH` → (`init_db` už proběhlo v `main`) `state.seed_chapters(config.DB_PATH, ingest.load_book(PATH))` (žádný run/klient, žádný lifecycle)
+    - `init PATH [--reset]` → (`init_db` už proběhlo v `main`). Když `chapters`
+      tabulka NENÍ prázdná a není `--reset` → `print("DB už obsahuje knihu. Použij
+      init --reset pro nahrazení.")`, return 1. `--reset` → `state.reset_book(db)`
+      (TRUNCATE `chapters`, `questions`, `term_mentions`, `drift_reports`,
+      `glossary`, `runs`, `llm_calls`; `guide.json`/`draft` zůstávají soubory -
+      člověk je smaže sám). Pak `state.seed_chapters(config.DB_PATH, ingest.load_book(PATH))`. (žádný lifecycle)
     - `scan [--chunked]` → `recover_processing`; `chs = state.chapters_by_status(db, ("pending","processing","done","flagged","needs_human","error"))` (všechny, ORDER BY idx); `cf = lambda a: PipelineLLMClient(AnthropicClient(), run_id=rid, agent=a, db_path=db, config_mod=config, interactive=False)`;
       - bez `--chunked`: `scout.scan_book("\n\n".join(c["raw_text"] for c in chs), cf("scout"))`
       - `--chunked`: `scout.scan_chunks(scout.chunk_chapters(chs, config.SCOUT_CHUNK_WORD_LIMIT), cf("scout"))`
@@ -2158,7 +2195,7 @@ git commit -m "feat: pipeline (process_chapter, revizní smyčka, transakce A/B,
       **Drift scheduling (přesně):** po každém úspěšném `process_chapter`, jehož výsledný status je `done` nebo `flagged`, spočti `n = state.counts_by_status(db)` součet `done+flagged`; pokud `n > 0 and n % config.CROSS_REF_EVERY_N == 0` → `pipeline.run_drift_check(db, ch["idx"])`. (Počítá hotové kapitoly, ne `idx`.)
       Po smyčce: report (`state.counts_by_status`) + `_print_usage(db, rid)` (suma z `llm_calls`). `finish_run` řeší lifecycle `finally`.
     - `questions` → vypiš `state.unanswered_questions`
-    - `answer QID TEXT` → `requeue.apply_answer`, vypiš co se requeue
+    - `answer QID TEXT` → `try: out = requeue.apply_answer(db, guide_path, QID, TEXT) except ValueError as e: print(e); return 1`; vypiš `out["requeued"]`
     - `status` → `state.counts_by_status` + seznam s markery (`OK/../!!/??/XX/~~` pro done/pending/flagged/needs_human/error/processing)
     - `export [--only-done]` → viz §Export; read-only, žádný lock
   - `main._bootstrap_stdout()` - UTF-8 reconfigure, voláno první v `main()`
@@ -2293,6 +2330,29 @@ def test_status_runs_without_db_error(tmp_path, monkeypatch):
     book.write_text("Chapter 1\n" + "text " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
     assert _run(["status"], tmp_path, monkeypatch) == 0
+
+
+def test_reinit_refuses_without_reset_and_reset_replaces(tmp_path, monkeypatch):
+    b1 = tmp_path / "b1.txt"
+    b1.write_text("".join(f"Chapter {i}\n" + "t " * 60 + "\n" for i in range(1, 6)),
+                  encoding="utf-8")
+    _run(["init", str(b1)], tmp_path, monkeypatch)
+    assert len(state.chapters_by_status("data/state.sqlite3", ("pending",))) == 5
+    b2 = tmp_path / "b2.txt"
+    b2.write_text("Chapter 1\n" + "t " * 60 + "\nChapter 2\n" + "t " * 60, encoding="utf-8")
+    assert _run(["init", str(b2)], tmp_path, monkeypatch) == 1   # odmítne bez --reset
+    assert len(state.chapters_by_status("data/state.sqlite3", ("pending",))) == 5
+    assert _run(["init", str(b2), "--reset"], tmp_path, monkeypatch) == 0
+    chs = state.chapters_by_status("data/state.sqlite3", ("pending",))
+    assert len(chs) == 2   # nahrazeno, žádné stale kapitoly 3-5
+
+
+def test_answer_empty_text_is_controlled_error(tmp_path, monkeypatch):
+    book = tmp_path / "k.txt"; book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    state.upsert_open_question("data/state.sqlite3", {"chapter_idx": 1, "kind": "term",
+        "text": "?", "scope_key": "t1", "guess_answer": None, "severity": "guess"})
+    assert _run(["answer", "1", "   "], tmp_path, monkeypatch) == 1   # ne stacktrace
 
 
 def _init_4ch(tmp_path, monkeypatch):
