@@ -122,7 +122,7 @@ Jeden modul, jedna rodina promptů.
 
 ```
 python main.py init kniha.epub    # kniha → kapitoly do DB (status pending)
-python main.py scan               # scout projede celou knihu → guide.draft.json
+python main.py scan [--chunked]   # scout projede knihu → guide.draft.json
 python main.py review             # web UI: potvrdíš/upravíš návod → guide.json
 python main.py run                # překladová smyčka přes kapitoly (pending + error)
 python main.py run --retry-flagged [IDX...]   # flagged → pending (revision_rounds=0), pak běž
@@ -151,14 +151,17 @@ python main.py export             # hotové kapitoly → output/kniha_cz.txt
            (new_terms se ale kumulují)
        concordance.check_chapter znovu; kritik znovu
        revision_rounds += 1
-6. z FINÁLNÍHO překladu (vše v jedné transakci s krokem 8):
-     - new_terms → glosář jako `candidate` (dedup podle term_en)
-     - ověř `rendered_terms` proti CZ textu, neověřené zahoď
+6. z FINÁLNÍHO překladu (vše v transakci B):
+     - pro každý `new_term`: nejdřív zkus napárovat na existující glosář řádek
+       (povrch vs `canonical_en`/`aliases`); shoda → jen mention, ne nový řádek.
+       Jinak `add_candidate()` → přiřadí `term_id`, a rovnou
+       `upsert_open_question(kind=term, scope_key=term_id, guess_answer=cz,
+       severity=guess)`.
+     - ověř `rendered_terms` proti CZ textu, neověřené zahoď; doplň `scene_idx`
      - DELETE FROM term_mentions WHERE chapter_idx=?
      - concordance.build_mentions(EN, CZ, glosář, rendered_terms) → INSERT
-7. otázky → DB (upsert, viz `questions` klíč):
-     - translatorova `guess` / `blocking` otázka
-     - Finding s `action=question` (viz sekce Finding)
+7. otázky → DB přes `upsert_open_question` (větví globální vs kapitolové, viz
+   `questions`): translatorovy `guess`/`blocking` + Findings s `action=question`
 8. ulož translated_text + revision_rounds + notes(JSON Findings) + status:
        flagged        critical/leak nález přežil MAX_REVIZE kol
        needs_human    blocking otázka
@@ -199,7 +202,8 @@ done        ──answer na guess otázku, když answer ≠ guess───> pend
 1. zapiš odpověď podle `kind`:
    - `term` / `name`: glosář `candidate` → `approved` (nebo oprav `cz`); pokud
      odpověď připouští víc tvarů, ty navíc → `accepted_alt`
-   - `relationship` (`scope_key = "a|b"`): zapiš `address` do `guide.relationships`
+   - `relationship` (`scope_key = relationship_key(a,b)`): zapiš `address`
+     do `guide.relationships`
    - `style` / `other`: `guide.add_rule(odpověď)`
 2. **blocking otázka** (kapitola `needs_human`): kapitolu vrať na `pending` jen
    když pro její `chapter_idx` NEZBÝVÁ žádná nezodpovězená `severity=blocking`
@@ -264,8 +268,8 @@ prompt, zavolají klienta, zparsují. Žádná DB, žádné soubory.
   - normalizační klíč = `name_en.strip().casefold()`; položky se stejným klíčem
     se slijí, `aliases` = sjednocení, `note` = spojení
   - kolize jmen (různé entity, stejný povrch): nechat obě, přidat `must_decide`
-  - `relationships`: stejná dvojice (klíč `sorted(a,b)`) s různým `suggested`
-    napříč chunky → `suggested: null` + `must_decide`
+  - `relationships`: klíč = `relationship_key(a,b)` (viz níže); stejný klíč
+    s různým `suggested` napříč chunky → `suggested: null` + `must_decide`
   - `must_decide` a `terms`/`places` obdobně sjednotit podle scope_key
   → jeden draft návodu. Žádné další LLM volání.
 - Model: `claude-sonnet-5`. Před pilotem změřit vstup přes `count_tokens`.
@@ -424,11 +428,14 @@ drží `state`.
   - `term_id` = stabilní ID entity (ne povrch textu) - kvůli aliasům a případu
     "stejný povrch, různé entity". `canonical_en` + `aliases` = na co concordance
     matchuje v EN textu. **Deterministické:** u seedovaných `slug(canonical_en)`,
-    u kandidátů `"cand_" + slug(term_en)`. Reseed je pak UPDATE podle `term_id`,
-    ne delete+insert → `term_mentions`/`questions` FK zůstávají platné.
-  - **Omezení v1:** `new_terms` z translatora se deduplikují podle povrchu
-    (`term_en`). Když jeden povrch má být 2 entity, je to ruční `answer`
-    operace (split), ne automatika.
+    u kandidátů `"cand_" + slug(term_en)`.
+  - **Párování při vzniku kandidáta i při reseedu:** nejdřív hledej existující
+    řádek podle povrchu (`canonical_en`/`aliases`). Shoda → uprav ten řádek
+    in-place (zachovej jeho `term_id`, změň `status`, doplň pole). Žádná shoda
+    → nový řádek. Tím candidate a pozdější seeded/approved pro stejnou entitu
+    sdílí `term_id` a FK z `term_mentions`/`questions` drží.
+  - **Omezení v1:** párování je podle povrchu. Jeden povrch = jedna entita;
+    split povrchu na 2 entity je ruční `answer` operace, ne automatika.
   - `type`: name | place | term
   - `status`: `seeded` (z návodu), `approved` (člověk potvrdil přes `answer`),
     `candidate` (translator navrhl, nepotvrzeno)
@@ -461,7 +468,10 @@ scéně/kapitole, plus ty v `rendered_terms`. Ne celý glosář.
   - navíc přesné shody `cz` / `accepted_alt` / kmene v CZ textu, které
     `rendered_terms` nepokryl → `source=detected`
   - žádná forma nenalezena → řádek `cz_form=NULL, source=omission`
-  → tabulka `term_mentions` = ÚPLNÝ pozorovací záznam (i tvary mimo glosář).
+  → tabulka `term_mentions` = **best-effort** pozorovací záznam (zachytí tvary
+    mimo glosář jen když je translator uvede v `rendered_terms`; deterministická
+    detekce hledá jen `cz`/`accepted_alt`/kmen). Downstream (drift) na úplnost
+    NEspoléhá - je to signál, ne důkaz.
 - **`check_chapter(en_text, cz_text, glossary, rendered_terms) → list[Finding]`:**
   - `leak`: EN podoba překládaného termínu (`cz != canonical_en`) je v CZ textu
     → `action=revise`. `keep` položky (`cz == canonical_en`) se nehlásí.
@@ -473,9 +483,9 @@ scéně/kapitole, plus ty v `rendered_terms`. Ne celý glosář.
 - **Drift napříč kapitolami** (`check_drift(term_mentions) → list[DriftFinding]`):
   pro každý `term_id` seskup ne-NULL `cz_form` z `term_mentions` všech
   `done`/`flagged` kapitol; 2+ zjevně různé kmeny → `DriftFinding{term_id,
-  formy: [...], kapitoly: [...]}`. Data jsou úplná (i tvary mimo glosář),
-  takže drift chytí i nekonzistenci, kterou `check_chapter` v době překladu
-  neznal. Pipeline z každého DriftFinding udělá `question` (viz `run`).
+  formy: [...], kapitoly: [...]}`. Best-effort - `rendered_terms` často zachytí
+  i tvar, který `check_chapter` v době překladu neznal, ale úplnost není
+  zaručená. Pipeline z každého DriftFinding udělá `question` (viz `run`).
 - České skloňování: v1 nedělá lemmatizaci. Porovnává na kmeni (slovo bez
   posledních 1-3 znaků) + přesnou shodou. Nejistoty ukáže člověku, tvrdě nepadá.
   LLM soudce ("stejné slovo skloňované?") případně později.
@@ -529,17 +539,23 @@ chapters (idx PK, title, raw_text, translated_text, status,
 questions (id PK, chapter_idx NULL, kind, text, scope_key, guess_answer,
            severity, answer, resolved_at)
     kind:     term | name | relationship | style | other
-    scope_key: term_id (term/name), "a|b" (relationship),
+    scope_key: term_id (term/name), relationship_key(a,b) (relationship),
       hash(text) (style/other) - nikdy NULL/"" aby UNIQUE fungoval
+      relationship_key(a,b) = "|".join(sorted(
+        normalize(resolve_surface(a)), normalize(resolve_surface(b))))
+      - používá se v scout merge, answer i questions, jedna definice
     severity: guess | blocking
     chapter_idx = NULL u globálních otázek (drift); jinak kapitola vzniku
-    dedup jen mezi OTEVŘENÝMI otázkami - dva samostatné partial unique indexy
+    dedup jen mezi OTEVŘENÝMI otázkami - dva partial unique indexy
     (SQLite: `CREATE UNIQUE INDEX ... WHERE answer IS NULL`, ne inline constraint):
       idx1: (chapter_idx, kind, scope_key, severity) WHERE answer IS NULL
       idx2: (kind, scope_key, severity) WHERE answer IS NULL AND chapter_idx IS NULL
-      → zodpovězená otázka neblokuje založení nové pro stejný klíč (nový drift
-        po opravě, opětovné nadhození po dalším rerunu)
-    upsert; rerun kapitoly maže její nezodpovězené a zakládá znovu (krok 0).
+    zápis přes helper `upsert_open_question(q)`: větví globální (chapter_idx
+      NULL) vs kapitolové, dělá explicitní SELECT (dle správného predikátu) +
+      UPDATE/INSERT v transakci B. Ne obecný `ON CONFLICT`.
+    zodpovězená otázka neblokuje novou pro stejný klíč (nový drift po opravě,
+      opětovné nadhození po rerunu). Rerun kapitoly maže její nezodpovězené
+      (krok 0) a zakládá znovu.
 
 glossary (term_id PK, canonical_en, aliases TEXT, cz, accepted_alt TEXT,
           note, type, status, updated_at)
@@ -558,7 +574,8 @@ term_mentions (id PK, term_id FK, cz_form NULL, chapter_idx, scene_idx NULL,
 
 drift_reports (id PK, up_to_chapter, report TEXT, created_at)
 
-runs (id PK, command, started_at, ended_at, status)
+runs (id PK, command, started_at, ended_at, status, spend_ceiling NULL)
+    spend_ceiling = per-run navýšený strop po potvrzení cost guardu
 llm_calls (id PK, run_id FK, agent, provider, model, input_tokens NULL,
            output_tokens NULL, cost_usd NULL, truncated, status,
            error_class NULL, ts)
@@ -618,9 +635,11 @@ nikdy nespustí → žádná kapitola nedostane finální stav (`done`/`flagged`
 - Sedí v `PipelineLLMClient.complete()` (viz Provider vrstva) - má tam k
   dispozici `system`/`user`/`max_tokens`, takže odhad ceny volání (vstup přes
   `count_tokens` + výstup `max_tokens × out_rate`) je spolehlivý.
-- `config.MAX_SPEND_USD` platí pro `run` i `scan`. `spent_so_far` (z `llm_calls`)
-  + odhad tohoto volání > strop → pauza `pokračovat? [y/N]`; u `scan` tvrdě
-  zastav (fatal běhu).
+- Efektivní strop = `max(config.MAX_SPEND_USD, runs.spend_ceiling)`.
+  `spent_so_far` (z `llm_calls`) + odhad tohoto volání > strop →
+  `pokračovat? nový strop v $ [prázdné = stop]`. Odpověď zapíše
+  `runs.spend_ceiling` pro tenhle běh → neptá se znovu, dokud se nepřekročí
+  i nový strop. U `scan` (1 volání) tvrdě zastav (fatal běhu).
 - Usage v `llm_calls` po každém volání → přežije pád procesu.
 - Vlastní rate limiter není potřeba (SDK backoff).
 

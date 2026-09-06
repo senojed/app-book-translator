@@ -62,3 +62,9 @@ Max kol: 10
 - Claude: CHANGES_NEEDED (0 vlastních) → round-9-claude.md
 - Opraveno: Finding +action(revise|question|note)+term_id s routing tabulkou (kritik/concordance → co s tím); scene_idx doplňuje pipeline ne translator (revizní výstup → NULL); deterministický term_id (slug) + reseed = UPDATE podle term_id ne delete+insert (FK integrita term_mentions/questions); run --retry-flagged doplněn do CLI seznamu/automatu/buildu/testů (reset revision_rounds=0); přiznané v1 omezení: new_terms dedup podle povrchu, split entity je ruční answer; partial unique zapsáno jako CREATE UNIQUE INDEX ... WHERE answer IS NULL.
 - Sporné: nic. Architektura beze změny 5 kol po sobě.
+
+## Kolo 10 — 2026-09-06T16:21:38Z (finální)
+- Codex: CHANGES_NEEDED (0 BLOCKING, 6 IMPORTANT, 2 NIT) → round-10-codex.md
+- Claude: CONSENSUS (0 vlastních) → round-10-claude.md
+- Opraveno: candidate/seeded term_id kolize (párování podle povrchu, sdílený term_id); new_terms → garantovaná upsert_open_question; term_mentions přeformulováno na best-effort; relationship_key jedna definice všude; runs.spend_ceiling (cost guard stav po potvrzení); upsert_open_question helper (větví globální/kapitolové); scan --chunked do CLI.
+- VÝSLEDEK: MAX_ROUNDS (10/10). Konvergence prakticky dosažena - Claude CONSENSUS, Codex CHANGES (instruován nebýt shovívavý), architektura nezměněna 6 kol, 0 BLOCKING od kola 8. Viz final-verdict.md.
