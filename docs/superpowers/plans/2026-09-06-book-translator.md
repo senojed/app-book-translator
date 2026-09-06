@@ -1172,7 +1172,7 @@ def test_load_guide_normalizes_partial_existing_file(tmp_path):
 
 def test_save_and_load_roundtrip(tmp_path):
     p = str(tmp_path / "g.json")
-    guide.save_guide(p, {"characters": [{"name_en": "X"}], "places": [],
+    guide.save_guide(p, {"characters": [{"name_en": "X"}], "places": [], "terms": [],
                          "relationships": [], "style": "s", "rules": ["r"]})
     assert guide.load_guide(p)["rules"] == ["r"]
 
@@ -1190,7 +1190,7 @@ def test_merge_keeps_human_decisions(tmp_path):
                             {"name_en": "NewGuy", "suggested": "translate", "note": ""}],
              "places": [], "terms": [], "relationships": [], "must_decide": []}
     g = {"characters": [{"name_en": "Harry", "render": "keep", "cz": "Harry"}],
-         "places": [], "relationships": [], "style": "", "rules": []}
+         "places": [], "terms": [], "relationships": [], "style": "", "rules": []}
     merged = guide.merge_draft_and_guide(draft, g)
     harry = [c for c in merged["characters"] if c["name_en"] == "Harry"][0]
     assert harry["render"] == "keep"  # lidské rozhodnutí zůstalo
@@ -1200,7 +1200,7 @@ def test_merge_keeps_human_decisions(tmp_path):
 
 def test_prompt_block_has_no_cz_pairs(tmp_path):
     g = {"characters": [{"name_en": "Foo", "render": "translate", "cz": "Fů"}],
-         "places": [], "relationships": [], "style": "sarkastický", "rules": []}
+         "places": [], "terms": [], "relationships": [], "style": "sarkastický", "rules": []}
     block = guide.guide_as_prompt_block(g)
     assert "sarkastický" in block
     assert "Fů" not in block  # cz páry jdou jen z glosáře
@@ -1563,7 +1563,7 @@ git commit -m "feat: state questions (upsert_open_question), term_mentions, drif
     - `characters` dedup dle `name_en.strip().casefold()`
     - `places` dedup dle `name_en.strip().casefold()`
     - `terms` dedup dle `term_en.strip().casefold()` (scout terms používají `term_en`, ne `name_en`)
-    - u všech tří: `aliases` = union, `note` = spojení `"; "`, `suggested`/`suggested_cz` = první neprázdný, konflikt různých hodnot → `must_decide{kind, scope_key=povrch, question}`
+    - u všech tří: `aliases` = union, `note` = spojení `"; "`, `suggested`/`suggested_cz` = první neprázdný, konflikt různých hodnot → `must_decide` objekt s VŠEMI poli: `{kind, scope_key: povrch, question: "<popis konfliktu>", default: <první hodnota>}`. `kind` = `"name"` (characters), `"place"` (places), `"term"` (terms).
     - `relationships` dedup dle `relationship_key(a,b)`, různý `suggested` → `suggested=None` + `must_decide{kind:"relationship", scope_key=relationship_key}`
     - `style_notes` = spojení `"\n"`; `must_decide` = union dle `(kind, scope_key)`
 
@@ -1854,17 +1854,19 @@ git commit -m "feat: agents/critic (nezávislá revize, Finding s action routing
       (a) ověř `rendered_terms` substringem proti finálnímu `cz`, neověřené zahoď;
       (b) `extra_mentions = []`; pro každý `nt` v `new_terms`:
           `existing = glossary.resolve_surface(db, nt["term_en"])`:
-          - shoda (`existing` je term_id): NENÍ nový; přidej
-            `extra_mentions.append({term_id: existing, cz_form: nt["cz"],
-            chapter_idx: idx, scene_idx: None, source: "rendered"})` (nezahazuj -
-            translator ho použil, requeue ho musí najít)
+          `mention_form = nt["cz"] if concordance.contains_form(cz, nt["cz"]) else None`
+          (ověř, že tvar je v FINÁLNÍM překladu - `new_terms` se kumulují přes
+          revize, mohl zmizet); `mention_source = "rendered" if mention_form else "omission"`.
+          - shoda (`existing` je term_id): NENÍ nový; `extra_mentions.append(
+            {term_id: existing, cz_form: mention_form, chapter_idx: idx,
+            scene_idx: None, source: mention_source})` (nezahazuj - requeue ho musí najít)
           - žádná shoda: `cand = {term_id: "cand_"+glossary.slugify(nt["term_en"]),
             canonical_en: nt["term_en"], aliases: [], cz: nt["cz"], accepted_alt: [],
             note: nt.get("note",""), type: nt.get("type","term"), status: "candidate"}`,
             přidej `cand` do `new_candidates`, question `{chapter_idx: idx, kind:"term",
             scope_key: cand["term_id"], text: ..., guess_answer: nt["cz"], severity:"guess"}`,
-            a `extra_mentions.append({term_id: cand["term_id"], cz_form: nt["cz"],
-            chapter_idx: idx, scene_idx: None, source: "rendered"})`
+            a `extra_mentions.append({term_id: cand["term_id"], cz_form: mention_form,
+            chapter_idx: idx, scene_idx: None, source: mention_source})`
       (c) `glossary_rows = glossary.all_terms(db) + new_candidates`;
       (d) `mentions = concordance.build_mentions(en, cz, glossary_rows, rendered_terms_ověřené) + extra_mentions`;
       (e) `questions` = translator guess/blocking + Findings s `action=="question"`
@@ -2042,18 +2044,26 @@ def test_run_drift_check_creates_global_question(tmp_path):
 
 ```python
 def test_commit_chapter_result_is_atomic(tmp_path):
-    db = _db(tmp_path)  # má chapter 1, glossary t1
+    db = _db(tmp_path)  # má chapter 1 (status processing), glossary t1
+    good_cand = {"term_id": "cand_new", "canonical_en": "New", "aliases": [],
+                 "cz": "Nový", "accepted_alt": [], "note": "", "type": "term",
+                 "status": "candidate"}
     bad_mention = {"term_id": "NEEXISTUJE", "cz_form": "x", "scene_idx": None,
-                   "source": "detected"}  # poruší FK → výjimka uprostřed
+                   "source": "detected"}  # poruší FK → výjimka uprostřed transakce B
     import pytest
     with pytest.raises(Exception):
         state.commit_chapter_result(db, 1, translated_text="CZ", revision_rounds=1,
-            notes_json="[]", status="done", new_candidates=[], mentions=[bad_mention],
+            notes_json="[]", status="done", new_candidates=[good_cand],
+            mentions=[bad_mention],
             questions=[{"chapter_idx": 1, "kind": "term", "text": "q", "scope_key": "t1",
                         "guess_answer": None, "severity": "guess"}])
-    # nic se nezapsalo
+    # VŠECHNO se rollbacklo - kandidát, otázka, stav kapitoly
     assert state.get_chapter(db, 1)["status"] == "processing"
+    assert state.get_chapter(db, 1)["translated_text"] is None
     assert state.unanswered_questions(db) == []
+    with state.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) c FROM glossary WHERE term_id='cand_new'"
+                            ).fetchone()["c"] == 0
 ```
 
 - [ ] **Step 3b: Implement `src/pipeline.py`.** Pipeline importuje `from src.agents import translator, critic` a `from src import concordance, glossary, guide as guide_mod, state, ingest` - agenty volá modulově-kvalifikovaně (`translator.translate_scene`) kvůli monkeypatch.
@@ -2087,14 +2097,17 @@ git commit -m "feat: pipeline (process_chapter, revizní smyčka, transakce A/B,
     - `style`/`other`: `guide.add_rule(guide_path, answer_text)`
     **Fáze 2 - DB, jedna transakce** přes `state.commit_answer(db_path, *, qid,
     answer_text, glossary_ops, requeue_idxs)`:
-    - `glossary_ops` (spočítá pipeline PŘED voláním, pro `term`/`name`):
+    - `glossary_ops` (spočítá `requeue.apply_answer` PŘED voláním, pro `term`/`name`):
       `parts = [p.strip() for p in answer_text.split("|") if p.strip()]`;
       `tid = glossary.resolve_term_or_surface(db, scope_key)`;
-      `glossary_ops = [("promote", tid, parts[0])]` pokud `tid`, jinak
-      `[("add_approved", scope_key, parts[0])]`; + `("add_accepted_alt", tid_or_new, a)` pro `a in parts[1:]`
-    - `requeue_idxs` (spočítá pipeline PŘED voláním, jen guess otázka a
+      `target_tid = tid or ("term_" + glossary.slugify(scope_key))` (deterministické
+      ID pro blocking povrch - stejné, jaké `add_approved` vytvoří);
+      `glossary_ops = [("promote" if tid else "add_approved", target_tid if tid else scope_key, parts[0])]
+      + [("add_accepted_alt", target_tid, a) for a in parts[1:]]`.
+      `requeue_idxs` níže pak používá `target_tid`.
+    - `requeue_idxs` (spočítá `requeue.apply_answer` PŘED voláním, jen guess otázka a
       `answer_text != q["guess_answer"]`):
-      - `term`/`name` → `state.chapters_mentioning_term(db, tid)`
+      - `term`/`name` → `state.chapters_mentioning_term(db, target_tid)`
       - `relationship` → `done`/`flagged` kde obě jména v `raw_text` (word-bnd, ci)
       - `style`/`other` → `done`/`flagged` s `idx >= q["chapter_idx"]`
         (`chapter_idx=None` u drift → všechny `done`/`flagged`)
@@ -2207,6 +2220,19 @@ def test_blocking_answer_requeues_only_after_last_blocking(tmp_path):
     # odpověď na blocking otázku založila approved glosář řádek
     assert any(t["status"] == "approved" and t["canonical_en"] == "aria"
                for t in glossary.all_terms(db))
+
+
+def test_blocking_answer_with_alternatives_creates_approved_with_alts(tmp_path):
+    db, gp, tid = _setup(tmp_path)
+    state.set_status(db, 1, "needs_human")
+    q = state.upsert_open_question(db, {"chapter_idx": 1, "kind": "name",
+        "text": "kdo je Grey Cloak?", "scope_key": "Grey Cloak",
+        "guess_answer": None, "severity": "blocking"})
+    requeue.apply_answer(db, gp, q, "Šedý plášť | Šedého pláště | šedým pláštěm")
+    t = [x for x in glossary.all_terms(db) if x["canonical_en"] == "Grey Cloak"][0]
+    assert t["status"] == "approved" and t["cz"] == "Šedý plášť"
+    assert set(t["accepted_alt"]) == {"Šedého pláště", "šedým pláštěm"}
+    assert state.get_chapter(db, 1)["status"] == "pending"
 
 
 def test_process_chapter_then_answer_requeues_original_chapter(tmp_path, monkeypatch):
@@ -2403,12 +2429,13 @@ git commit -m "feat: CLI (init/scan/run/status/questions/answer/export) + requeu
 **Interfaces:**
 - Consumes: `guide` (`load_draft`, `load_guide`, `merge_draft_and_guide`, `save_guide`), `fastapi`, `uvicorn`
 - Produces:
-  - `server.apply_must_decide(payload: dict) -> dict` - PŘED save: pro každý `must_decide` s neprázdnou `answer` zapiš odpověď do finálních polí podle `kind`:
-    - `term` → přidej/uprav `payload["terms"]` řádek `{term_en: scope_key, cz: answer}`
+  - `server.apply_must_decide(payload: dict) -> dict` - PŘED save: pro každý `must_decide` s neprázdnou `answer` zapiš odpověď do finálních polí podle `kind` (upsert podle klíče, ne duplikát):
+    - `term` → `payload["terms"]` řádek `{term_en: scope_key, cz: answer}`
+    - `place` → `payload["places"]` řádek `{name_en: scope_key, cz: answer}`
     - `name` → `payload["characters"]` řádek `{name_en: scope_key, render: "translate" if answer != scope_key else "keep", cz: answer}`
     - `relationship` (`scope_key = "a|b"`) → `payload["relationships"]` `{a, b, address: answer}`
     - `style`/`other` → append do `payload["rules"]`
-    `must_decide` se pak z payloadu odstraní (rozhodnutí jsou zapsaná v polích). Vrací upravený payload.
+    `must_decide` se pak z payloadu odstraní. Vrací upravený payload.
   - `server.validate(payload: dict) -> list[str]` - vrací seznam chyb (prázdný = OK). Sekce čte přes `payload.get(section, [])` (chybějící sekce = prázdná, ne chyba):
     - každá `characters` položka: `name_en` neprázdné, `render ∈ {keep, translate}`, u `translate` `cz` neprázdné
     - každá `places` / `terms` položka: `name_en`/`term_en` neprázdné, `cz` neprázdné

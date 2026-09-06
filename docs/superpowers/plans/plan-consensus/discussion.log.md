@@ -70,3 +70,10 @@ Max kol: 10
 - IMPORTANT: new_terms shoda s existujícím povrchem "přeskoč" → ztráta mention → přidej explicitní mention s resolved term_id. style/other scope_key hash remap nespecifikován → pipeline normalizuje všechny questions (sha1(text)[:16]). apply_answer atomicita falešná → state.commit_answer jednotransakční helper (glossary_ops SQL nad conn). stale lock takeover race → unlink + O_EXCL retry smyčka.
 - NIT: validate čte payload.get(section, []).
 - Sporné: nic.
+
+## Kolo 9 — 2026-09-06T19:01:21Z
+- Codex: CHANGES_NEEDED (0 BLOCKING, 4 IMPORTANT, 2 NIT) → round-9-codex.md
+- Claude: CHANGES_NEEDED (0 vlastních) → round-9-claude.md
+- Poprvé bez BLOCKING. IMPORTANT: must_decide place kind + apply_must_decide place větev; blocking term/name s alternativami target_tid deterministické ("term_"+slug); extra_mentions ověřit nt["cz"] proti finálnímu překladu (contains_form), jinak source="omission" ne fake "rendered"; atomicity test posílen (new_candidates + FK-vadná mention → assert vše rollbacknuto).
+- NIT: Task 7 payloady + terms; must_decide konflikt objekty všechna pole.
+- Sporné: nic. Konverguje.
