@@ -147,14 +147,17 @@ python main.py export             # hotové kapitoly → output/kniha_cz.txt
 7. otázky z translatora → DB:
      - candidate termín → 1 otázka kind=term, guess_answer=navržený CZ, severity=guess
      - blocking otázka → severity=blocking
-8. ulož translated_text + revision_rounds + critic_notes(JSON: kritik + concordance) + status:
+   před zápisem mentions: DELETE FROM term_mentions WHERE chapter_idx=? (retranslation)
+8. ulož translated_text + revision_rounds + notes(JSON: kritik + concordance) + status:
        flagged        critical/leak nález přežil MAX_REVIZE kol
        needs_human    translator vrátil blocking otázku
        done           jinak (i s odhadnutým jménem / kandidátním termínem)
 ```
 
-`needs_human` a `error` kapitoly `run` **přeskočí a pokračuje** další kapitolou.
-Žádná kapitola nezastaví dávku. Report na konci je vypíše.
+**Které stavy `run` bere do fronty:** `pending` a `error` (error = auto retry).
+`needs_human` a `flagged` `run` **přeskočí** (čekají na člověka); vrátí je do
+hry `answer` resp. `run --retry-flagged`. Žádná kapitola nezastaví dávku.
+Report na konci vypíše přeskočené.
 
 Každých `CROSS_REF_EVERY_N` kapitol: `concordance.check_drift` nad `term_mentions`
 hotových kapitol, report do `drift_reports`, CLI vypíše počet nálezů.
@@ -168,23 +171,25 @@ otázek + spotřeba tokenů za běh.
 pending ──překlad+kritika──┬──> done
                            ├──> flagged        (critical/leak nález přežil MAX_REVIZE)
                            ├──> needs_human     (blocking otázka)
-                           └──> error           (recoverable výjimka; run pokračuje dál)
+                           └──> error           (recoverable výjimka)
 
-needs_human ──answer (všechny otázky kapitoly zodpovězené)──> pending
-flagged     ──answer / `run --retry-flagged` / ruční requeue──> pending
-error       ──run (auto retry)───────────────────────────────> pending
+error       ──běžný `run` (auto retry)──────────────────────> pending
+needs_human ──answer (všechny blocking otázky kapitoly)─────> pending  (vždy)
+flagged     ──answer (mění-li výsledek) / `run --retry-flagged`──> pending
+done        ──answer na guess otázku, když answer ≠ guess───> pending
 ```
 
-**Requeue po `answer` (přesná pravidla):** otázka nese `scope_key` (u termínu
-`term_en`, u pravidla klíč pravidla) a `guess_answer`. Po odpovědi:
-1. zapiš odpověď; u term otázky povyš `candidate` → `approved` (nebo oprav CZ)
-   a je-li to pravidlo stylu, `guide.add_rule()`
-2. pokud se `answer` == `guess_answer` (u termínu: stejný CZ) → nic dalšího,
-   žádná kapitola se nepřekládá znovu
-3. jinak: `affected_chapters` = kapitoly, jejichž `term_mentions` obsahují
-   `scope_key` (u pravidla: všechny `done`/`flagged` od kapitoly, kde otázka
-   vznikla). Ty přejdou zpět na `pending`.
-`answer` nikdy nesahá na kapitolu, která je zrovna `pending`/rozpracovaná.
+**Requeue po `answer` (přesná pravidla):**
+1. zapiš odpověď. U `term`/`name`: povyš glosář `candidate` → `approved`
+   (nebo oprav CZ). U `style`: `guide.add_rule()`.
+2. **blocking otázka** (kapitola `needs_human`, žádný `guess_answer`): kapitola
+   → `pending` VŽDY (původní překlad měl díru).
+3. **guess otázka** (kapitola už `done`/`flagged`):
+   - `answer` == `guess_answer` → nic, žádný přepočet
+   - jinak → `affected_chapters` (kapitoly, jejichž `term_mentions` obsahují
+     `scope_key`; u `style` bez scope_key: všechny `done`/`flagged` od kapitoly
+     vzniku otázky) přejdou na `pending`
+`answer` nikdy nesahá na kapitolu ve stavu `pending` / právě zpracovávanou.
 
 ### Export
 
@@ -192,7 +197,8 @@ error       ──run (auto retry)───────────────�
   překlad). Před `flagged` kapitolu vloží řádek `[!! REVIDOVAT: <shrnutí nálezu>]`.
 - `needs_human` a `error` kapitoly `export` nahradí `[!! CHYBÍ KAPITOLA N - <důvod>]`
   a vypíše varování na stdout (kniha nemá tiše chybět kapitola).
-- `export --only-done` = jen čisté kapitoly, ostatní úplně vynechá.
+- `export --only-done` = jen čisté kapitoly; vynechané kapitoly stejně vypíše
+  na stdout jako seznam (kniha nemá tiše chybět kapitola).
 - `export` je read-only, nemění stav.
 
 ## Prostředí
@@ -218,11 +224,16 @@ prompt, zavolají klienta, zparsují. Žádná DB, žádné soubory.
   terms:         [{term_en, suggested_cz, note}]
   relationships: [{a, b, observed, suggested: tyka|vyka}]
   style_notes:   "1. osoba, min. čas, sarkastický vypravěč, ..."
-  must_decide:   ["'The White Council' - přeložit nebo ponechat?"]
+  must_decide:   [{kind: "term", scope_key: "The White Council",
+                   question: "Přeložit nebo ponechat?", default: "ponechat"}]
   ```
 - **Useknutý / neúplný výstup u scouta = tvrdá chyba, ne varování.** Částečný
   návod tiše vynechá postavy/termíny a znehodnotí celý běh. Reakce: zvětši
   `max_tokens`, nebo přepni na `--chunked`. Nikdy nepokračovat s částečným JSON.
+- **`must_decide` je strukturované, ne volný string:**
+  `{kind: "term|name|relationship|style", scope_key, question, default}` - review
+  UI podle `kind`/`scope_key` ví, kam odpověď zapsat (postava / termín / vztah /
+  pravidlo).
 - **`scan --chunked` fallback:** kniha po chuncích (skupiny kapitol) → dílčí
   fakta z každého chunku → `merge_scout_facts()` (deduplikace postav/termínů
   podle jména, sjednocení aliasů, sběr must_decide) → jeden draft návodu.
@@ -241,10 +252,14 @@ prompt, zavolají klienta, zparsují. Žádná DB, žádné soubory.
   ===METADATA===
   {"new_terms":  [{term_en, cz, note, type}],
    "used_terms": [{term_en, cz_form}],   # jak byl každý známý termín vyrenderován
-   "questions":  [{"text": "...", "severity": "guess"|"blocking"}]}
+   "questions":  [{"kind": "term|name|relationship|style|other",
+                   "scope_key": "term_en / null",
+                   "guess_answer": "co translator zvolil / null u blocking",
+                   "text": "...", "severity": "guess"|"blocking"}]}
   ```
-  `guess` = přeloženo odhadem, jen se zapíše otázka. `blocking` = "fakt nevím"
-  → kapitola `needs_human`. `new_terms` jdou do glosáře jako `candidate`.
+  `guess` = přeloženo odhadem (má `guess_answer`), zapíše se otázka. `blocking`
+  = "fakt nevím" (bez `guess_answer`) → kapitola `needs_human`. `new_terms` jdou
+  do glosáře jako `candidate`. `used_terms` z FINÁLNÍHO překladu → `term_mentions`.
 - Model: `claude-sonnet-5`. Největší žrout tokenů. `max_tokens` velký (~16000)
   + pojistka na useknutí (translator: useknuto = `error`, viz Chyby).
 
@@ -256,7 +271,8 @@ prompt, zavolají klienta, zparsují. Žádná DB, žádné soubory.
   {"verdict": "pass"|"revise",
    "findings": [{"severity": "critical"|"minor", "cz_excerpt", "issue", "suggestion"}]}
   ```
-- Revizní smyčka se spouští jen na `critical` nálezy. `minor` se zapíšou, neřeší.
+- Revizní smyčku spouští `critical` nález kritika NEBO concordance `leak` NEBO
+  `inconsistency` u schváleného termínu. `minor` se jen zapíše.
 - Model: `claude-sonnet-5`.
 
 ## Provider vrstva (`llm/client.py`)
@@ -264,6 +280,7 @@ prompt, zavolají klienta, zparsují. Žádná DB, žádné soubory.
 ```python
 class LLMClient(Protocol):
     def complete(self, *, system: str, user: str, max_tokens: int, model: str) -> Completion: ...
+    def count_tokens(self, *, system: str, user: str, model: str) -> int: ...
 
 @dataclass
 class Completion:
@@ -275,14 +292,18 @@ class Completion:
 
 - `AnthropicClient` = jediná implementace v pokusu 2, jediný soubor importující
   `anthropic`. `max_retries` nastaveno na SDK klientovi (config, default 8).
-- Agenti klienta dostanou parametrem, nikdy ho nevytváří. Pipeline ho sestaví
-  z configu.
+  **Zůstává čistý - žádná DB, žádné `run_id`.**
+- Agenti klienta dostanou parametrem, nikdy ho nevytváří.
+- **Logging spotřeby:** pipeline obalí klienta do `LoggedLLMClient(inner,
+  run_id, agent, state)` - ten po každém `complete()` zapíše řádek do
+  `llm_calls` (přes `state`). Agenti dostanou obalený klient, nepoznají rozdíl.
+  Tak se neporuší hranice modulů a usage přežije pád procesu.
+- **Cost guard běží v pipeline PŘED `complete()`:** zavolá `count_tokens()`
+  (samostatná metoda, nevolá model), přičte `spent_so_far` z `llm_calls`,
+  porovná se stropem.
 - **Sonnet 5:** neposílat `temperature` / `top_p` / `top_k` (model non-default
-  sampling odmítá 400). 1M kontext, až 128k výstup.
-- Klient po KAŽDÉM volání zapíše spotřebu do DB (tabulka `llm_calls`), ne až
-  agregát na konci - jinak se in-flight usage při pádu ztratí a cost guard je slepý.
-- `complete()` navíc vrací `count_tokens(system, user)` odhad (pre-flight pro
-  cost guard) - k dispozici i samostatně bez volání modelu.
+  sampling odmítá 400). Předpoklady o kontextu/výstupu (1M / 128k) ověřit proti
+  Anthropic docs a držet v `config.py`, ne v logice.
 - **Kam půjde per-provider varianta promptů ("později"):** každý agent bude mít
   `SYSTEM_PROMPTS = {"anthropic": "..."}` klíčováno rodinou providera. V pokusu 2
   jen `"anthropic"`. Zapsáno v designu, nepostaveno.
@@ -330,8 +351,9 @@ zdrojů: `translated_text` kapitol (v DB) a tabulky `term_mentions` (plněná
 z translatorových `used_terms`).
 
 - **Kontrola kapitoly** (`check_chapter(cz_text, glossary) → list[Issue]`):
-  - `leak`: EN podoba termínu (term_en / alias) je v CZ textu nepřeložená → vždy
-    critical (reálný bug, triviální detekce)
+  - `leak`: EN podoba termínu je v CZ textu, ale termín se MÁ překládat
+    (`cz != term_en`) → critical. Pro `keep` položky (`cz == term_en`) se `leak`
+    nikdy nehlásí - tam je EN podoba správně.
   - `inconsistency`: očekávaný CZ tvar (`seeded`/`approved` termín) v kapitole
     chybí, ale je tam jiná známá varianta → critical u `approved`/`seeded`,
     jinak jen otázka
@@ -354,8 +376,10 @@ z translatorových `used_terms`).
   tvá dřívější rozhodnutí mají přednost, nové nálezy scouta se přidají jako
   nepotvrzené. `scan` zapisuje **jen** `guide.draft.json`, nikdy `guide.json`,
   takže opakovaný `scan` nikdy nepřepíše tvoje rozhodnutí.
-- `POST /api/guide` → validace, zápis `guide.json`. Seed glosáře (`seeded`
-  položky) se z návodu přegeneruje při každém uložení.
+- `POST /api/guide` → validace, zápis `guide.json`, pak reseed glosáře:
+  přegeneruje **jen `seeded`** položky z návodu; `approved` a `candidate`
+  (runtime) zůstávají. Konflikt (seeded termín teď koliduje s `approved`):
+  `approved` vyhrává (novější lidské rozhodnutí přes `answer`).
 - Stránka - sekce formuláře, strukturovaný vstup (roletky, zatržítka - menší
   šance na překlep):
   - **Postavy:** tabulka, řádek = jméno (readonly) + aliasy + roletka
@@ -381,8 +405,8 @@ chapters (idx PK, title, raw_text, translated_text, status,
 
 questions (id PK, chapter_idx, kind, text, scope_key, guess_answer,
            severity, answer, resolved_at)
-    kind:     term | name | style | other
-    scope_key: term_en (u term/name) nebo klíč pravidla (u style)
+    kind:     term | name | relationship | style | other
+    scope_key: term_en (term/name), "a|b" (relationship), null (style/other)
     severity: guess | blocking
 
 term_mentions (id PK, term_en, cz_form, chapter_idx)
@@ -391,8 +415,10 @@ term_mentions (id PK, term_en, cz_form, chapter_idx)
 drift_reports (id PK, up_to_chapter, report TEXT, created_at)
 
 runs (id PK, command, started_at, ended_at, status)
-llm_calls (id PK, run_id FK, agent, model, input_tokens, output_tokens, ts)
-    zápis po KAŽDÉM volání; cost guard i závěrečný report čtou odtud
+llm_calls (id PK, run_id FK, agent, provider, model, input_tokens, output_tokens,
+           estimated_cost_usd, truncated, status, ts)
+    zápis po KAŽDÉM volání (přes LoggedLLMClient); cost guard i report čtou odtud
+    cena: input_tokens*sazba_in + output_tokens*sazba_out, sazby v config.py
 ```
 
 **Granularita navázání = kapitola.** Kapitola co spadne na scéně 3 z 5 se
@@ -411,9 +437,9 @@ jednu `error`, pokračuj další.
 | **API dočasná** | 429, 5xx, timeout | SDK retry (max_retries=8, backoff); po vyčerpání → recoverable |
 | **Recoverable kapitola** | retry vyčerpán, neočekávaná výjimka v jedné kapitole | kapitola `error`, `run` pokračuje |
 | **Useknutý výstup** | translator | `error` (useknutý překlad = ztráta dat) |
-| | kritik | varování, zparsuj část (nálezy nejsou autoritativní vstup) |
+| | kritik | 1× retry s vyšším `max_tokens`; když zas useknuto → kapitola `flagged` (nepředpokládat pass) |
 | | scout | **fatal běhu** - viz sekce Scout (částečný návod znehodnotí vše) |
-| **Rozbitý výstup agenta** | neparsovatelný | translator/scout → `error` resp. fatal; kritik → varování |
+| **Rozbitý výstup agenta** | neparsovatelný | translator → `error`; scout → fatal; kritik → 1× retry, pak `flagged` |
 | **Pád procesu** (Ctrl-C, stroj) | | commit po kapitolách → `run` naváže; `scan` běží znovu |
 
 Rozlišení fatal vs recoverable: první volání každého `run`/`scan` je "kanárek" -
