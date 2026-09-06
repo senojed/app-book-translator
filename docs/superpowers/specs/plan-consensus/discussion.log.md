@@ -24,3 +24,9 @@ Max kol: 10
 - Claude: CHANGES_NEEDED (1 vlastní IMPORTANT) → round-3-claude.md
 - Opraveno: cost guard + logging sloučeny do PipelineLLMClient.complete() (má system/user/max_tokens z Protocolu); translator už nehlásí used_terms - concordance.build_mentions staví term_mentions deterministicky z EN+CZ; přidán stav 'processing' + file lock (.book-translator.lock, PID) - answer/run/scan/init se navzájem vylučují, read-only ne; check_chapter bere EN text + nález 'omission'; cost formula + max_tokens*out_rate; rollback wording; chunked scout merge detailně (casefold klíč, alias union, kolize->must_decide, konfliktní vztahy->null+must_decide). NIT: Stav->v revizi, answer <question_id>.
 - Sporné: nic. Rozsah změn klesá (kolo 1: 10+, kolo 2: 12, kolo 3: 8).
+
+## Kolo 4 — 2026-09-06T15:51:20Z
+- Codex: CHANGES_NEEDED (1 BLOCKING, 5 IMPORTANT, 2 NIT) → round-4-codex.md
+- Claude: CHANGES_NEEDED (0 vlastních) → round-4-claude.md
+- Opraveno: answer řeší 1 otázku, needs_human→pending jen když nezbývá blocking otázka; glosář = JEDINÝ zdroj termín→CZ v promptu (guide neemit termíny, approved má přednost); glossary +variants[] (z mentions/kandidátů/odpovědí) - rozlišuje inconsistency vs omission; kanárek/processing transakčně dotažen (processing commit před 1. voláním, fatal→zůstane processing, další run vrátí na pending); used_terms úplně odstraněno; PipelineLLMClient jednotný název, per-volání; nits (model/ceny config+validace, data/ output/ do dir stromu).
+- Sporné: nic. Konverguje (kolo 4 = 0 vlastních Claude nálezů).

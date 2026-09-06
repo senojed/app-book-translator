@@ -93,7 +93,10 @@ book-translator/
 │   │   └── critic.py    # nezávislá revize, nálezy se závažností
 │   ├── pipeline.py      # orchestrace: sekvence na kapitolu + revizní smyčka
 │   └── review_ui/       # lokální web UI pro review fázi (izolované)
-└── tests/
+├── tests/
+├── data/               # runtime (gitignored): state.sqlite3, guide*.json,
+│                       #   glossary.json, .book-translator.lock
+└── output/             # runtime (gitignored): kniha_cz.txt
 ```
 
 ### Hranice modulů
@@ -175,16 +178,17 @@ pending ──překlad+kritika──┬──> done
                            └──> error           (recoverable výjimka)
 
 error       ──běžný `run` (auto retry)──────────────────────> pending
-needs_human ──answer (všechny blocking otázky kapitoly)─────> pending  (vždy)
+needs_human ──answer, když už žádná blocking otázka kapitoly nezbývá──> pending
 flagged     ──answer (mění-li výsledek) / `run --retry-flagged`──> pending
 done        ──answer na guess otázku, když answer ≠ guess───> pending
 ```
 
-**Requeue po `answer` (přesná pravidla):**
+**Requeue po `answer` (`answer` řeší JEDNU otázku):**
 1. zapiš odpověď. U `term`/`name`: povyš glosář `candidate` → `approved`
-   (nebo oprav CZ). U `style`: `guide.add_rule()`.
-2. **blocking otázka** (kapitola `needs_human`, žádný `guess_answer`): kapitola
-   → `pending` VŽDY (původní překlad měl díru).
+   (nebo oprav CZ), přidej starý guess jako `variant`. U `style`: `guide.add_rule()`.
+2. **blocking otázka** (kapitola `needs_human`): kapitolu vrať na `pending` jen
+   když pro její `chapter_idx` NEZBÝVÁ žádná nezodpovězená `severity=blocking`
+   otázka. Jinak zůstává `needs_human`.
 3. **guess otázka** (kapitola už `done`/`flagged`):
    - `answer` == `guess_answer` → nic, žádný přepočet
    - jinak → `affected_chapters` (kapitoly, jejichž `term_mentions` obsahují
@@ -302,8 +306,9 @@ class Completion:
   `anthropic`. `max_retries` na SDK klientovi (config, default 8). **Čistý -
   žádná DB, žádné `run_id`, žádný cost guard.**
 - **`PipelineLLMClient(inner, run_id, agent, state, config)`** - obal, který
-  pipeline předá agentům místo holého klienta. Implementuje stejný Protocol.
-  Jeho `complete(system, user, max_tokens, model)`:
+  pipeline vytvoří **zvlášť pro každé volání agenta** (`agent` = label do logu)
+  a předá tomu agentovi místo holého klienta. Levný objekt. Implementuje stejný
+  Protocol. Jeho `complete(system, user, max_tokens, model)`:
   1. odhad ceny volání = `count_tokens(system,user)*in_rate + max_tokens*out_rate`
      (konzervativně počítá plný `max_tokens` na výstupu - u překladu je output
      hlavní náklad)
@@ -321,6 +326,9 @@ class Completion:
 
 ### Modely (`config.py`, role → model id)
 Vše `claude-sonnet-5` (levnější a novější než `claude-sonnet-4-6`).
+Model IDs, kontextové limity i ceny ($/MTok in/out pro cost guard) jsou
+konfigurační hodnoty v `config.py`, ne konstanty v logice. **Před pilotem
+ověřit proti Anthropic docs** (model active? ceny? context/output limit?).
 Později volitelně: translator + kritik na Opus pro kvalitu, scout zůstává Sonnet.
 
 ## Deterministické nástroje
@@ -343,18 +351,28 @@ Později volitelně: translator + kritik na Opus pro kvalitu, scout zůstává S
   ```
 - `guide.draft.json` = výstup scouta (bohatší: note, suggested, must_decide)
 - `load_guide()`, `save_guide()`, `guide_as_prompt_block()`, `add_rule()`
+- **Jediný zdroj pravdy pro termín→CZ v promptu je glosář.**
+  `guide_as_prompt_block()` emituje styl, vztahy (tyká/vyká) a rozhodnutí
+  keep/translate, ale **NE** dvojice termín→český překlad - ty jdou do promptu
+  jen z `glossary.as_prompt_block()`. Návod glosář jen seeduje; po `answer` má
+  `approved` glosář přednost a v promptu není nic, co by ho přebíjelo.
 
 ### `glossary.py`
-- `{term_en: {cz, note, type, status}}`
+- `{term_en: {cz, variants: [], note, type, status}}`
   - `type`: name | place | term
   - `status`: `seeded` (z návodu), `approved` (člověk potvrdil přes `answer`),
     `candidate` (translator navrhl, nepotvrzeno)
-- seed z návodu (keep → cz=term_en, translate → cz=guide.cz; místa, termíny) = `seeded`
-- za běhu: `new_terms` z translatora → `candidate` (dedup podle term_en; existující
-  se nepřepisuje)
-- `as_prompt_block()` řadí `seeded`+`approved` jako závazné, `candidate` uvádí
-  zvlášť jako "návrh, může se změnit"
-- `add_candidate()`, `promote(term_en, cz)`, `as_prompt_block()`
+  - `variants`: další české tvary téhož termínu, které concordance viděla
+    v `term_mentions` / kandidátech / lidských odpovědích. Slouží k rozlišení
+    `inconsistency` (známá varianta ≠ kanonický `cz`) od `omission` (žádná
+    známá podoba). Novotvar, který ještě nikde nebyl, concordance neuvidí jako
+    inconsistency hned - chytne ho až drift check napříč kapitolami.
+- seed z návodu (keep → cz=term_en, translate → cz=guide.cz) = `seeded`
+- za běhu: `new_terms` → `candidate` (dedup podle term_en; existující nepřepisuje)
+- `as_prompt_block()` řadí `seeded`+`approved` jako závazné, `candidate` zvlášť
+  jako "návrh, může se změnit"
+- `add_candidate()`, `promote(term_en, cz)`, `add_variant(term_en, cz_form)`,
+  `as_prompt_block()`
 
 ### `concordance.py` - deterministicky, BEZ LLM
 Nahrazuje terminology + cross_reference agenty z pokusu 1. Vstup: EN a CZ text
@@ -368,9 +386,10 @@ kapitoly + glosář. Nedůvěřuje LLM metadatům.
 - **`check_chapter(en_text, cz_text, glossary) → list[Issue]`:**
   - `leak`: EN podoba překládaného termínu (`cz != term_en`) je v CZ textu →
     critical. `keep` položky (`cz == term_en`) se nehlásí.
-  - `inconsistency`: termín je v EN, v CZ je jeho známá varianta ≠ `approved`/
-    `seeded` `cz` → critical u approved/seeded, jinak otázka.
-  - `omission`: termín je v EN, v CZ žádná známá podoba → minor (ukáže se, nepadá)
+  - `inconsistency`: termín je v EN, v CZ je některá jeho `variant` ≠ kanonický
+    `cz` → critical u approved/seeded, jinak otázka.
+  - `omission`: termín je v EN, v CZ ani `cz` ani žádná `variant` → minor
+    (ukáže se, nepadá; může to být legitimní parafráze i chyba)
 - **Drift napříč kapitolami** (`check_drift(term_mentions, glossary) → report`):
   pro každý `term_en` seskup `cz_form` z `term_mentions` všech `done`/`flagged`
   kapitol; 2+ zjevně různé kmeny (ne jen skloňování stejného slova) → drift nález
@@ -426,14 +445,15 @@ questions (id PK, chapter_idx, kind, text, scope_key, guess_answer,
     severity: guess | blocking
 
 term_mentions (id PK, term_en, cz_form, chapter_idx)
-    plněno z translatorových used_terms; zdroj dat pro drift check
+    plněno deterministicky přes concordance.build_mentions(EN,CZ,glosář);
+    zdroj dat pro drift check
 
 drift_reports (id PK, up_to_chapter, report TEXT, created_at)
 
 runs (id PK, command, started_at, ended_at, status)
 llm_calls (id PK, run_id FK, agent, provider, model, input_tokens, output_tokens,
            estimated_cost_usd, truncated, status, ts)
-    zápis po KAŽDÉM volání (přes LoggedLLMClient); cost guard i report čtou odtud
+    zápis po KAŽDÉM volání (přes PipelineLLMClient); cost guard i report čtou odtud
     cena: input_tokens*sazba_in + output_tokens*sazba_out, sazby v config.py
 ```
 
@@ -465,8 +485,12 @@ jednu `error`, pokračuj další.
 | **Rozbitý výstup agenta** | neparsovatelný | translator → `error`; scout → fatal; kritik → 1× retry, pak `flagged` |
 | **Pád procesu** (Ctrl-C, stroj) | | commit po kapitolách → `run` naváže; `scan` běží znovu |
 
-Rozlišení fatal vs recoverable: první volání každého `run`/`scan` je "kanárek" -
-selže-li fatal třídou, končíme dřív než se cokoli zapíše.
+**Kanárek a transakční hranice.** Krok 0 (`chapters.status → processing`) se
+commituje před prvním LLM voláním. První volání běhu je fatal-kanárek: selže-li
+fatal třídou, příkaz skončí, kapitola zůstane `processing` (žádná se nezapíše
+jako `done`/`flagged`/`error`). Start dalšího `run` každou uvízlou `processing`
+vrátí na `pending`. Takže "fatal nesahá na kapitoly" = žádná kapitola nedostane
+finální stav; dočasné `processing` je samoopravné.
 
 ### Cost guard
 - Sedí v `PipelineLLMClient.complete()` (viz Provider vrstva) - má tam k
@@ -509,7 +533,7 @@ revizní smyčka - test napřed).
 3. `glossary` (candidate/approved) + `guide` (+ merge draft/final) + `concordance`
    (leak, inconsistency, drift nad `term_mentions`) + testy
 4. `agents/scout` (+ `--chunked` merge) + test
-5. `agents/translator` (čerstvý + revizní režim, `used_terms`) + test
+5. `agents/translator` (čerstvý + revizní režim, question metadata) + test
 6. `agents/critic` + test
 7. `pipeline` (revizní smyčka, requeue logika, fatal/recoverable klasifikace,
    cost guard) + test
