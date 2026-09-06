@@ -31,3 +31,11 @@ Max kol: 10
 - IMPORTANT: nové termíny v kapitole exempt z concordance té kapitoly (v1 chování explicitní); review reseed automatizovaný test (monkeypatch run_review_server 0/1); INSERT + IntegrityError remap místo INSERT OR IGNORE (visící FK).
 - NIT: nt/cand naming sjednoceno; test count review UI.
 - Sporné: nic.
+
+## Kolo 4 — 2026-09-06T18:32:32Z
+- Codex: CHANGES_NEEDED (1 BLOCKING, 4 IMPORTANT, 2 NIT) → round-4-codex.md
+- Claude: CHANGES_NEEDED (1 vlastní IMPORTANT) → round-4-claude.md
+- BLOCKING: FatalRunError z critic.review spolknut → kapitola flagged, run pokračuje → oprava: FatalRunError se všude chytá PRVNÍ a re-raise (pipeline critic handling, _guard kolem count_tokens).
+- IMPORTANT: _price 0.0 pro neznámý model = cost guard tiše off → raise FatalRunError. float(ans) na strop ValueError → reprompt 1x, pak FatalRunError. Export coverage tenká → full-marker/only-done/read-only testy. Review reseed negative test neefektivní → rozděleno pozitivní/negativní (fresh DB, guide uložen ale rc=1 → žádný reseed).
+- NIT: except Exception (ne trojice); Task 16 spouští test_cli.py.
+- Sporné: nic. Rozsah klesá.

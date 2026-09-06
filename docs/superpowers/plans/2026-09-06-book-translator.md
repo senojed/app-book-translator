@@ -782,6 +782,26 @@ def test_cost_guard_non_interactive_hard_stops(tmp_path, monkeypatch):
                           config_mod=config, interactive=False)
     with pytest.raises(FatalRunError):
         c.complete(system="s", user="u", max_tokens=10, model="claude-sonnet-5")
+
+
+def test_unknown_model_price_raises_fatal(tmp_path):
+    db = _db(tmp_path)
+    rid = state.create_run(db, "run")
+    c = PipelineLLMClient(FakeLLMClient([Completion("x", False, 1, 1)]),
+                          run_id=rid, agent="translator", db_path=db, config_mod=config)
+    with pytest.raises(FatalRunError):
+        c.complete(system="s", user="u", max_tokens=10, model="gpt-neexistuje")
+
+
+def test_cost_guard_invalid_ceiling_input_raises_fatal(tmp_path, monkeypatch):
+    db = _db(tmp_path)
+    rid = state.create_run(db, "run")
+    monkeypatch.setattr(config, "MAX_SPEND_USD", 0.0)
+    c = PipelineLLMClient(FakeLLMClient([Completion("x", False, 1, 1)]),
+                          run_id=rid, agent="scout", db_path=db, config_mod=config,
+                          confirm=lambda _: "abc")
+    with pytest.raises(FatalRunError):
+        c.complete(system="s", user="u", max_tokens=10, model="claude-sonnet-5")
 ```
 
 - [ ] **Step 2: Run to verify fail** — `python -m pytest tests/test_pipeline_client.py -v` → FAIL.
@@ -851,16 +871,21 @@ class PipelineLLMClient:
         return self._inner.count_tokens(system=system, user=user, model=model)
 
     def _price(self, model: str) -> tuple[float, float]:
-        return (self._cfg.PRICE_IN_PER_MTOK.get(model, 0.0),
-                self._cfg.PRICE_OUT_PER_MTOK.get(model, 0.0))
+        if model not in self._cfg.PRICE_IN_PER_MTOK or model not in self._cfg.PRICE_OUT_PER_MTOK:
+            raise FatalRunError(
+                f"Model {model!r} nemá sazby v config.PRICE_*_PER_MTOK - "
+                "cost guard by byl slepý. Doplň sazby.")
+        return (self._cfg.PRICE_IN_PER_MTOK[model], self._cfg.PRICE_OUT_PER_MTOK[model])
 
     def _guard(self, system: str, user: str, max_tokens: int, model: str) -> None:
         from src import state
-        in_rate, out_rate = self._price(model)
+        in_rate, out_rate = self._price(model)   # může vyhodit FatalRunError
         try:
             in_tok = self._inner.count_tokens(system=system, user=user, model=model)
+        except FatalRunError:
+            raise
         except Exception:
-            in_tok = (len(system) + len(user)) // 4
+            in_tok = (len(system) + len(user)) // 4   # hrubý odhad, jen na non-fatal
         est = in_tok / 1e6 * in_rate + max_tokens / 1e6 * out_rate
         spent = state.spent_so_far(self._db, self._run_id)
         ceiling = state.get_run_spend_ceiling(self._db, self._run_id) or 0.0
@@ -871,13 +896,19 @@ class PipelineLLMClient:
             raise FatalRunError(
                 f"Cost guard: strop ${limit:.2f} překročen (utraceno ~${spent:.2f} "
                 f"+ odhad ~${est:.2f}). Non-interactive režim, zastavuji.")
-        ans = self._confirm(
-            f"Cost guard: utraceno ~${spent:.2f}, odhad tohoto volání ~${est:.2f}, "
-            f"strop ${limit:.2f}. Nový strop v $ [prázdné = stop]: ")
-        ans = (ans or "").strip()
-        if not ans:
-            raise FatalRunError("Cost guard: běh zastaven uživatelem.")
-        state.set_run_spend_ceiling(self._db, self._run_id, float(ans))
+        for _ in range(2):   # 1 prompt + 1 reprompt na nevalidní vstup
+            ans = (self._confirm(
+                f"Cost guard: utraceno ~${spent:.2f}, odhad ~${est:.2f}, "
+                f"strop ${limit:.2f}. Nový strop v $ [prázdné = stop]: ") or "").strip()
+            if not ans:
+                raise FatalRunError("Cost guard: běh zastaven uživatelem.")
+            try:
+                new_limit = float(ans)
+            except ValueError:
+                continue   # reprompt
+            state.set_run_spend_ceiling(self._db, self._run_id, new_limit)
+            return
+        raise FatalRunError("Cost guard: nevalidní vstup stropu, zastavuji.")
 
     def complete(self, *, system: str, user: str, max_tokens: int, model: str) -> Completion:
         from src import state
@@ -909,7 +940,7 @@ Poznámka: `from src import state` uvnitř metod (ne top-level) je záměr - `cl
 nesmí mít `state` jako top-level import kvůli hranicím modulů a možnému cyklu
 (state nezná client, client zná state jen pro logging). Lazy import to řeší.
 
-- [ ] **Step 5: Run to verify pass** — `python -m pytest tests/test_pipeline_client.py tests/test_state_schema.py -v` → PASS (5 pipeline_client testů + schema testy).
+- [ ] **Step 5: Run to verify pass** — `python -m pytest tests/test_pipeline_client.py tests/test_state_schema.py -v` → PASS (8 pipeline_client testů + schema testy).
 
 - [ ] **Step 6: Commit**
 
@@ -1748,7 +1779,13 @@ git commit -m "feat: agents/critic (nezávislá revize, Finding s action routing
       notes_json=json.dumps(findings, ensure_ascii=False), status=status,
       new_candidates=new_candidates, mentions=mentions, questions=questions)` JEDNOU.
     - status: `needs_human` když je blocking `question` (translator severity=blocking); `flagged` když `has_revise_triggers(findings)` po vyčerpání `MAX_REVIZE`; jinak `done`
-    - `OutputTruncated`/`ValueError` z translatora → propaguj (volající `run` → kapitola `error`); z `critic.review` → chyť, `status="flagged"`, findings dostane pseudo-Finding `{source:"critic", type:"fluency", severity:"critical", action:"note", issue:"kritik selhal: <e>"}`
+    - **Chyby v `process_chapter`:** `FatalRunError` (z translatora i kritika) →
+      NEchytat, propaguj (volající `run` → ukončí celý běh). `OutputTruncated` /
+      `ValueError` z translatora → propaguj (→ kapitola `error`). `OutputTruncated`
+      / `ValueError` / jiná výjimka z `critic.review` → chyť **až po**
+      `except FatalRunError: raise`, `status="flagged"`, findings dostane
+      pseudo-Finding `{source:"critic", type:"fluency", severity:"critical",
+      action:"note", issue:"kritik selhal: <e>"}`
   - `run_drift_check(db_path, up_to_chapter: int) -> list[dict]` - načti `term_mentions` JOIN chapters WHERE status IN ('done','flagged') AND idx <= up_to_chapter; `concordance.check_drift(rows)`; `state.save_drift_report(db, up_to_chapter, {"drift": drifts})`; pro každý DriftFinding `state.upsert_open_question({chapter_idx: None, kind: "term", scope_key: term_id, text: "Drift: <formy>", guess_answer: <nejčastější tvar>, severity: "guess"})`
   - `has_revise_triggers(findings) -> bool` - `any(f["action"] == "revise" for f in findings)`
   - `_glossary_block(db)` / `_guide_block(guide)` - helpery pro promptové bloky (`glossary.as_prompt_block(db)`, `guide.guide_as_prompt_block(guide)`)
@@ -1854,6 +1891,20 @@ def test_processing_recovered_before_next_run(tmp_path, monkeypatch):
     assert state.recover_processing(db) == 1
 
 
+def test_critic_fatal_error_propagates_not_flagged(tmp_path, monkeypatch):
+    db = _db(tmp_path)
+    from src.llm.client import FatalRunError
+    monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
+        "překlad", [], [], []))
+    def boom(*a, **k): raise FatalRunError("bad key")
+    monkeypatch.setattr(C, "review", boom)
+    ch = state.get_chapter(db, 1)
+    with __import__("pytest").raises(FatalRunError):
+        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    assert state.get_chapter(db, 1)["status"] != "flagged"
+
+
 def test_run_drift_check_creates_global_question(tmp_path):
     db = _db(tmp_path)
     with state.connect(db) as conn:
@@ -1892,7 +1943,7 @@ def test_commit_chapter_result_is_atomic(tmp_path):
 ```
 
 - [ ] **Step 3b: Implement `src/pipeline.py`.** Pipeline importuje `from src.agents import translator, critic` a `from src import concordance, glossary, guide as guide_mod, state, ingest` - agenty volá modulově-kvalifikovaně (`translator.translate_scene`) kvůli monkeypatch.
-- [ ] **Step 4: Run to verify pass** — PASS (7 pipeline testů + atomicity test).
+- [ ] **Step 4: Run to verify pass** — PASS (8 pipeline testů + atomicity test).
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -1960,12 +2011,12 @@ git commit -m "feat: pipeline (process_chapter, revizní smyčka, transakce A/B,
           summary = pipeline.process_chapter(db, ch, client_factory=cf, guide=g)
       except FatalRunError:
           raise                        # bublá do lifecycle try, status zůstane "fatal", exit 1
-      except (OutputTruncated, ValueError, Exception) as e:
+      except Exception as e:            # OutputTruncated i ValueError jsou Exception - stejný handling
           state.update_chapter(db, ch["idx"], status="error",
                                notes=json.dumps({"error": f"{type(e).__name__}: {e}"},
                                                 ensure_ascii=False))
       ```
-      **Pořadí `except` je závazné - `FatalRunError` PRVNÍ a jen `raise`** (je to `Exception`; `except Exception` by fatal chybu jinak označil jako `error` kapitoly). Nechytat `KeyboardInterrupt` tady - patří do lifecycle. Každých `config.CROSS_REF_EVERY_N` hotových kapitol → `pipeline.run_drift_check(db, ch["idx"])`. Po smyčce: report (`state.counts_by_status`) + `_print_usage(db, rid)` (suma z `llm_calls`). `finish_run` řeší lifecycle `finally`.
+      **Pořadí `except` je závazné - `FatalRunError` PRVNÍ a jen `raise`** (je to `Exception`; `except Exception` samo by fatal chybu jinak označilo jako `error` kapitoly). `KeyboardInterrupt` NENÍ `Exception` - projde ven do lifecycle sám. Každých `config.CROSS_REF_EVERY_N` hotových kapitol → `pipeline.run_drift_check(db, ch["idx"])`. Po smyčce: report (`state.counts_by_status`) + `_print_usage(db, rid)` (suma z `llm_calls`). `finish_run` řeší lifecycle `finally`.
     - `questions` → vypiš `state.unanswered_questions`
     - `answer QID TEXT` → `requeue.apply_answer`, vypiš co se requeue
     - `status` → `state.counts_by_status` + seznam s markery (`OK/../!!/??/XX/~~` pro done/pending/flagged/needs_human/error/processing)
@@ -2091,17 +2142,45 @@ def test_status_runs_without_db_error(tmp_path, monkeypatch):
     assert _run(["status"], tmp_path, monkeypatch) == 0
 
 
-def test_export_marks_missing_chapters(tmp_path, monkeypatch, capsys):
+def _init_4ch(tmp_path, monkeypatch):
     book = tmp_path / "k.txt"
-    book.write_text("Chapter 1\n" + "t " * 60 + "\nChapter 2\n" + "t " * 60,
-                    encoding="utf-8")
+    body = "t " * 60
+    book.write_text("".join(f"Chapter {i}\n{body}\n" for i in range(1, 5)), encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
-    state.update_chapter("data/state.sqlite3", 1, status="done",
-                         translated_text="Přeložená kapitola 1.")
-    _run(["export"], tmp_path, monkeypatch)
+    db = "data/state.sqlite3"
+    state.update_chapter(db, 1, status="done", translated_text="Kapitola 1 CZ.")
+    state.update_chapter(db, 2, status="flagged", translated_text="Kapitola 2 CZ.",
+                         notes=json.dumps([{"issue": "nekonzistentní termín",
+                                            "action": "revise"}]))
+    state.update_chapter(db, 3, status="needs_human", translated_text="")
+    state.update_chapter(db, 4, status="error", notes='{"error":"X"}')
+    return db
+
+
+def test_export_full_markers(tmp_path, monkeypatch, capsys):
+    db = _init_4ch(tmp_path, monkeypatch)
+    before = {c["idx"]: c["status"] for c in state.chapters_by_status(
+        db, ("done", "flagged", "needs_human", "error"))}
+    assert _run(["export"], tmp_path, monkeypatch) == 0
     text = open("output/kniha_cz.txt", encoding="utf-8").read()
-    assert "Přeložená kapitola 1." in text
-    assert "CHYBÍ KAPITOLA 2" in text
+    assert "Kapitola 1 CZ." in text
+    assert "Kapitola 2 CZ." in text and "REVIDOVAT" in text
+    assert "CHYBÍ KAPITOLA 3" in text and "CHYBÍ KAPITOLA 4" in text
+    out = capsys.readouterr().out
+    assert "3" in out and "4" in out          # varování na stdout o vynechaných
+    after = {c["idx"]: c["status"] for c in state.chapters_by_status(
+        db, ("done", "flagged", "needs_human", "error"))}
+    assert before == after                     # export je read-only
+
+
+def test_export_only_done(tmp_path, monkeypatch, capsys):
+    _init_4ch(tmp_path, monkeypatch)
+    assert _run(["export", "--only-done"], tmp_path, monkeypatch) == 0
+    text = open("output/kniha_cz.txt", encoding="utf-8").read()
+    assert "Kapitola 1 CZ." in text
+    assert "Kapitola 2 CZ." not in text        # flagged vynechána
+    assert "REVIDOVAT" not in text and "CHYBÍ KAPITOLA" not in text
+    assert "2" in capsys.readouterr().out       # ale seznam vynechaných na stdout
 
 
 def test_run_processes_queue_with_monkeypatched_pipeline(tmp_path, monkeypatch):
@@ -2171,7 +2250,7 @@ git commit -m "feat: CLI (init/scan/run/status/questions/answer/export) + requeu
   - `server.validate(payload: dict) -> list[str]` - vrací seznam chyb (prázdný = OK): `render=translate` bez `cz`; `must_decide` bez `answer`.
   - `server.build_app(draft_path, guide_path, on_saved) -> FastAPI` - `GET /` → `index.html`; `GET /api/guide` → `merge_draft_and_guide`; `POST /api/guide` → `validate` → chyba `422`; jinak `apply_must_decide` → `save_guide` → `on_saved()` → `{"ok": true}`
   - `server.run_review_server(draft_path, guide_path) -> int` - uvicorn + `webbrowser.open`; po úspěšném POST `should_exit=True` → return 0; SIGINT/zavření bez uložení → return 1
-  - `main` `review` subcommand: `with state.run_lock(config.LOCK_PATH):` → `rc = server.run_review_server(...)`; `if rc == 0: glossary.seed_from_guide(db, guide.load_guide(config.GUIDE_PATH))` (reseed dělá CLI, ne UI - drží izolaci)
+  - `main` `review` subcommand: `with state.run_lock(config.LOCK_PATH):` → `rc = server.run_review_server(config.GUIDE_DRAFT_PATH, config.GUIDE_PATH)`; `if rc == 0: glossary.seed_from_guide(config.DB_PATH, guide.load_guide(config.GUIDE_PATH))` (reseed dělá CLI, ne UI - drží izolaci); `return rc`
 
 - [ ] **Step 1: Write failing tests** — `tests/test_review_ui.py`
 
@@ -2249,28 +2328,42 @@ def test_post_routes_must_decide_answer_into_terms(tmp_path):
 - [ ] **Step 5: Test CLI `review` reseed** — `tests/test_cli.py`:
 
 ```python
-def test_review_reseeds_only_on_success(tmp_path, monkeypatch):
+def test_review_reseeds_on_success(tmp_path, monkeypatch):
     book = tmp_path / "k.txt"; book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
-    import json as _j
-    _j.dump({"characters": [{"name_en": "Harry", "render": "keep"}], "places": [],
-             "terms": [], "relationships": [], "style_notes": "", "must_decide": []},
-            open("data/guide.draft.json", "w", encoding="utf-8"))
     import src.review_ui.server as SRV
-    from src import state, guide as G
-    monkeypatch.setattr(SRV, "run_review_server", lambda *a, **k: (
+    from src import guide as G, glossary
+    def fake_ok(*a, **k):
         G.save_guide("data/guide.json", {"characters": [{"name_en": "Harry",
-        "render": "keep"}], "places": [], "terms": [], "relationships": [],
-        "style": "", "rules": []}) or 0))
+            "render": "keep"}], "places": [], "terms": [], "relationships": [],
+            "style": "", "rules": []})
+        return 0
+    monkeypatch.setattr(SRV, "run_review_server", fake_ok)
     assert _run(["review"], tmp_path, monkeypatch) == 0
-    from src import glossary
-    assert any(t["status"] == "seeded" for t in glossary.all_terms("data/state.sqlite3"))
-    # a naopak: rc != 0 → žádný reseed
-    monkeypatch.setattr(SRV, "run_review_server", lambda *a, **k: 1)
-    _run(["review"], tmp_path, monkeypatch)  # exit code 1 od main je OK
+    assert any(t["canonical_en"] == "Harry" and t["status"] == "seeded"
+               for t in glossary.all_terms("data/state.sqlite3"))
+
+
+def test_review_does_not_reseed_on_failure(tmp_path, monkeypatch):
+    book = tmp_path / "k.txt"; book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    import src.review_ui.server as SRV
+    from src import guide as G, glossary
+    def fake_fail(*a, **k):
+        # UI "uložilo" guide, ale server skončil chybou (rc=1)
+        G.save_guide("data/guide.json", {"characters": [{"name_en": "Zed",
+            "render": "keep"}], "places": [], "terms": [], "relationships": [],
+            "style": "", "rules": []})
+        return 1
+    monkeypatch.setattr(SRV, "run_review_server", fake_fail)
+    rc = _run(["review"], tmp_path, monkeypatch)
+    assert rc == 1
+    assert glossary.all_terms("data/state.sqlite3") == []   # ŽÁDNÝ reseed
 ```
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Run to verify pass** — `python -m pytest tests/test_review_ui.py tests/test_cli.py -v` → PASS (celá test_cli.py včetně 2 nových review testů).
+- [ ] **Step 7: Add `review` subcommand smoke** — ruční: `python main.py review` po `init`+`scan` otevře prohlížeč, uložení → server skončí → `glossary` má `seeded` řádky.
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/review_ui/ main.py pyproject.toml tests/test_review_ui.py tests/test_cli.py
