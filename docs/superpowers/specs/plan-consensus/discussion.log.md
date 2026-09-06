@@ -36,3 +36,11 @@ Max kol: 10
 - Claude: CHANGES_NEEDED (0 vlastních) → round-5-claude.md
 - Vše kolem data modelu concordance/finding. Opraveno: translator hlásí rendered_terms (uzavřená množina termínů co dostal, pipeline ověří substringem, neověřené zahodí) - řeší cirkularitu drift detekce z kola 3; nová sekce Finding {source,type,severity,term_en?,expected?,actual?,cz_excerpt?,issue,suggestion?}; step 7 převádí concordance candidate inconsistency na questions; term_mentions.cz_form nullable (omission=NULL řádek), zahrnuto do affected_chapters; cost_usd (actual) místo estimated_cost_usd.
 - Sporné: nic. Codex poprvé bez BLOCKING.
+
+## Kolo 6 — 2026-09-06T16:01:43Z
+- Codex: CHANGES_NEEDED (2 BLOCKING, 5 IMPORTANT, 3 NIT) → round-6-codex.md
+- Claude: CHANGES_NEEDED (2 vlastní IMPORTANT) → round-6-claude.md
+- BLOCKING: variants konfliktní ("pozorované" i "akceptované" - regrese kola 5) → zrušeno, glosář má cz + accepted_alt (jen člověk), pozorování jen v term_mentions. Glosář JSON mimo SQLite transakci → glosář přesunut do SQLite tabulky (jedna transakce s commitem kapitoly), guide.json zůstává soubor.
+- IMPORTANT: review drží run lock; kind=relationship→guide.relationships, other→rules; drift → questions (actionable, ne jen report); metadata agregace po scénách (union) + revize nahradí; questions UNIQUE(chapter_idx,kind,scope_key,severity)+upsert, rerun maže nezodpovězené.
+- NIT: check_chapter signatura sjednocena; concordance zkoumá jen termíny ve scéně ne celý glosář.
+- Sporné: nic.

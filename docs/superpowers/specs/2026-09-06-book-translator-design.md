@@ -82,7 +82,7 @@ book-translator/
 │   ├── ingest.py        # EPUB/TXT → kapitoly; dělení na scény
 │   ├── state.py         # SQLite: stav běhu, navazatelnost
 │   ├── guide.py         # překladatelský návod (JSON)
-│   ├── glossary.py      # glosář termínů (JSON)
+│   ├── glossary.py      # glosář termínů (logika nad SQLite tabulkou)
 │   ├── concordance.py   # deterministická kontrola termínů + drift
 │   ├── llm/
 │   │   ├── client.py    # rozhraní LLMClient + AnthropicClient
@@ -95,7 +95,7 @@ book-translator/
 │   └── review_ui/       # lokální web UI pro review fázi (izolované)
 ├── tests/
 ├── data/               # runtime (gitignored): state.sqlite3, guide*.json,
-│                       #   glossary.json, .book-translator.lock
+│                       #   .book-translator.lock (glosář je v SQLite)
 └── output/             # runtime (gitignored): kniha_cz.txt
 ```
 
@@ -105,7 +105,8 @@ book-translator/
 |---|---|---|---|
 | `ingest` | soubor → kapitoly | DB, LLM | vzorové soubory |
 | `state` | jen SQLite | LLM, překlad | dočasná DB |
-| `guide`, `glossary` | JSON na disku | LLM | přímo |
+| `guide` | JSON na disku | LLM | přímo |
+| `glossary` | logika nad SQLite tabulkou (přes `state`) | LLM | dočasná DB |
 | `concordance` | text + glosář (čistá logika) | DB, LLM | vzorky |
 | `llm/client` | jediné místo co importuje `anthropic` | agenti, pipeline | fake |
 | `agents/*` | prompt → volání klienta → parsování | DB, soubory | fake klient |
@@ -133,45 +134,51 @@ python main.py export             # hotové kapitoly → output/kniha_cz.txt
 ### Co dělá `run` na jednu kapitolu
 
 ```
-0. status kapitoly → processing (drží run lock, viz Stav)
+0. status kapitoly → processing; DELETE FROM questions WHERE chapter_idx=? AND answer IS NULL
 1. rozděl na scény (podle prahu slov)
-2. translator(scéna, návod, glosář) pro každou scénu → slouč do plného překladu CZ
-3. concordance.check_chapter(EN kapitola, CZ, glosář) → nálezy (leak/inconsistency/omission)
-4. kritik(EN kapitola, CZ) → nálezy se závažností
+2. pro každou scénu translator(scéna, návod, glosář); slouč překlady;
+   METADATA scén agreguj: new_terms = union, questions = concat,
+   rendered_terms = union (podle term_en, poslední vyhrává)
+3. concordance.check_chapter(EN kapitola, CZ, glosář, rendered_terms) → Findings
+4. kritik(EN kapitola, CZ) → Findings
 5. dokud (critical nález kritika  NEBO  concordance leak  NEBO
           inconsistency u seeded/approved termínu)  a  kolo < MAX_REVIZE:
        findings = kritikovy critical + concordance nálezy (společný tvar Finding)
-       translator v revizním režimu(EN kapitola, CZ, findings, návod, glosář) → nový CZ
+       translator revizní režim(EN kapitola, CZ, findings, návod, glosář) → nový CZ
+         → jeho celokapitolová METADATA NAHRADÍ agregát z kroku 2
+           (new_terms se ale kumulují)
        concordance.check_chapter znovu; kritik znovu
        revision_rounds += 1
-6. z FINÁLNÍHO překladu:
+6. z FINÁLNÍHO překladu (vše v jedné transakci s krokem 8):
      - new_terms → glosář jako `candidate` (dedup podle term_en)
      - ověř `rendered_terms` proti CZ textu, neověřené zahoď
      - DELETE FROM term_mentions WHERE chapter_idx=?
      - concordance.build_mentions(EN, CZ, glosář, rendered_terms) → INSERT
-     - nové cz_form → glossary.variants
-7. otázky → DB:
-     - translatorova `guess` otázka → severity=guess (má guess_answer)
-     - translatorova `blocking` otázka → severity=blocking
-     - concordance `inconsistency` u kandidátního termínu → otázka
-       kind=term, scope_key=term_en, guess_answer=nalezený tvar, severity=guess
-8. ulož translated_text + revision_rounds + notes(JSON: kritik + concordance) + status:
+7. otázky → DB (upsert podle klíče (chapter_idx, kind, scope_key, severity)):
+     - translatorova `guess` / `blocking` otázka
+     - concordance `inconsistency` u kandidátního termínu → kind=term,
+       scope_key=term_en, guess_answer=nalezený tvar, severity=guess
+8. ulož translated_text + revision_rounds + notes(JSON Findings) + status:
        flagged        critical/leak nález přežil MAX_REVIZE kol
-       needs_human    translator vrátil blocking otázku
-       done           jinak (i s odhadnutým jménem / kandidátním termínem)
-   (commit kapitoly je jedna transakce; tím se uvolní z `processing`)
+       needs_human    blocking otázka
+       done           jinak
+   (jedna transakce; commit uvolní kapitolu z `processing`)
 ```
+
+Po každých `CROSS_REF_EVERY_N` kapitolách: `check_drift` → z každého
+`DriftFinding` `question` (kind=term, scope_key=term_en, guess_answer=
+nejčastější tvar, severity=guess), upsert stejným klíčem. Odpověď pak přes
+běžná requeue pravidla přepočítá dotčené kapitoly.
 
 **Které stavy `run` bere do fronty:** `pending` a `error` (error = auto retry).
 `needs_human` a `flagged` `run` **přeskočí** (čekají na člověka); vrátí je do
 hry `answer` resp. `run --retry-flagged`. Žádná kapitola nezastaví dávku.
 Report na konci vypíše přeskočené.
 
-Každých `CROSS_REF_EVERY_N` kapitol: `concordance.check_drift` nad `term_mentions`
-hotových kapitol, report do `drift_reports`, CLI vypíše počet nálezů.
+`check_drift` (viz výše) navíc ukládá report do `drift_reports` pro audit.
 
 Na konci `run`: report - kolik done / flagged / needs_human / error / čekajících
-otázek + spotřeba tokenů za běh.
+otázek (vč. drift otázek) + spotřeba tokenů za běh (z `llm_calls`).
 
 ### Stavový automat kapitoly
 
@@ -188,17 +195,23 @@ done        ──answer na guess otázku, když answer ≠ guess───> pend
 ```
 
 **Requeue po `answer` (`answer` řeší JEDNU otázku):**
-1. zapiš odpověď. U `term`/`name`: povyš glosář `candidate` → `approved`
-   (nebo oprav CZ), přidej starý guess jako `variant`. U `style`: `guide.add_rule()`.
+1. zapiš odpověď podle `kind`:
+   - `term` / `name`: glosář `candidate` → `approved` (nebo oprav `cz`); pokud
+     odpověď připouští víc tvarů, ty navíc → `accepted_alt`
+   - `relationship` (`scope_key = "a|b"`): zapiš `address` do `guide.relationships`
+   - `style` / `other`: `guide.add_rule(odpověď)`
 2. **blocking otázka** (kapitola `needs_human`): kapitolu vrať na `pending` jen
    když pro její `chapter_idx` NEZBÝVÁ žádná nezodpovězená `severity=blocking`
    otázka. Jinak zůstává `needs_human`.
 3. **guess otázka** (kapitola už `done`/`flagged`):
    - `answer` == `guess_answer` → nic, žádný přepočet
-   - jinak → `affected_chapters` = kapitoly s řádkem v `term_mentions` pro
-     `scope_key` (včetně `cz_form = NULL` omission řádků); u `style` bez
-     scope_key: všechny `done`/`flagged` od kapitoly vzniku otázky. Přejdou
-     na `pending`.
+   - jinak → `affected_chapters` přejdou na `pending`:
+     - `term`/`name`: kapitoly s řádkem v `term_mentions` pro `scope_key`
+       (včetně `cz_form = NULL` omission řádků)
+     - `relationship`: `done`/`flagged` kapitoly, kde se v EN textu vyskytují
+       obě jména dvojice
+     - `style`/`other` (bez scope_key): všechny `done`/`flagged` od kapitoly
+       vzniku otázky
 `answer` běží jen když neběží `run` (run lock, viz Stav), takže nikdy nekoliduje
 s právě zpracovávanou kapitolou.
 
@@ -280,8 +293,8 @@ prompt, zavolají klienta, zparsují. Žádná DB, žádné soubory.
   scéně přeložil. **Uzavřená množina** (jen termíny, které translator dostal),
   navíc pipeline každý `cz_as_used` ověří substringem proti CZ textu a
   neověřené zahodí. Je to "ukaž na co jsi sáhl", ne "prohledej text" - to kód
-  ověří sám. Slouží jako vstup pro `concordance.build_mentions` (odhalí i
-  novotvar mimo glosář a `variants`).
+  ověří sám. Slouží jako vstup pro `concordance.build_mentions` (zachytí i
+  tvar mimo kanonický `cz`/`accepted_alt`).
 - Model: `claude-sonnet-5`. Největší žrout tokenů. `max_tokens` velký (~16000)
   + pojistka na useknutí (translator: useknuto = `error`, viz Chyby).
 
@@ -386,49 +399,55 @@ Později volitelně: translator + kritik na Opus pro kvalitu, scout zůstává S
   jen z `glossary.as_prompt_block()`. Návod glosář jen seeduje; po `answer` má
   `approved` glosář přednost a v promptu není nic, co by ho přebíjelo.
 
-### `glossary.py`
-- `{term_en: {cz, variants: [], note, type, status}}`
+### `glossary.py` - logika nad SQLite tabulkou `glossary` (ne JSON!)
+Glosář se za běhu mění při každé kapitole. Musí být ve stejné DB jako kapitoly,
+aby zápis glosáře a commit kapitoly byl JEDNA transakce (JSON soubor mimo SQLite
+= riziko nekonzistence při pádu). `glossary.py` je jen logická vrstva, data
+drží `state`.
+
+- řádek: `term_en, cz, accepted_alt (JSON list), note, type, status`
   - `type`: name | place | term
   - `status`: `seeded` (z návodu), `approved` (člověk potvrdil přes `answer`),
     `candidate` (translator navrhl, nepotvrzeno)
-  - `variants`: další české tvary téhož termínu, sbírané z `rendered_terms`,
-    `term_mentions`, kandidátů a lidských odpovědí. Slouží k rozlišení
-    `inconsistency` (jiný tvar než kanonický `cz`) od `omission` (žádná známá
-    podoba). Protože `rendered_terms` hlásí i tvar mimo glosář, i první výskyt
-    novotvaru se do `variants` dostane a `check_chapter` ho označí.
+  - `cz` = kanonický překlad. `accepted_alt` = další tvary, které člověk
+    EXPLICITNĚ schválil přes `answer` (ne automaticky pozorované). Pozorované
+    tvary žijou jen v `term_mentions`, do glosáře se nepromítají.
 - seed z návodu (keep → cz=term_en, translate → cz=guide.cz) = `seeded`
 - za běhu: `new_terms` → `candidate` (dedup podle term_en; existující nepřepisuje)
 - `as_prompt_block()` řadí `seeded`+`approved` jako závazné, `candidate` zvlášť
   jako "návrh, může se změnit"
-- `add_candidate()`, `promote(term_en, cz)`, `add_variant(term_en, cz_form)`,
-  `as_prompt_block()`
+- `add_candidate()`, `promote(term_en, cz)`, `add_accepted_alt(term_en, cz_form)`,
+  `as_prompt_block()` - všechny přes `state` (SQLite)
 
 ### `concordance.py` - deterministicky, BEZ LLM
 Nahrazuje terminology + cross_reference agenty z pokusu 1. Vstup: EN a CZ text
 kapitoly, glosář, a translatorem ohlášené `rendered_terms` (uzavřená, kódem
 ověřená množina - viz Translator).
 
+Množina zkoumaných termínů = jen ty, jejichž EN podoba (term_en/alias) je ve
+scéně/kapitole, plus ty v `rendered_terms`. Ne celý glosář.
+
 - **`build_mentions(en_text, cz_text, glossary, rendered_terms) → list[Mention]`:**
-  `Mention = (term_en, cz_form | NULL, chapter_idx)`. Pro každý termín, jehož EN
-  podoba je v EN textu:
-  - `cz_form` = ověřené `cz_as_used` z `rendered_terms`, jinak přesná shoda `cz`
-    / `variant` / kmene v CZ textu
-  - nic z toho nenalezeno → řádek s `cz_form = NULL` (omission)
-  → tabulka `term_mentions`. NULL řádky se počítají do `affected_chapters`
-  při requeue.
+  `Mention = (term_en, cz_form | NULL, chapter_idx)`. Pro každý zkoumaný termín:
+  - `cz_form` = ověřené `cz_as_used` z `rendered_terms`, jinak přesná shoda
+    `cz` / `accepted_alt` / kmene v CZ textu
+  - nic z toho → řádek `cz_form = NULL` (omission)
+  → tabulka `term_mentions` = ÚPLNÝ pozorovací záznam (i tvary mimo glosář).
 - **`check_chapter(en_text, cz_text, glossary, rendered_terms) → list[Finding]`:**
   - `leak`: EN podoba překládaného termínu (`cz != term_en`) je v CZ textu →
     critical. `keep` položky (`cz == term_en`) se nehlásí.
-  - `inconsistency`: `cz_form` termínu (z rendered_terms nebo textu) ≠ kanonický
-    `cz` a ≠ žádná `variant` → critical u approved/seeded, jinak `question`.
-    Nová `cz_form` se zároveň přidá do `glossary.variants` (aby ji drift viděl).
-  - `omission`: termín je v EN, v CZ ani `cz` ani `variant` ani rendered_term →
-    minor (ukáže se, nepadá; může to být legitimní parafráze i chyba)
-- **Drift napříč kapitolami** (`check_drift(term_mentions, glossary) → report`):
+  - `inconsistency`: `cz_form` termínu ∉ ({`cz`} ∪ `accepted_alt` ∪ jejich
+    skloňování) → critical u approved/seeded, jinak `question`.
+    **`cz_form` se do glosáře NEpřidává** (jen člověk přes `answer` může přidat
+    `accepted_alt`). Pozorování žije v `term_mentions`.
+  - `omission`: termín v EN, v CZ ani `cz` ani `accepted_alt` ani rendered_term
+    → minor (ukáže se, nepadá; parafráze i chyba)
+- **Drift napříč kapitolami** (`check_drift(term_mentions) → list[DriftFinding]`):
   pro každý `term_en` seskup ne-NULL `cz_form` z `term_mentions` všech
-  `done`/`flagged` kapitol; 2+ zjevně různé kmeny → drift nález s výčtem kapitol.
-  Data jsou úplná (rendered_terms zachytí i tvary mimo glosář), takže drift
-  chytí i nekonzistenci, kterou `check_chapter` v době překladu neznal.
+  `done`/`flagged` kapitol; 2+ zjevně různé kmeny → `DriftFinding{term_en,
+  formy: [...], kapitoly: [...]}`. Data jsou úplná (i tvary mimo glosář),
+  takže drift chytí i nekonzistenci, kterou `check_chapter` v době překladu
+  neznal. Pipeline z každého DriftFinding udělá `question` (viz `run`).
 - České skloňování: v1 nedělá lemmatizaci. Porovnává na kmeni (slovo bez
   posledních 1-3 znaků) + přesnou shodou. Nejistoty ukáže člověku, tvrdě nepadá.
   LLM soudce ("stejné slovo skloňované?") případně později.
@@ -444,10 +463,11 @@ ověřená množina - viz Translator).
   tvá dřívější rozhodnutí mají přednost, nové nálezy scouta se přidají jako
   nepotvrzené. `scan` zapisuje **jen** `guide.draft.json`, nikdy `guide.json`,
   takže opakovaný `scan` nikdy nepřepíše tvoje rozhodnutí.
-- `POST /api/guide` → validace, zápis `guide.json`, pak reseed glosáře:
-  přegeneruje **jen `seeded`** položky z návodu; `approved` a `candidate`
-  (runtime) zůstávají. Konflikt (seeded termín teď koliduje s `approved`):
-  `approved` vyhrává (novější lidské rozhodnutí přes `answer`).
+- `POST /api/guide` → validace, zápis `guide.json`. Server pak skončí a
+  **CLI příkaz `review`** (ne UI - drží izolaci) provede reseed glosáře:
+  přepíše **jen `seeded`** řádky tabulky `glossary` z návodu; `approved` a
+  `candidate` řádky zůstávají. Konflikt (seeded teď koliduje s `approved`):
+  `approved` vyhrává. `review` po celou dobu drží run lock.
 - Stránka - sekce formuláře, strukturovaný vstup (roletky, zatržítka - menší
   šance na překlep):
   - **Postavy:** tabulka, řádek = jméno (readonly) + aliasy + roletka
@@ -478,6 +498,14 @@ questions (id PK, chapter_idx, kind, text, scope_key, guess_answer,
     kind:     term | name | relationship | style | other
     scope_key: term_en (term/name), "a|b" (relationship), null (style/other)
     severity: guess | blocking
+    UNIQUE(chapter_idx, kind, scope_key, severity) - upsert, aby rerun kapitoly
+      nezakládal duplicitní nezodpovězené otázky. Zodpovězené (answer NOT NULL)
+      zůstávají; nezodpovězené se při rerunu kapitoly mažou a zakládají znovu.
+
+glossary (term_en PK, cz, accepted_alt TEXT, note, type, status, updated_at)
+    runtime glosář; v SQLite (ne JSON), aby zápis + commit kapitoly byla
+    jedna transakce. guide.json/guide.draft.json zůstávají soubory
+    (edituje je člověk přes review UI, za `run` se nemění).
 
 term_mentions (id PK, term_en, cz_form NULL, chapter_idx)
     plněno přes concordance.build_mentions(EN,CZ,glosář,rendered_terms);
@@ -498,12 +526,18 @@ llm_calls (id PK, run_id FK, agent, provider, model, input_tokens, output_tokens
 přehraje od scény 1 (přijatelné, kapitola je minuty ne hodiny). `scan` je
 idempotentní. `run` commituje po každé kapitole → pád na 47 → `run` naváže od 47.
 
-**Run lock.** `run` i `scan` na startu vezmou zámek (`.book-translator.lock`
-v `data/` s PID + časem). Druhý mutující příkaz (`run`, `scan`, `answer`,
-`init`) při aktivním zámku skončí s hláškou "běží jiný příkaz". `status`,
-`questions`, `export` jsou read-only, zámek ignorují. Zastaralý zámek (mrtvý
-PID) se přebere. Tím je pravidlo "`answer` nesahá na právě zpracovávanou
-kapitolu" vynutitelné - `answer` se během `run` vůbec nespustí.
+**Run lock.** Mutující příkazy (`run`, `scan`, `answer`, `init`, a `review` po
+dobu běhu serveru) na startu vezmou zámek (`.book-translator.lock` v `data/`
+s PID + časem). Druhý mutující příkaz při aktivním zámku skončí s hláškou
+"běží jiný příkaz". `status`, `questions`, `export` jsou read-only, zámek
+ignorují. Zastaralý zámek (mrtvý PID) se přebere. Tím je pravidlo "`answer`
+nesahá na právě zpracovávanou kapitolu" vynutitelné a `review` (zapisuje
+`guide.json` + reseeduje glosář) nekoliduje s `run`.
+
+**Transakce.** Zápis glosáře (`glossary`, `term_mentions`) a commit stavu
+kapitoly (`chapters`, `questions`) při zpracování jedné kapitoly jsou jedna
+SQLite transakce. Buď se zapíše vše, nebo nic → žádný nekonzistentní mezistav
+při pádu.
 
 ## Chyby
 
