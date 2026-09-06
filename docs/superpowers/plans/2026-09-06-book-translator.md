@@ -1270,13 +1270,14 @@ def test_inconsistency_on_approved_is_revise():
 
 
 def test_inconsistency_on_candidate_is_question():
-    g = [{"term_id": "cand_foo", "canonical_en": "Foo", "aliases": [], "cz": "Fů",
-          "accepted_alt": [], "status": "candidate", "type": "term"}]
-    f = C.check_chapter("Foo appeared.", "Fůha se objevil.", g,
-                        [{"term_id": "cand_foo", "cz_as_used": "Fůha"}])
+    g = [{"term_id": "cand_grey", "canonical_en": "Grey Cloak", "aliases": [],
+          "cz": "Šedý plášť", "accepted_alt": [], "status": "candidate", "type": "term"}]
+    # translator ve stejné kapitole termín vyrenderoval úplně jinak (jiný kmen)
+    f = C.check_chapter("Grey Cloak spoke.", "Popelář promluvil.", g,
+                        [{"term_id": "cand_grey", "cz_as_used": "Popelář"}])
     inc = [x for x in f if x["type"] == "inconsistency"]
     assert inc and inc[0]["action"] == "question"
-    assert inc[0]["term_id"] == "cand_foo"
+    assert inc[0]["term_id"] == "cand_grey"
 
 
 def test_build_mentions_records_omission_as_null():
@@ -1352,7 +1353,7 @@ git commit -m "feat: concordance (build_mentions, check_chapter leak/inconsisten
     - `_pid_alive(pid: int) -> bool`:
       - POSIX: `try: os.kill(pid, 0); return True; except ProcessLookupError: return False; except PermissionError: return True`
       - Windows: `ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)` (`PROCESS_QUERY_LIMITED_INFORMATION`) → handle != 0 → `CloseHandle` + `return True`; handle == 0 → `return False`. **NIKDY `os.kill` na Windows** (nedestruktivní check neexistuje, `os.kill` volá `TerminateProcess`).
-    - `acquire`: **atomicky** `fd = os.open(lock_path, os.O_CREAT|os.O_EXCL|os.O_WRONLY)` → uspěje → zapiš JSON, `os.close`, hotovo. `FileExistsError` → načti stávající; pokud `_pid_alive(pid)` False NEBO `ts` je starší než 6 h NEBO `ts`/JSON nejde zparsovat → stale: zapiš nový lock do `lock_path + ".tmp"` a `os.replace(tmp, lock_path)` (atomický takeover), hotovo. Jinak `raise LockError`.
+    - `acquire` (smyčka, max 3 pokusy): `try: fd = os.open(lock_path, os.O_CREAT|os.O_EXCL|os.O_WRONLY)` → uspěje → zapiš JSON, `os.close`, hotovo. `FileExistsError` → načti stávající; `_pid_alive(pid)` a `ts` mladší 6 h a JSON validní → `raise LockError` (živý zámek). Jinak (stale): `try: os.unlink(lock_path) except FileNotFoundError: pass` a `continue` (další iterace zkusí `O_EXCL` znovu - kdo vyhraje `O_EXCL`, vlastní zámek; kdo prohraje, uvidí zas `FileExistsError` a pokud je teď živý → `LockError`). Po 3 pokusech `raise LockError`.
 
 - [ ] **Step 1: Write failing tests** — `tests/test_state_chapters.py`
 
@@ -1851,23 +1852,27 @@ git commit -m "feat: agents/critic (nezávislá revize, Finding s action routing
     - Krok 5: `while has_revise_triggers(findings) and rounds < config.MAX_REVIZE`: `translator.revise_chapter(en, cz, [f for f in findings if f["action"]=="revise"], guide_block, glossary_block, client_factory("translator"))` → nový `cz`; jeho metadata NAHRADÍ agregát (`rendered_terms`, `questions`), `new_terms` se kumulují; `check_chapter` + `review` znovu; `rounds += 1`
     - Krok 6-8 (**transakce B**): PŘED transakcí pipeline:
       (a) ověř `rendered_terms` substringem proti finálnímu `cz`, neověřené zahoď;
-      (b) pro každý `nt` v `new_terms`: `glossary.resolve_surface(db, nt["term_en"])`
-          → shoda: přeskoč; jinak `cand = {term_id: "cand_"+glossary.slugify(nt["term_en"]),
-          canonical_en: nt["term_en"], aliases: [], cz: nt["cz"], accepted_alt: [],
-          note: nt.get("note",""), type: nt.get("type","term"), status: "candidate"}`,
-          přidej `cand` do `new_candidates` a question `{chapter_idx: idx, kind:"term",
-          scope_key: cand["term_id"], text: f"Nový termín {nt['term_en']} → {nt['cz']}?",
-          guess_answer: nt["cz"], severity:"guess"}`;
+      (b) `extra_mentions = []`; pro každý `nt` v `new_terms`:
+          `existing = glossary.resolve_surface(db, nt["term_en"])`:
+          - shoda (`existing` je term_id): NENÍ nový; přidej
+            `extra_mentions.append({term_id: existing, cz_form: nt["cz"],
+            chapter_idx: idx, scene_idx: None, source: "rendered"})` (nezahazuj -
+            translator ho použil, requeue ho musí najít)
+          - žádná shoda: `cand = {term_id: "cand_"+glossary.slugify(nt["term_en"]),
+            canonical_en: nt["term_en"], aliases: [], cz: nt["cz"], accepted_alt: [],
+            note: nt.get("note",""), type: nt.get("type","term"), status: "candidate"}`,
+            přidej `cand` do `new_candidates`, question `{chapter_idx: idx, kind:"term",
+            scope_key: cand["term_id"], text: ..., guess_answer: nt["cz"], severity:"guess"}`,
+            a `extra_mentions.append({term_id: cand["term_id"], cz_form: nt["cz"],
+            chapter_idx: idx, scene_idx: None, source: "rendered"})`
       (c) `glossary_rows = glossary.all_terms(db) + new_candidates`;
-      (d) `mentions = concordance.build_mentions(en, cz, glossary_rows, rendered_terms_ověřené)`;
-          navíc pro KAŽDÝ `cand` v `new_candidates` přidej explicitní mention
-          `{term_id: cand["term_id"], cz_form: cand["cz"], chapter_idx: idx,
-          scene_idx: None, source: "rendered"}` (translator ho v téhle kapitole
-          použil - víme to jistě; nespoléhat na to, že jeho EN povrch je v `en`
-          textu, requeue by ho jinak nenašel);
+      (d) `mentions = concordance.build_mentions(en, cz, glossary_rows, rendered_terms_ověřené) + extra_mentions`;
       (e) `questions` = translator guess/blocking + Findings s `action=="question"`
           (→ `{chapter_idx: idx, kind:"term", scope_key: f["term_id"], guess_answer: f["actual"],
           severity:"guess", text: f["issue"]}`) + new-term questions z (b).
+          **Normalizuj scope_key:** `for q in questions: if not q.get("scope_key"):
+          q["scope_key"] = hashlib.sha1(q["text"].encode()).hexdigest()[:16]`
+          (`style`/`other` otázky bez klíče - nikdy prázdné do DB).
       Pak `state.commit_chapter_result(db, idx, translated_text=cz, revision_rounds=rounds,
       notes_json=json.dumps(findings, ensure_ascii=False), status=status,
       new_candidates=new_candidates, mentions=mentions, questions=questions)` JEDNOU.
@@ -2073,37 +2078,38 @@ git commit -m "feat: pipeline (process_chapter, revizní smyčka, transakce A/B,
 **Interfaces:**
 - Consumes: `state`, `glossary`, `guide`, `pipeline`, `ingest`, `agents.scout`, `config`, `llm.client`
 - Produces:
-  - `requeue.apply_answer(db_path, guide_path, qid: int, answer_text: str) -> dict` - dle §"Requeue po answer". `q = state.get_question(db, qid)`; `scope_key = q["scope_key"]`.
-    **Pořadí kvůli konzistenci:** nejdřív změny do `guide.json` (atomický zápis
-    přes temp + `os.replace`, viz Task 7), pak VŠECHNY DB změny v jedné
-    `state`-transakci (`answer_question` + glossary + requeue). Pád v guide fázi →
-    otázka není zodpovězená, jen se re-spustí `answer`. Pád v DB fázi → transakce
-    rollback, guide.json zůstane změněný (idempotentní - další `answer` ho jen
-    přepíše stejně).
-    1. dle `kind`:
-       - `term`/`name`: `parts = [p.strip() for p in answer_text.split("|") if p.strip()]`;
-         `canonical_cz = parts[0]`, `alts = parts[1:]`.
-         `tid = glossary.resolve_term_or_surface(db, scope_key)`. `tid` nalezen
-         → `glossary.promote(db, tid, canonical_cz)`; `tid` NEnalezen (blocking -
-         `scope_key` je PŮVODNÍ povrch, ne lowercase) → `tid = glossary.add_approved(
-         db, canonical_en=scope_key, cz=canonical_cz)`. Pak `glossary.add_accepted_alt(
-         db, tid, a)` pro každý `a` v `alts`.
-       - `relationship` (`scope_key` = `relationship_key` = `"a|b"`): `a, b = scope_key.split("|", 1)`;
-         upsert `{a, b, address: answer_text}` do `guide["relationships"]` (klíč
-         `relationship_key`), `guide.save_guide`
-       - `style` / `other`: `guide.add_rule(guide_path, answer_text)`
-    2. `state.answer_question(db, qid, answer_text)`
-    3. blocking otázka: `state.set_status(chapter_idx, "pending")` jen když
-       `not state.chapter_has_open_blocking(db, chapter_idx)`
-    4. guess otázka a `answer_text != q["guess_answer"]`: `affected_chapters`:
-       - `term`/`name` → `state.chapters_mentioning_term(db, tid)`
-       - `relationship` → `done`/`flagged` kapitoly, kde jsou obě jména dvojice
-         (word-boundary, ci) v `raw_text`
-       - `style`/`other` → `done`/`flagged` s `idx >= q["chapter_idx"]` (u
-         globálních drift otázek s `chapter_idx=None` → všechny `done`/`flagged`)
-       každou `set_status("pending")`
-    Vrací `{"requeued": [idx...], "chapter_status_changed": bool}`
-  - `main.main(argv=None) -> int` - argparse subcommands. `main()` první řádek: `_bootstrap_stdout()`. Každý mutující příkaz: `with state.run_lock(config.LOCK_PATH):`.
+  - `requeue.apply_answer(db_path, guide_path, qid: int, answer_text: str) -> dict`:
+    `q = state.get_question(db, qid)`; `scope_key = q["scope_key"]`.
+    **Fáze 1 - guide.json** (jen `relationship`/`style`/`other`): atomický zápis
+    přes `guide.save_guide` (temp+`os.replace`). Idempotentní.
+    - `relationship` (`scope_key = "a|b"`): `a, b = scope_key.split("|", 1)`;
+      upsert `{a, b, address: answer_text}` do `guide["relationships"]`
+    - `style`/`other`: `guide.add_rule(guide_path, answer_text)`
+    **Fáze 2 - DB, jedna transakce** přes `state.commit_answer(db_path, *, qid,
+    answer_text, glossary_ops, requeue_idxs)`:
+    - `glossary_ops` (spočítá pipeline PŘED voláním, pro `term`/`name`):
+      `parts = [p.strip() for p in answer_text.split("|") if p.strip()]`;
+      `tid = glossary.resolve_term_or_surface(db, scope_key)`;
+      `glossary_ops = [("promote", tid, parts[0])]` pokud `tid`, jinak
+      `[("add_approved", scope_key, parts[0])]`; + `("add_accepted_alt", tid_or_new, a)` pro `a in parts[1:]`
+    - `requeue_idxs` (spočítá pipeline PŘED voláním, jen guess otázka a
+      `answer_text != q["guess_answer"]`):
+      - `term`/`name` → `state.chapters_mentioning_term(db, tid)`
+      - `relationship` → `done`/`flagged` kde obě jména v `raw_text` (word-bnd, ci)
+      - `style`/`other` → `done`/`flagged` s `idx >= q["chapter_idx"]`
+        (`chapter_idx=None` u drift → všechny `done`/`flagged`)
+    `commit_answer` v JEDNÉ `state.connect` transakci: aplikuje `glossary_ops`
+    (SQL nad `conn`), `answer_question`, u blocking otázky `set_status(pending)`
+    když `not chapter_has_open_blocking`, `set_status(pending)` pro `requeue_idxs`.
+    Vrací `{"requeued": [...], "chapter_status_changed": bool}`.
+    Pád ve fázi 2 → rollback, otázka nezodpovězená (re-spustí se `answer`);
+    guide.json z fáze 1 už změněný, ale idempotentní.
+  - **`state.commit_answer(db_path, *, qid, answer_text, glossary_ops, requeue_idxs, blocking_chapter_idx: int | None) -> dict`** (rozšíření `state.py` v tomto tasku): jeden `with connect(db) as conn:` blok. `glossary_ops` = list `(op, key, value)` kde `op ∈ {promote, add_approved, add_accepted_alt}` - SQL nad `conn` (ne `glossary.py` helpery, ty otvírají vlastní connect). `answer_question` nad `conn`. Když `blocking_chapter_idx` a `not <chapter má další open blocking nad conn>` → `set_status(pending)`. `set_status(pending)` pro každý v `requeue_idxs`. Vrací `{"requeued": requeue_idxs, "chapter_status_changed": bool}`.
+  - `main.main(argv=None) -> int` - argparse subcommands. `main()` pořadí:
+    (1) `_bootstrap_stdout()`, (2) `os.makedirs(config.DATA_DIR, exist_ok=True)` +
+    `os.makedirs(config.OUTPUT_DIR, exist_ok=True)`, (3) `state.init_db(config.DB_PATH)`
+    (idempotentní - schema vždy existuje před jakýmkoli příkazem), (4) dispatch.
+    Mutující příkaz (`init`, `scan`, `run`, `answer`, `review`): `with state.run_lock(config.LOCK_PATH):`.
   - **Jednotný lifecycle pattern pro `run`/`scan`** (závazný, jeden `finish_run`):
     ```
     rid = state.create_run(db, cmd)
@@ -2119,7 +2125,7 @@ git commit -m "feat: pipeline (process_chapter, revizní smyčka, transakce A/B,
     finally:
         state.finish_run(db, rid, status)   # JEDINÝ finish_run
     ```
-    - `init PATH` → `ingest.load_book` + `state.seed_chapters` (žádný run/klient, žádný lifecycle)
+    - `init PATH` → (`init_db` už proběhlo v `main`) `state.seed_chapters(config.DB_PATH, ingest.load_book(PATH))` (žádný run/klient, žádný lifecycle)
     - `scan [--chunked]` → `recover_processing`; `chs = state.chapters_by_status(db, ("pending","processing","done","flagged","needs_human","error"))` (všechny, ORDER BY idx); `cf = lambda a: PipelineLLMClient(AnthropicClient(), run_id=rid, agent=a, db_path=db, config_mod=config, interactive=False)`;
       - bez `--chunked`: `scout.scan_book("\n\n".join(c["raw_text"] for c in chs), cf("scout"))`
       - `--chunked`: `scout.scan_chunks(scout.chunk_chapters(chs, config.SCOUT_CHUNK_WORD_LIMIT), cf("scout"))`
@@ -2373,7 +2379,7 @@ def test_scan_scout_bad_json_is_fatal(tmp_path, monkeypatch):
 ```
 
 - [ ] **Step 3: Run to verify fail** — FAIL.
-- [ ] **Step 4: Implement `src/requeue.py` a `main.py`.**
+- [ ] **Step 4: Implement `state.commit_answer` (rozšíření `src/state.py`), `src/requeue.py`, `main.py`.** `main` má `_bootstrap_stdout` + `makedirs` + `state.init_db` PŘED dispatchem (viz Interfaces).
 - [ ] **Step 5: Run to verify pass** — `python -m pytest tests/test_requeue.py tests/test_cli.py -v` → PASS.
 - [ ] **Step 6: Verify UTF-8 bootstrap in cp1252** — Run: `python -X utf8=0 -c "import sys; sys.argv=['x','status']; import main; main.main()"` po `init` v adresáři s daty. Expected: žádný `UnicodeEncodeError` na českém výstupu.
 - [ ] **Step 7: Commit**
@@ -2403,7 +2409,7 @@ git commit -m "feat: CLI (init/scan/run/status/questions/answer/export) + requeu
     - `relationship` (`scope_key = "a|b"`) → `payload["relationships"]` `{a, b, address: answer}`
     - `style`/`other` → append do `payload["rules"]`
     `must_decide` se pak z payloadu odstraní (rozhodnutí jsou zapsaná v polích). Vrací upravený payload.
-  - `server.validate(payload: dict) -> list[str]` - vrací seznam chyb (prázdný = OK):
+  - `server.validate(payload: dict) -> list[str]` - vrací seznam chyb (prázdný = OK). Sekce čte přes `payload.get(section, [])` (chybějící sekce = prázdná, ne chyba):
     - každá `characters` položka: `name_en` neprázdné, `render ∈ {keep, translate}`, u `translate` `cz` neprázdné
     - každá `places` / `terms` položka: `name_en`/`term_en` neprázdné, `cz` neprázdné
     - každá `relationships` položka: `a`, `b` neprázdné, `address ∈ {tyka, vyka}`

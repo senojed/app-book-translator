@@ -62,3 +62,11 @@ Max kol: 10
 - IMPORTANT: apply_answer ordering (guide atomicky → DB v jedné transakci); save_guide/save_draft atomické temp+os.replace; lock os.open(O_CREAT|O_EXCL) atomické; seed_from_guide u approved nesahá na cz/status/accepted_alt (jen aliasy); blocking scope_key neztrácí velikost písmen (jen strip, ne lower); count_tokens fail → len/2 konzervativní nadhad; scan lifecycle testy (truncated/bad json → fatal, žádný draft).
 - NIT: neparsovatelný lock ts = stale.
 - Sporné: nic.
+
+## Kolo 8 — 2026-09-06T18:56:41Z
+- Codex: CHANGES_NEEDED (2 BLOCKING, 4 IMPORTANT, 1 NIT) → round-8-codex.md
+- Claude: CHANGES_NEEDED (0 vlastních) → round-8-claude.md
+- BLOCKING: init bere lock ale data/ neexistuje + chybí state.init_db → main() dělá bootstrap_stdout + makedirs + init_db PŘED dispatchem. Task 8 test "Fů"/"Fůha" - stem je sjednotí → test data "Šedý plášť"/"Popelář".
+- IMPORTANT: new_terms shoda s existujícím povrchem "přeskoč" → ztráta mention → přidej explicitní mention s resolved term_id. style/other scope_key hash remap nespecifikován → pipeline normalizuje všechny questions (sha1(text)[:16]). apply_answer atomicita falešná → state.commit_answer jednotransakční helper (glossary_ops SQL nad conn). stale lock takeover race → unlink + O_EXCL retry smyčka.
+- NIT: validate čte payload.get(section, []).
+- Sporné: nic.
