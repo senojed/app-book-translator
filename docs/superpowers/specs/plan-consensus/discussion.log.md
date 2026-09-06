@@ -44,3 +44,9 @@ Max kol: 10
 - IMPORTANT: review drží run lock; kind=relationship→guide.relationships, other→rules; drift → questions (actionable, ne jen report); metadata agregace po scénách (union) + revize nahradí; questions UNIQUE(chapter_idx,kind,scope_key,severity)+upsert, rerun maže nezodpovězené.
 - NIT: check_chapter signatura sjednocena; concordance zkoumá jen termíny ve scéně ne celý glosář.
 - Sporné: nic.
+
+## Kolo 7 — 2026-09-06T16:06:51Z
+- Codex: CHANGES_NEEDED (1 BLOCKING, 5 IMPORTANT, 1 NIT) → round-7-codex.md
+- Claude: CHANGES_NEEDED (0 vlastních) → round-7-claude.md
+- Vše schema precision, ne architektura. Opraveno: glossary term_id PK + canonical_en + aliases JSON (proteklo do term_mentions FK, DriftFinding, questions.scope_key, Mention); rendered_terms = seznam výskytů {term_id,cz_as_used,scene_idx} bez last-wins; questions.scope_key="" sentinel místo NULL (SQL UNIQUE s NULL nefunguje); questions.chapter_idx nullable + partial UNIQUE pro globální drift otázky; PipelineLLMClient loguje ve finally (status ok/truncated/error, error_class, tokeny nullable) - selhaná volání nezmizí z auditu; transakce A (krok 0) / LLM mimo / transakce B (kroky 6-8) explicitně; pilot checklist: ověřit model+ceny proti docs.
+- Sporné: nic.
