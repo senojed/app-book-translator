@@ -56,3 +56,9 @@ Max kol: 10
 - Claude: CHANGES_NEEDED (0 vlastních) → round-8-claude.md
 - Vše precizace term_id/schema, architektura beze změny 4 kola. Opraveno: prompt glosáře nese term_id + translator hlásí rendered_terms přes term_id (dotažení kola 7); term_mentions = 1 řádek/výskyt + scene_idx + source(rendered|detected|omission); scope_key style/other = hash(text) ne ""; partial UNIQUE jen WHERE answer IS NULL (zodpovězená otázka neblokuje novou); llm_calls +error_class +status ok/truncated/error; fatal/kanárek wording sjednocen; glossary API na term_id + resolve_surface(); review server exit-code jako signál pro reseed.
 - Sporné: nic. Doporučeno kolo 9 jako finální sweep, pak uzavřít.
+
+## Kolo 9 — 2026-09-06T16:16:07Z
+- Codex: CHANGES_NEEDED (1 BLOCKING, 4 IMPORTANT, 2 NIT) → round-9-codex.md
+- Claude: CHANGES_NEEDED (0 vlastních) → round-9-claude.md
+- Opraveno: Finding +action(revise|question|note)+term_id s routing tabulkou (kritik/concordance → co s tím); scene_idx doplňuje pipeline ne translator (revizní výstup → NULL); deterministický term_id (slug) + reseed = UPDATE podle term_id ne delete+insert (FK integrita term_mentions/questions); run --retry-flagged doplněn do CLI seznamu/automatu/buildu/testů (reset revision_rounds=0); přiznané v1 omezení: new_terms dedup podle povrchu, split entity je ruční answer; partial unique zapsáno jako CREATE UNIQUE INDEX ... WHERE answer IS NULL.
+- Sporné: nic. Architektura beze změny 5 kol po sobě.

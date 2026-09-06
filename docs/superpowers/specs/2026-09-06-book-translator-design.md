@@ -124,7 +124,8 @@ Jeden modul, jedna rodina promptů.
 python main.py init kniha.epub    # kniha → kapitoly do DB (status pending)
 python main.py scan               # scout projede celou knihu → guide.draft.json
 python main.py review             # web UI: potvrdíš/upravíš návod → guide.json
-python main.py run                # překladová smyčka přes kapitoly
+python main.py run                # překladová smyčka přes kapitoly (pending + error)
+python main.py run --retry-flagged [IDX...]   # flagged → pending (revision_rounds=0), pak běž
 python main.py questions          # otázky nadhozené během běhu
 python main.py answer <question_id> "..."   # odpověď → pravidlo/glosář + přepočet kapitol
 python main.py status             # přehled stavu kapitol
@@ -138,7 +139,8 @@ python main.py export             # hotové kapitoly → output/kniha_cz.txt
 1. rozděl na scény (podle prahu slov)
 2. pro každou scénu translator(scéna, návod, glosář); slouč překlady;
    METADATA scén agreguj: new_terms = union, questions = concat,
-   rendered_terms = SEZNAM {term_id, cz_as_used, scene_idx} (bez dedup)
+   rendered_terms = SEZNAM {term_id, cz_as_used, scene_idx} (bez dedup;
+   pipeline doplní scene_idx). Revizní celokapitolový výstup → scene_idx = NULL.
 3. concordance.check_chapter(EN kapitola, CZ, glosář, rendered_terms) → Findings
 4. kritik(EN kapitola, CZ) → Findings
 5. dokud (critical nález kritika  NEBO  concordance leak  NEBO
@@ -154,10 +156,9 @@ python main.py export             # hotové kapitoly → output/kniha_cz.txt
      - ověř `rendered_terms` proti CZ textu, neověřené zahoď
      - DELETE FROM term_mentions WHERE chapter_idx=?
      - concordance.build_mentions(EN, CZ, glosář, rendered_terms) → INSERT
-7. otázky → DB (upsert podle klíče (chapter_idx, kind, scope_key, severity)):
+7. otázky → DB (upsert, viz `questions` klíč):
      - translatorova `guess` / `blocking` otázka
-     - concordance `inconsistency` u kandidátního termínu → kind=term,
-       scope_key=term_id, guess_answer=nalezený tvar, severity=guess
+     - Finding s `action=question` (viz sekce Finding)
 8. ulož translated_text + revision_rounds + notes(JSON Findings) + status:
        flagged        critical/leak nález přežil MAX_REVIZE kol
        needs_human    blocking otázka
@@ -190,7 +191,7 @@ pending ──překlad+kritika──┬──> done
 
 error       ──běžný `run` (auto retry)──────────────────────> pending
 needs_human ──answer, když už žádná blocking otázka kapitoly nezbývá──> pending
-flagged     ──answer (mění-li výsledek) / `run --retry-flagged`──> pending
+flagged     ──answer (mění-li výsledek) / `run --retry-flagged` (resetuje revision_rounds=0)──> pending
 done        ──answer na guess otázku, když answer ≠ guess───> pending
 ```
 
@@ -280,7 +281,8 @@ prompt, zavolají klienta, zparsují. Žádná DB, žádné soubory.
   <čistý přeložený text>
   ===METADATA===
   {"new_terms":      [{term_en, cz, note, type}],   # jen NEZNÁMÉ povrchy
-   "rendered_terms": [{term_id, cz_as_used}],       # 1 řádek na výskyt známého termínu
+   "rendered_terms": [{term_id, cz_as_used}],       # 1 řádek na výskyt; scene_idx
+                                                    #   doplní pipeline, ne translator
    "questions": [{"kind": "term|name|relationship|style|other",
                   "scope_key": "term_id / a|b / null",
                   "guess_answer": "co translator zvolil / null u blocking",
@@ -323,7 +325,8 @@ Finding = {
   source:     "critic" | "concordance",
   type:       "fidelity"|"fluency"|"register"  |  "leak"|"inconsistency"|"omission",
   severity:   "critical" | "minor",
-  term_en:    str | null,     # jen concordance
+  action:     "revise" | "question" | "note",   # co s tím pipeline udělá
+  term_id:    str | null,     # jen concordance
   expected:   str | null,     # kanonický cz (concordance)
   actual:     str | null,     # co je v textu (concordance)
   cz_excerpt: str | null,     # jen critic
@@ -331,6 +334,12 @@ Finding = {
   suggestion: str | null,
 }
 ```
+
+Pipeline routuje podle `action`: `revise` → do revizní smyčky; `question` →
+`questions` (kind=term, scope_key=term_id, guess_answer=`actual`, severity=guess);
+`note` → jen do `chapters.notes`. Kritikovy `critical` = `revise`, `minor` =
+`note`. Concordance `leak` a `inconsistency` u seeded/approved = `revise`;
+`inconsistency` u kandidáta = `question`; `omission` = `note`.
 
 ## Provider vrstva (`llm/client.py`)
 
@@ -414,7 +423,12 @@ drží `state`.
   accepted_alt (JSON list), note, type, status`
   - `term_id` = stabilní ID entity (ne povrch textu) - kvůli aliasům a případu
     "stejný povrch, různé entity". `canonical_en` + `aliases` = na co concordance
-    matchuje v EN textu.
+    matchuje v EN textu. **Deterministické:** u seedovaných `slug(canonical_en)`,
+    u kandidátů `"cand_" + slug(term_en)`. Reseed je pak UPDATE podle `term_id`,
+    ne delete+insert → `term_mentions`/`questions` FK zůstávají platné.
+  - **Omezení v1:** `new_terms` z translatora se deduplikují podle povrchu
+    (`term_en`). Když jeden povrch má být 2 entity, je to ruční `answer`
+    operace (split), ne automatika.
   - `type`: name | place | term
   - `status`: `seeded` (z návodu), `approved` (člověk potvrdil přes `answer`),
     `candidate` (translator navrhl, nepotvrzeno)
@@ -449,14 +463,13 @@ scéně/kapitole, plus ty v `rendered_terms`. Ne celý glosář.
   - žádná forma nenalezena → řádek `cz_form=NULL, source=omission`
   → tabulka `term_mentions` = ÚPLNÝ pozorovací záznam (i tvary mimo glosář).
 - **`check_chapter(en_text, cz_text, glossary, rendered_terms) → list[Finding]`:**
-  - `leak`: EN podoba překládaného termínu (`cz != term_en`) je v CZ textu →
-    critical. `keep` položky (`cz == term_en`) se nehlásí.
+  - `leak`: EN podoba překládaného termínu (`cz != canonical_en`) je v CZ textu
+    → `action=revise`. `keep` položky (`cz == canonical_en`) se nehlásí.
   - `inconsistency`: `cz_form` termínu ∉ ({`cz`} ∪ `accepted_alt` ∪ jejich
-    skloňování) → critical u approved/seeded, jinak `question`.
-    **`cz_form` se do glosáře NEpřidává** (jen člověk přes `answer` může přidat
+    skloňování) → `action=revise` u approved/seeded, `action=question` u kandidáta.
+    **`cz_form` se do glosáře NEpřidává** (jen člověk přes `answer` přidá
     `accepted_alt`). Pozorování žije v `term_mentions`.
-  - `omission`: termín v EN, v CZ ani `cz` ani `accepted_alt` ani rendered_term
-    → minor (ukáže se, nepadá; parafráze i chyba)
+  - `omission`: termín v EN, v CZ nic známého → `action=note` (parafráze i chyba)
 - **Drift napříč kapitolami** (`check_drift(term_mentions) → list[DriftFinding]`):
   pro každý `term_id` seskup ne-NULL `cz_form` z `term_mentions` všech
   `done`/`flagged` kapitol; 2+ zjevně různé kmeny → `DriftFinding{term_id,
@@ -482,9 +495,12 @@ scéně/kapitole, plus ty v `rendered_terms`. Ne celý glosář.
   `{ok: true}`, a server se sám ukončí s exit 0. Zavření prohlížeče bez uložení
   / SIGINT → exit ≠ 0.
 - **CLI příkaz `review`** spustí server a čeká na jeho konec. Exit 0 → provede
-  reseed glosáře (ne UI - drží izolaci): přepíše **jen `seeded`** řádky tabulky
-  `glossary` z návodu; `approved`/`candidate` zůstávají; konflikt → `approved`
-  vyhrává. Exit ≠ 0 → žádný reseed. `review` po celou dobu drží run lock.
+  reseed glosáře (ne UI - drží izolaci): pro každý termín z návodu UPDATE
+  (podle deterministického `term_id`) řádku se `status='seeded'`; nový termín
+  → INSERT; termín z návodu odebraný → řádek zůstává (může být odkazovaný),
+  jen se neaktualizuje. `approved`/`candidate` řádky se nedotknou; konflikt
+  (seeded by přepsal approved) → `approved` vyhrává. Exit ≠ 0 → žádný reseed.
+  `review` po celou dobu drží run lock.
 - Stránka - sekce formuláře, strukturovaný vstup (roletky, zatržítka - menší
   šance na překlep):
   - **Postavy:** tabulka, řádek = jméno (readonly) + aliasy + roletka
@@ -517,9 +533,10 @@ questions (id PK, chapter_idx NULL, kind, text, scope_key, guess_answer,
       hash(text) (style/other) - nikdy NULL/"" aby UNIQUE fungoval
     severity: guess | blocking
     chapter_idx = NULL u globálních otázek (drift); jinak kapitola vzniku
-    dedup jen mezi OTEVŘENÝMI otázkami:
-      partial UNIQUE(chapter_idx, kind, scope_key, severity) WHERE answer IS NULL
-      partial UNIQUE(kind, scope_key, severity) WHERE answer IS NULL AND chapter_idx IS NULL
+    dedup jen mezi OTEVŘENÝMI otázkami - dva samostatné partial unique indexy
+    (SQLite: `CREATE UNIQUE INDEX ... WHERE answer IS NULL`, ne inline constraint):
+      idx1: (chapter_idx, kind, scope_key, severity) WHERE answer IS NULL
+      idx2: (kind, scope_key, severity) WHERE answer IS NULL AND chapter_idx IS NULL
       → zodpovězená otázka neblokuje založení nové pro stejný klíč (nový drift
         po opravě, opětovné nadhození po dalším rerunu)
     upsert; rerun kapitoly maže její nezodpovězené a zakládá znovu (krok 0).
@@ -614,8 +631,10 @@ nikdy nespustí → žádná kapitola nedostane finální stav (`done`/`flagged`
    kmenové porovnání), parsing (`split_sections`, `extract_json`),
    guide/glossary (candidate/approved/seeded, reseed merge),
    `merge_scout_facts`. Většina testů. Z pokusu 1 portovat 11.
-2. **Stav:** dočasná SQLite, CRUD + přechody (blocking→pending, guess requeue
-   podle scope_key, error retry, uvízlé `processing`→`pending`, run lock).
+2. **Stav:** dočasná SQLite, CRUD + přechody (blocking→pending až po poslední
+   blocking otázce, guess requeue podle scope_key, error retry, `flagged`
+   → `pending` přes `--retry-flagged` (reset revision_rounds), uvízlé
+   `processing`→`pending`, run lock, partial unique jen na otevřené otázky).
 3. **Agenti:** fake `LLMClient` s nakonzervovanými odpověďmi. Sestavení promptu +
    parsování výstupu + guess/blocking split. Bez API.
 4. **Pipeline:** fake agenti + fake klient. Revizní smyčka (spustí se na
@@ -645,7 +664,8 @@ revizní smyčka - test napřed).
 6. `agents/critic` + test
 7. `pipeline` (revizní smyčka, requeue logika, fatal/recoverable klasifikace,
    cost guard) + test
-8. CLI: `init`, `scan`, `run`, `status`, `questions`, `answer`, `export`
+8. CLI: `init`, `scan`, `run` (+ `--retry-flagged`), `status`, `questions`,
+   `answer`, `export` (+ `--only-done`); run lock; UTF-8 stdout
 9. Review UI (minimální schvalovací cesta stačí k prvnímu `run`)
 10. Pilot na 2-3 reálných kapitolách + ladění promptů
 
