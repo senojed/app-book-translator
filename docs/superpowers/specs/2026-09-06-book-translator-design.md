@@ -1,7 +1,7 @@
 # Multiagentní překladač knih - design (pokus 2)
 
 Datum: 2026-09-06
-Stav: schváleno, čeká na implementační plán
+Stav: v revizi (plan-consensus Claude↔Codex)
 
 ## Kontext a cíl
 
@@ -122,7 +122,7 @@ python main.py scan               # scout projede celou knihu → guide.draft.js
 python main.py review             # web UI: potvrdíš/upravíš návod → guide.json
 python main.py run                # překladová smyčka přes kapitoly
 python main.py questions          # otázky nadhozené během běhu
-python main.py answer 3 "..."     # odpověď → pravidlo do návodu + přepočet kapitol
+python main.py answer <question_id> "..."   # odpověď → pravidlo/glosář + přepočet kapitol
 python main.py status             # přehled stavu kapitol
 python main.py export             # hotové kapitoly → output/kniha_cz.txt
 ```
@@ -130,28 +130,29 @@ python main.py export             # hotové kapitoly → output/kniha_cz.txt
 ### Co dělá `run` na jednu kapitolu
 
 ```
+0. status kapitoly → processing (drží run lock, viz Stav)
 1. rozděl na scény (podle prahu slov)
 2. translator(scéna, návod, glosář) pro každou scénu → slouč do plného překladu CZ
-3. concordance.check_chapter(CZ, glosář) → nálezy (leak / inconsistency)
+3. concordance.check_chapter(EN kapitola, CZ, glosář) → nálezy (leak/inconsistency/omission)
 4. kritik(EN kapitola, CZ) → nálezy se závažností
 5. dokud (critical nález kritika  NEBO  concordance leak  NEBO
-          inconsistency u schváleného termínu)  a  kolo < MAX_REVIZE:
+          inconsistency u seeded/approved termínu)  a  kolo < MAX_REVIZE:
        findings = kritikovy critical + concordance nálezy (sjednocené do jednoho tvaru)
        translator v revizním režimu(EN kapitola, CZ, findings, návod, glosář) → nový CZ
-       concordance.check_chapter znovu
-       kritik znovu
+       concordance.check_chapter znovu; kritik znovu
        revision_rounds += 1
 6. z FINÁLNÍHO překladu:
      - new_terms → glosář jako `candidate` (dedup podle term_en)
-     - used_terms (jak byl každý známý termín v kapitole vyrenderován) → tabulka term_mentions
+     - DELETE FROM term_mentions WHERE chapter_idx=?
+     - concordance.build_mentions(EN, CZ, glosář) → INSERT do term_mentions
 7. otázky z translatora → DB:
      - candidate termín → 1 otázka kind=term, guess_answer=navržený CZ, severity=guess
      - blocking otázka → severity=blocking
-   před zápisem mentions: DELETE FROM term_mentions WHERE chapter_idx=? (retranslation)
 8. ulož translated_text + revision_rounds + notes(JSON: kritik + concordance) + status:
        flagged        critical/leak nález přežil MAX_REVIZE kol
        needs_human    translator vrátil blocking otázku
        done           jinak (i s odhadnutým jménem / kandidátním termínem)
+   (commit kapitoly je jedna transakce; tím se uvolní z `processing`)
 ```
 
 **Které stavy `run` bere do fronty:** `pending` a `error` (error = auto retry).
@@ -189,7 +190,8 @@ done        ──answer na guess otázku, když answer ≠ guess───> pend
    - jinak → `affected_chapters` (kapitoly, jejichž `term_mentions` obsahují
      `scope_key`; u `style` bez scope_key: všechny `done`/`flagged` od kapitoly
      vzniku otázky) přejdou na `pending`
-`answer` nikdy nesahá na kapitolu ve stavu `pending` / právě zpracovávanou.
+`answer` běží jen když neběží `run` (run lock, viz Stav), takže nikdy nekoliduje
+s právě zpracovávanou kapitolou.
 
 ### Export
 
@@ -235,9 +237,14 @@ prompt, zavolají klienta, zparsují. Žádná DB, žádné soubory.
   UI podle `kind`/`scope_key` ví, kam odpověď zapsat (postava / termín / vztah /
   pravidlo).
 - **`scan --chunked` fallback:** kniha po chuncích (skupiny kapitol) → dílčí
-  fakta z každého chunku → `merge_scout_facts()` (deduplikace postav/termínů
-  podle jména, sjednocení aliasů, sběr must_decide) → jeden draft návodu.
-  Deterministický merge v kódu, ne dalším LLM voláním.
+  fakta → `merge_scout_facts()` (deterministicky v kódu):
+  - normalizační klíč = `name_en.strip().casefold()`; položky se stejným klíčem
+    se slijí, `aliases` = sjednocení, `note` = spojení
+  - kolize jmen (různé entity, stejný povrch): nechat obě, přidat `must_decide`
+  - `relationships`: stejná dvojice (klíč `sorted(a,b)`) s různým `suggested`
+    napříč chunky → `suggested: null` + `must_decide`
+  - `must_decide` a `terms`/`places` obdobně sjednotit podle scope_key
+  → jeden draft návodu. Žádné další LLM volání.
 - Model: `claude-sonnet-5`. Před pilotem změřit vstup přes `count_tokens`.
 
 ### Translator (`agents/translator.py`) - dva režimy
@@ -250,16 +257,17 @@ prompt, zavolají klienta, zparsují. Žádná DB, žádné soubory.
   ===PREKLAD===
   <čistý přeložený text>
   ===METADATA===
-  {"new_terms":  [{term_en, cz, note, type}],
-   "used_terms": [{term_en, cz_form}],   # jak byl každý známý termín vyrenderován
-   "questions":  [{"kind": "term|name|relationship|style|other",
-                   "scope_key": "term_en / null",
-                   "guess_answer": "co translator zvolil / null u blocking",
-                   "text": "...", "severity": "guess"|"blocking"}]}
+  {"new_terms": [{term_en, cz, note, type}],
+   "questions": [{"kind": "term|name|relationship|style|other",
+                  "scope_key": "term_en / null",
+                  "guess_answer": "co translator zvolil / null u blocking",
+                  "text": "...", "severity": "guess"|"blocking"}]}
   ```
   `guess` = přeloženo odhadem (má `guess_answer`), zapíše se otázka. `blocking`
   = "fakt nevím" (bez `guess_answer`) → kapitola `needs_human`. `new_terms` jdou
-  do glosáře jako `candidate`. `used_terms` z FINÁLNÍHO překladu → `term_mentions`.
+  do glosáře jako `candidate`.
+  `term_mentions` translator NEhlásí - staví je deterministicky `concordance`
+  z EN+CZ textu (LLM metadatům se u konzistence nedá věřit).
 - Model: `claude-sonnet-5`. Největší žrout tokenů. `max_tokens` velký (~16000)
   + pojistka na useknutí (translator: useknuto = `error`, viz Chyby).
 
@@ -291,16 +299,19 @@ class Completion:
 ```
 
 - `AnthropicClient` = jediná implementace v pokusu 2, jediný soubor importující
-  `anthropic`. `max_retries` nastaveno na SDK klientovi (config, default 8).
-  **Zůstává čistý - žádná DB, žádné `run_id`.**
-- Agenti klienta dostanou parametrem, nikdy ho nevytváří.
-- **Logging spotřeby:** pipeline obalí klienta do `LoggedLLMClient(inner,
-  run_id, agent, state)` - ten po každém `complete()` zapíše řádek do
-  `llm_calls` (přes `state`). Agenti dostanou obalený klient, nepoznají rozdíl.
-  Tak se neporuší hranice modulů a usage přežije pád procesu.
-- **Cost guard běží v pipeline PŘED `complete()`:** zavolá `count_tokens()`
-  (samostatná metoda, nevolá model), přičte `spent_so_far` z `llm_calls`,
-  porovná se stropem.
+  `anthropic`. `max_retries` na SDK klientovi (config, default 8). **Čistý -
+  žádná DB, žádné `run_id`, žádný cost guard.**
+- **`PipelineLLMClient(inner, run_id, agent, state, config)`** - obal, který
+  pipeline předá agentům místo holého klienta. Implementuje stejný Protocol.
+  Jeho `complete(system, user, max_tokens, model)`:
+  1. odhad ceny volání = `count_tokens(system,user)*in_rate + max_tokens*out_rate`
+     (konzervativně počítá plný `max_tokens` na výstupu - u překladu je output
+     hlavní náklad)
+  2. `spent_so_far` z `llm_calls` + odhad > `MAX_SPEND_USD` → pauza
+     `pokračovat? [y/N]` (u `scan` tvrdě zastav)
+  3. `inner.complete(...)`
+  4. zapiš řádek do `llm_calls` (přes `state`)
+  Agenti nepoznají rozdíl, hranice modulů zůstávají (klient sám DB nezná).
 - **Sonnet 5:** neposílat `temperature` / `top_p` / `top_k` (model non-default
   sampling odmítá 400). Předpoklady o kontextu/výstupu (1M / 128k) ověřit proti
   Anthropic docs a držet v `config.py`, ne v logice.
@@ -346,17 +357,20 @@ Později volitelně: translator + kritik na Opus pro kvalitu, scout zůstává S
 - `add_candidate()`, `promote(term_en, cz)`, `as_prompt_block()`
 
 ### `concordance.py` - deterministicky, BEZ LLM
-Nahrazuje terminology + cross_reference agenty z pokusu 1. Data bere ze dvou
-zdrojů: `translated_text` kapitol (v DB) a tabulky `term_mentions` (plněná
-z translatorových `used_terms`).
+Nahrazuje terminology + cross_reference agenty z pokusu 1. Vstup: EN a CZ text
+kapitoly + glosář. Nedůvěřuje LLM metadatům.
 
-- **Kontrola kapitoly** (`check_chapter(cz_text, glossary) → list[Issue]`):
-  - `leak`: EN podoba termínu je v CZ textu, ale termín se MÁ překládat
-    (`cz != term_en`) → critical. Pro `keep` položky (`cz == term_en`) se `leak`
-    nikdy nehlásí - tam je EN podoba správně.
-  - `inconsistency`: očekávaný CZ tvar (`seeded`/`approved` termín) v kapitole
-    chybí, ale je tam jiná známá varianta → critical u `approved`/`seeded`,
-    jinak jen otázka
+- **`build_mentions(en_text, cz_text, glossary) → list[(term_en, cz_form)]`:**
+  pro každý termín, jehož EN podoba (term_en/alias) je v EN textu, najdi v CZ
+  textu jeho vyrenderování (přesná shoda očekávaného `cz` nebo kmene). Výsledek
+  → tabulka `term_mentions` (zdroj dat pro drift). Termín z EN, který v CZ nemá
+  žádnou známou podobu → kandidát na `omission`.
+- **`check_chapter(en_text, cz_text, glossary) → list[Issue]`:**
+  - `leak`: EN podoba překládaného termínu (`cz != term_en`) je v CZ textu →
+    critical. `keep` položky (`cz == term_en`) se nehlásí.
+  - `inconsistency`: termín je v EN, v CZ je jeho známá varianta ≠ `approved`/
+    `seeded` `cz` → critical u approved/seeded, jinak otázka.
+  - `omission`: termín je v EN, v CZ žádná známá podoba → minor (ukáže se, nepadá)
 - **Drift napříč kapitolami** (`check_drift(term_mentions, glossary) → report`):
   pro každý `term_en` seskup `cz_form` z `term_mentions` všech `done`/`flagged`
   kapitol; 2+ zjevně různé kmeny (ne jen skloňování stejného slova) → drift nález
@@ -400,7 +414,9 @@ z translatorových `used_terms`).
 ```
 chapters (idx PK, title, raw_text, translated_text, status,
           revision_rounds INTEGER DEFAULT 0, notes TEXT, updated_at)
-    status: pending | done | flagged | needs_human | error
+    status: pending | processing | done | flagged | needs_human | error
+    processing = kapitola je právě zpracovávaná; při startu `run` se každá
+      uvízlá `processing` (pád v půlce) přepne zpět na `pending`
     notes: JSON - poslední nálezy kritika + concordance, nebo text chyby
 
 questions (id PK, chapter_idx, kind, text, scope_key, guess_answer,
@@ -425,6 +441,13 @@ llm_calls (id PK, run_id FK, agent, provider, model, input_tokens, output_tokens
 přehraje od scény 1 (přijatelné, kapitola je minuty ne hodiny). `scan` je
 idempotentní. `run` commituje po každé kapitole → pád na 47 → `run` naváže od 47.
 
+**Run lock.** `run` i `scan` na startu vezmou zámek (`.book-translator.lock`
+v `data/` s PID + časem). Druhý mutující příkaz (`run`, `scan`, `answer`,
+`init`) při aktivním zámku skončí s hláškou "běží jiný příkaz". `status`,
+`questions`, `export` jsou read-only, zámek ignorují. Zastaralý zámek (mrtvý
+PID) se přebere. Tím je pravidlo "`answer` nesahá na právě zpracovávanou
+kapitolu" vynutitelné - `answer` se během `run` vůbec nespustí.
+
 ## Chyby
 
 Klasifikace určuje reakci. **Fatal běhu** = zastav příkaz hned, nesahej na žádnou
@@ -433,7 +456,7 @@ jednu `error`, pokračuj další.
 
 | Třída | Co | Reakce |
 |---|---|---|
-| **Fatal běhu** | chybějící/špatný API klíč (auth error), neznámý model (404), 400 invalid request (špatné parametry), chyba konfigurace, `MAX_SPEND_USD` překročeno | výjimka ukončí příkaz, exit≠0, kapitoly beze změny |
+| **Fatal běhu** | chybějící/špatný API klíč (auth error), neznámý model (404), 400 invalid request (špatné parametry), chyba konfigurace, `MAX_SPEND_USD` překročeno | výjimka ukončí příkaz, exit≠0. Aktuální kapitola beze změny (necommitnutá); dříve commitnuté kapitoly zůstávají (navazatelné). |
 | **API dočasná** | 429, 5xx, timeout | SDK retry (max_retries=8, backoff); po vyčerpání → recoverable |
 | **Recoverable kapitola** | retry vyčerpán, neočekávaná výjimka v jedné kapitole | kapitola `error`, `run` pokračuje |
 | **Useknutý výstup** | translator | `error` (useknutý překlad = ztráta dat) |
@@ -446,23 +469,30 @@ Rozlišení fatal vs recoverable: první volání každého `run`/`scan` je "kan
 selže-li fatal třídou, končíme dřív než se cokoli zapíše.
 
 ### Cost guard
-- Usage se píše do `llm_calls` po každém volání (přežije pád procesu).
-- `config.MAX_SPEND_USD` - platí pro `run` i `scan`. Před každým voláním:
-  `spent_so_far` (z `llm_calls`) + `count_tokens` odhad tohoto volání +
-  worst-case odhad zbytku (zbývající kapitoly × prům. cena × (1 + MAX_REVIZE))
-  > strop → pauza `pokračovat? [y/N]` (u `scan` tvrdě zastav, je to 1 volání).
+- Sedí v `PipelineLLMClient.complete()` (viz Provider vrstva) - má tam k
+  dispozici `system`/`user`/`max_tokens`, takže odhad ceny volání (vstup přes
+  `count_tokens` + výstup `max_tokens × out_rate`) je spolehlivý.
+- `config.MAX_SPEND_USD` platí pro `run` i `scan`. `spent_so_far` (z `llm_calls`)
+  + odhad tohoto volání > strop → pauza `pokračovat? [y/N]`; u `scan` tvrdě
+  zastav (fatal běhu).
+- Usage v `llm_calls` po každém volání → přežije pád procesu.
 - Vlastní rate limiter není potřeba (SDK backoff).
 
 ## Testy - po vrstvách
 
 1. **Čistá logika (bez API, bez DB):** ingest (dělení kapitol/scén), concordance
-   (únik termínu, drift grouping), parsing (`split_sections`, `extract_json`),
-   guide/glossary load/save/format. Většina testů. Z pokusu 1 portovat 11.
-2. **Stav:** dočasná SQLite, CRUD + přechody (requeue po answer, retry `error`).
+   (`build_mentions`, leak vs keep, inconsistency, omission, drift grouping,
+   kmenové porovnání), parsing (`split_sections`, `extract_json`),
+   guide/glossary (candidate/approved/seeded, reseed merge),
+   `merge_scout_facts`. Většina testů. Z pokusu 1 portovat 11.
+2. **Stav:** dočasná SQLite, CRUD + přechody (blocking→pending, guess requeue
+   podle scope_key, error retry, uvízlé `processing`→`pending`, run lock).
 3. **Agenti:** fake `LLMClient` s nakonzervovanými odpověďmi. Sestavení promptu +
    parsování výstupu + guess/blocking split. Bez API.
-4. **Pipeline:** fake agenti. Revizní smyčka (spustí se na critical, zastaví na
-   MAX_REVIZE, zastaví na pass), růst glosáře, logování otázek, izolace chyb.
+4. **Pipeline:** fake agenti + fake klient. Revizní smyčka (spustí se na
+   critical/leak, zastaví na MAX_REVIZE, zastaví na pass), glosář candidate,
+   `term_mentions` mazání při retranslation, cost guard pauza, fatal vs
+   recoverable klasifikace, izolace chyb.
 5. **Pilot (neautomatizované):** jeden reálný `scan` + `run` na 2-3 kapitoly
    s klíčem. Checklist v README. Změří: fungují prompty, kvalita, cena, vydělává
    si multiagent na sebe.
