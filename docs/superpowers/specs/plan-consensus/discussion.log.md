@@ -30,3 +30,9 @@ Max kol: 10
 - Claude: CHANGES_NEEDED (0 vlastních) → round-4-claude.md
 - Opraveno: answer řeší 1 otázku, needs_human→pending jen když nezbývá blocking otázka; glosář = JEDINÝ zdroj termín→CZ v promptu (guide neemit termíny, approved má přednost); glossary +variants[] (z mentions/kandidátů/odpovědí) - rozlišuje inconsistency vs omission; kanárek/processing transakčně dotažen (processing commit před 1. voláním, fatal→zůstane processing, další run vrátí na pending); used_terms úplně odstraněno; PipelineLLMClient jednotný název, per-volání; nits (model/ceny config+validace, data/ output/ do dir stromu).
 - Sporné: nic. Konverguje (kolo 4 = 0 vlastních Claude nálezů).
+
+## Kolo 5 — 2026-09-06T15:55:43Z
+- Codex: CHANGES_NEEDED (0 BLOCKING, 4 IMPORTANT, 1 NIT) → round-5-codex.md
+- Claude: CHANGES_NEEDED (0 vlastních) → round-5-claude.md
+- Vše kolem data modelu concordance/finding. Opraveno: translator hlásí rendered_terms (uzavřená množina termínů co dostal, pipeline ověří substringem, neověřené zahodí) - řeší cirkularitu drift detekce z kola 3; nová sekce Finding {source,type,severity,term_en?,expected?,actual?,cz_excerpt?,issue,suggestion?}; step 7 převádí concordance candidate inconsistency na questions; term_mentions.cz_form nullable (omission=NULL řádek), zahrnuto do affected_chapters; cost_usd (actual) místo estimated_cost_usd.
+- Sporné: nic. Codex poprvé bez BLOCKING.

@@ -140,17 +140,21 @@ python main.py export             # hotové kapitoly → output/kniha_cz.txt
 4. kritik(EN kapitola, CZ) → nálezy se závažností
 5. dokud (critical nález kritika  NEBO  concordance leak  NEBO
           inconsistency u seeded/approved termínu)  a  kolo < MAX_REVIZE:
-       findings = kritikovy critical + concordance nálezy (sjednocené do jednoho tvaru)
+       findings = kritikovy critical + concordance nálezy (společný tvar Finding)
        translator v revizním režimu(EN kapitola, CZ, findings, návod, glosář) → nový CZ
        concordance.check_chapter znovu; kritik znovu
        revision_rounds += 1
 6. z FINÁLNÍHO překladu:
      - new_terms → glosář jako `candidate` (dedup podle term_en)
+     - ověř `rendered_terms` proti CZ textu, neověřené zahoď
      - DELETE FROM term_mentions WHERE chapter_idx=?
-     - concordance.build_mentions(EN, CZ, glosář) → INSERT do term_mentions
-7. otázky z translatora → DB:
-     - candidate termín → 1 otázka kind=term, guess_answer=navržený CZ, severity=guess
-     - blocking otázka → severity=blocking
+     - concordance.build_mentions(EN, CZ, glosář, rendered_terms) → INSERT
+     - nové cz_form → glossary.variants
+7. otázky → DB:
+     - translatorova `guess` otázka → severity=guess (má guess_answer)
+     - translatorova `blocking` otázka → severity=blocking
+     - concordance `inconsistency` u kandidátního termínu → otázka
+       kind=term, scope_key=term_en, guess_answer=nalezený tvar, severity=guess
 8. ulož translated_text + revision_rounds + notes(JSON: kritik + concordance) + status:
        flagged        critical/leak nález přežil MAX_REVIZE kol
        needs_human    translator vrátil blocking otázku
@@ -191,9 +195,10 @@ done        ──answer na guess otázku, když answer ≠ guess───> pend
    otázka. Jinak zůstává `needs_human`.
 3. **guess otázka** (kapitola už `done`/`flagged`):
    - `answer` == `guess_answer` → nic, žádný přepočet
-   - jinak → `affected_chapters` (kapitoly, jejichž `term_mentions` obsahují
-     `scope_key`; u `style` bez scope_key: všechny `done`/`flagged` od kapitoly
-     vzniku otázky) přejdou na `pending`
+   - jinak → `affected_chapters` = kapitoly s řádkem v `term_mentions` pro
+     `scope_key` (včetně `cz_form = NULL` omission řádků); u `style` bez
+     scope_key: všechny `done`/`flagged` od kapitoly vzniku otázky. Přejdou
+     na `pending`.
 `answer` běží jen když neběží `run` (run lock, viz Stav), takže nikdy nekoliduje
 s právě zpracovávanou kapitolou.
 
@@ -262,6 +267,7 @@ prompt, zavolají klienta, zparsují. Žádná DB, žádné soubory.
   <čistý přeložený text>
   ===METADATA===
   {"new_terms": [{term_en, cz, note, type}],
+   "rendered_terms": [{term_en, cz_as_used}],
    "questions": [{"kind": "term|name|relationship|style|other",
                   "scope_key": "term_en / null",
                   "guess_answer": "co translator zvolil / null u blocking",
@@ -270,8 +276,12 @@ prompt, zavolají klienta, zparsují. Žádná DB, žádné soubory.
   `guess` = přeloženo odhadem (má `guess_answer`), zapíše se otázka. `blocking`
   = "fakt nevím" (bez `guess_answer`) → kapitola `needs_human`. `new_terms` jdou
   do glosáře jako `candidate`.
-  `term_mentions` translator NEhlásí - staví je deterministicky `concordance`
-  z EN+CZ textu (LLM metadatům se u konzistence nedá věřit).
+  `rendered_terms` = pro každý termín z DODANÉHO glosáře, jak ho translator ve
+  scéně přeložil. **Uzavřená množina** (jen termíny, které translator dostal),
+  navíc pipeline každý `cz_as_used` ověří substringem proti CZ textu a
+  neověřené zahodí. Je to "ukaž na co jsi sáhl", ne "prohledej text" - to kód
+  ověří sám. Slouží jako vstup pro `concordance.build_mentions` (odhalí i
+  novotvar mimo glosář a `variants`).
 - Model: `claude-sonnet-5`. Největší žrout tokenů. `max_tokens` velký (~16000)
   + pojistka na useknutí (translator: useknuto = `error`, viz Chyby).
 
@@ -286,6 +296,25 @@ prompt, zavolají klienta, zparsují. Žádná DB, žádné soubory.
 - Revizní smyčku spouští `critical` nález kritika NEBO concordance `leak` NEBO
   `inconsistency` u schváleného termínu. `minor` se jen zapíše.
 - Model: `claude-sonnet-5`.
+
+### Finding (sjednocený tvar nálezu)
+
+Kritik i concordance produkují nálezy v jednom tvaru; pipeline je sloučí a
+předá revizoru (a uloží do `chapters.notes`):
+
+```
+Finding = {
+  source:     "critic" | "concordance",
+  type:       "fidelity"|"fluency"|"register"  |  "leak"|"inconsistency"|"omission",
+  severity:   "critical" | "minor",
+  term_en:    str | null,     # jen concordance
+  expected:   str | null,     # kanonický cz (concordance)
+  actual:     str | null,     # co je v textu (concordance)
+  cz_excerpt: str | null,     # jen critic
+  issue:      str,
+  suggestion: str | null,
+}
+```
 
 ## Provider vrstva (`llm/client.py`)
 
@@ -362,11 +391,11 @@ Později volitelně: translator + kritik na Opus pro kvalitu, scout zůstává S
   - `type`: name | place | term
   - `status`: `seeded` (z návodu), `approved` (člověk potvrdil přes `answer`),
     `candidate` (translator navrhl, nepotvrzeno)
-  - `variants`: další české tvary téhož termínu, které concordance viděla
-    v `term_mentions` / kandidátech / lidských odpovědích. Slouží k rozlišení
-    `inconsistency` (známá varianta ≠ kanonický `cz`) od `omission` (žádná
-    známá podoba). Novotvar, který ještě nikde nebyl, concordance neuvidí jako
-    inconsistency hned - chytne ho až drift check napříč kapitolami.
+  - `variants`: další české tvary téhož termínu, sbírané z `rendered_terms`,
+    `term_mentions`, kandidátů a lidských odpovědí. Slouží k rozlišení
+    `inconsistency` (jiný tvar než kanonický `cz`) od `omission` (žádná známá
+    podoba). Protože `rendered_terms` hlásí i tvar mimo glosář, i první výskyt
+    novotvaru se do `variants` dostane a `check_chapter` ho označí.
 - seed z návodu (keep → cz=term_en, translate → cz=guide.cz) = `seeded`
 - za běhu: `new_terms` → `candidate` (dedup podle term_en; existující nepřepisuje)
 - `as_prompt_block()` řadí `seeded`+`approved` jako závazné, `candidate` zvlášť
@@ -376,24 +405,30 @@ Později volitelně: translator + kritik na Opus pro kvalitu, scout zůstává S
 
 ### `concordance.py` - deterministicky, BEZ LLM
 Nahrazuje terminology + cross_reference agenty z pokusu 1. Vstup: EN a CZ text
-kapitoly + glosář. Nedůvěřuje LLM metadatům.
+kapitoly, glosář, a translatorem ohlášené `rendered_terms` (uzavřená, kódem
+ověřená množina - viz Translator).
 
-- **`build_mentions(en_text, cz_text, glossary) → list[(term_en, cz_form)]`:**
-  pro každý termín, jehož EN podoba (term_en/alias) je v EN textu, najdi v CZ
-  textu jeho vyrenderování (přesná shoda očekávaného `cz` nebo kmene). Výsledek
-  → tabulka `term_mentions` (zdroj dat pro drift). Termín z EN, který v CZ nemá
-  žádnou známou podobu → kandidát na `omission`.
-- **`check_chapter(en_text, cz_text, glossary) → list[Issue]`:**
+- **`build_mentions(en_text, cz_text, glossary, rendered_terms) → list[Mention]`:**
+  `Mention = (term_en, cz_form | NULL, chapter_idx)`. Pro každý termín, jehož EN
+  podoba je v EN textu:
+  - `cz_form` = ověřené `cz_as_used` z `rendered_terms`, jinak přesná shoda `cz`
+    / `variant` / kmene v CZ textu
+  - nic z toho nenalezeno → řádek s `cz_form = NULL` (omission)
+  → tabulka `term_mentions`. NULL řádky se počítají do `affected_chapters`
+  při requeue.
+- **`check_chapter(en_text, cz_text, glossary, rendered_terms) → list[Finding]`:**
   - `leak`: EN podoba překládaného termínu (`cz != term_en`) je v CZ textu →
     critical. `keep` položky (`cz == term_en`) se nehlásí.
-  - `inconsistency`: termín je v EN, v CZ je některá jeho `variant` ≠ kanonický
-    `cz` → critical u approved/seeded, jinak otázka.
-  - `omission`: termín je v EN, v CZ ani `cz` ani žádná `variant` → minor
-    (ukáže se, nepadá; může to být legitimní parafráze i chyba)
+  - `inconsistency`: `cz_form` termínu (z rendered_terms nebo textu) ≠ kanonický
+    `cz` a ≠ žádná `variant` → critical u approved/seeded, jinak `question`.
+    Nová `cz_form` se zároveň přidá do `glossary.variants` (aby ji drift viděl).
+  - `omission`: termín je v EN, v CZ ani `cz` ani `variant` ani rendered_term →
+    minor (ukáže se, nepadá; může to být legitimní parafráze i chyba)
 - **Drift napříč kapitolami** (`check_drift(term_mentions, glossary) → report`):
-  pro každý `term_en` seskup `cz_form` z `term_mentions` všech `done`/`flagged`
-  kapitol; 2+ zjevně různé kmeny (ne jen skloňování stejného slova) → drift nález
-  s výčtem kapitol.
+  pro každý `term_en` seskup ne-NULL `cz_form` z `term_mentions` všech
+  `done`/`flagged` kapitol; 2+ zjevně různé kmeny → drift nález s výčtem kapitol.
+  Data jsou úplná (rendered_terms zachytí i tvary mimo glosář), takže drift
+  chytí i nekonzistenci, kterou `check_chapter` v době překladu neznal.
 - České skloňování: v1 nedělá lemmatizaci. Porovnává na kmeni (slovo bez
   posledních 1-3 znaků) + přesnou shodou. Nejistoty ukáže člověku, tvrdě nepadá.
   LLM soudce ("stejné slovo skloňované?") případně později.
@@ -444,17 +479,19 @@ questions (id PK, chapter_idx, kind, text, scope_key, guess_answer,
     scope_key: term_en (term/name), "a|b" (relationship), null (style/other)
     severity: guess | blocking
 
-term_mentions (id PK, term_en, cz_form, chapter_idx)
-    plněno deterministicky přes concordance.build_mentions(EN,CZ,glosář);
-    zdroj dat pro drift check
+term_mentions (id PK, term_en, cz_form NULL, chapter_idx)
+    plněno přes concordance.build_mentions(EN,CZ,glosář,rendered_terms);
+    cz_form = NULL značí omission (termín v EN, nic známého v CZ);
+    zdroj dat pro drift check i affected_chapters při requeue
 
 drift_reports (id PK, up_to_chapter, report TEXT, created_at)
 
 runs (id PK, command, started_at, ended_at, status)
 llm_calls (id PK, run_id FK, agent, provider, model, input_tokens, output_tokens,
-           estimated_cost_usd, truncated, status, ts)
-    zápis po KAŽDÉM volání (přes PipelineLLMClient); cost guard i report čtou odtud
-    cena: input_tokens*sazba_in + output_tokens*sazba_out, sazby v config.py
+           cost_usd, truncated, status, ts)
+    zápis po KAŽDÉM volání (přes PipelineLLMClient), cost_usd = skutečná cena
+    z reálných tokenů (sazby v config.py); cost guard i report čtou odtud.
+    Pre-flight odhad guardu se nepersistuje (je jen dočasný v guardu).
 ```
 
 **Granularita navázání = kapitola.** Kapitola co spadne na scéně 3 z 5 se
