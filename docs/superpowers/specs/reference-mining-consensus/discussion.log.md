@@ -49,3 +49,33 @@ překlad používá zkrácenou podobu (Dresden místo Harry Dresden).
 
 Sporné body: žádné.
 
+## Kolo 3 — 2026-09-07
+
+- Codex: `round-3-codex.md` — VERDICT: CHANGES_NEEDED (4 BLOCKING, 6 IMPORTANT, 2 NITS)
+- Claude: `round-3-claude.md` — VERDICT: CHANGES_NEEDED (1 vlastní BLOCKING, 1 IMPORTANT)
+
+Nejcennější námitka: třída `contradicted` byla věcně chybná. Čeština skloňuje,
+takže nenalezení jednoho konkrétního tvaru návrh nevyvrací — přejmenováno na
+`not_attested` a hledání na CZ straně se nově opře o existující
+`concordance.find_form_occurrences` (kmenové porovnání), místo aby se stavěla
+vlastní morfologie.
+
+Další blokující: agregace aliasů dvojitě počítala překryvy (`Dresden` uvnitř
+`Harry Dresden`) a nález aliasu se vydával za doložení primárního tvaru; identita
+přes `term_en` nerozliší stejné jméno v `places` a `terms` (nově `id =
+sekce/klíč`); `write_reference` neuměl odlišit selhanou dávku od `unresolved`
+a `--limit` by smazal položky mimo limit; a délkové pravidlo si protiřečilo
+s vlastním testem `Mab`.
+
+Postavy obcházely invariant: validace dovoluje prázdné `cz` při `render=keep`,
+UI má `keep` jako výchozí a seed pak vloží anglické jméno. Nově vyžadována
+aktivní volba.
+
+Claude přidal blokující rozpor ve vlastní tabulce hranic (`reference.py` neměl
+znát `guide`, ale volat `guide.normalize_key`) — řeší nový `src/textnorm.py`.
+A upřesnil, že `--limit` se smí týkat jen stupně 1; stupeň 0 je zdarma.
+
+Spec přepsán celý — po třech kolech se sekce rozcházely.
+
+Sporné body: žádné.
+
