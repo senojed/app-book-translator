@@ -138,3 +138,31 @@ a u postavy render=keep znamená cz=canonical_en z definice.
 Claude přidal: korpusový fingerprint se musí brát z cache manifestu, jinak by
 review kvůli formuláři načítal 20 EPUBů (~30 s).
 
+## Kolo 6 — 2026-09-07
+
+- Codex: `round-6-codex.md` — VERDICT: CHANGES_NEEDED (2 BLOCKING, 2 IMPORTANT, 2 NITS)
+- Claude: `round-6-claude.md` — VERDICT: CHANGES_NEEDED (1 vlastní IMPORTANT)
+
+SPOR Z KOLA 5 VYŘEŠEN — Claude svou námitku stáhl. Codexův protiargument je
+silnější: výskyt "Dresden" nedokládá tvar "Harry Dresden", protože překlad může
+příjmení ponechat a křestní jméno počeštit. Praktická stránka rozhodla: weak
+položka je ve formuláři rozbalená i s důkazem, takže se doplní za dvě vteřiny —
+cena za nepředvyplnění nulová, za špatné předvyplnění chybný termín v celé knize.
+Alias-only nález nově nepředvyplní cz ani render.
+
+Kanonizace z kola 5 byla datově chybná: White Court / Red Court / Vampire Courts
+jsou tři různé entity, ne aliasy jedné. Výčty se nově rozdělují na samostatné
+položky bez jakéhokoli slučování podle interpunkce; synonyma tím dostanou dva
+řádky, což je správně (dva anglické povrchy = dva záznamy pro concordance).
+
+Prefixový matcher z kola 5 nefungoval — ověřeno spuštěním, že max(4, len-2)
+nespáruje ani bílá/bílé, ani rada/radě. Opraveno na max(3, len-2); ověřeno, že
+skloňování zvládne a kolizi bílá/bída pořád odmítne.
+
+corpus_fresh porovnával dva historické údaje (otisk v reference.json proti
+manifestu v téže cache) — nově se manifest sestaví znovu z disku přes os.stat.
+
+Claude přidal: rozdělení výčtů musí vidět i formulář, jinak nemá kam pověsit tři
+nálezy na jeden řádek draftu — sdílená guide.canonical_items() volaná těžbou
+i merge_sources.
+

@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 5 oponentury (Codex + Claude)
+Stav: po kole 6 oponentury (Codex + Claude)
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -12,7 +12,8 @@ a jména; překlad jedenáctky, který si vymyslí vlastní, je pro něj horší
 byl sám o sobě dobrý. **Návaznost na zavedenou terminologii je hlavní důvod,
 proč tenhle nástroj vzniká.**
 
-Scout po `scan` navrhl 121 povrchů (54 postav, 59 termínů, 19 míst). Bez
+Scout po `scan` navrhl 132 povrchů (54 postav, 59 termínů, 19 míst); 11 z nich
+jsou výčty, které se rozdělí na samostatné položky (viz rozhodnutí 5). Bez
 referencí na všech odpovídá člověk ručně nebo se hádá.
 
 **Cíl:** před fází `review` předvyplnit návod tím, co je **doložitelné**
@@ -157,8 +158,12 @@ textu** (jen NFC), `normalize_key` se používá výhradně na klíče položek.
 
 *Stupeň 1 - doložení navrženého českého tvaru (snese skloňování):*
 - porovnává se **po slovech prefixem**, ne oboustranným zkrácením: slovo v textu
-  odpovídá slovu dotazu, sdílejí-li prefix délky `max(4, len(slovo) - 2)`
-- slovo dotazu kratší než 4 znaky musí sedět **přesně**
+  odpovídá slovu dotazu, sdílejí-li prefix délky `max(3, len(slovo) - 2)`
+- slovo dotazu kratší než 3 znaky musí sedět **přesně**
+- Ověřeno, že pravidlo spáruje `bílá`↔`bílé`, `rada`↔`radě`, `plášť`↔`pláště`,
+  `rada`↔`radami`, a **nespáruje** `bílá`/`bída` ani `rada`/`rana`. Dřívější
+  varianta s prahem 4 skloňování nezvládala vůbec (`bílá`/`bílé` → False),
+  takže deklarovaná podpora skloňování byla prázdné tvrzení.
 - víceslovný tvar musí sedět jako souvislá posloupnost slov
 - Oboustranné zkracování (jako `concordance.stem`) je zakázané - právě ono
   slévá `Bílá rada` s `Bída rana`. Regresní test na tuhle dvojici je povinný.
@@ -187,12 +192,12 @@ povrchu by u překladu, který používá zkrácenou podobu, našlo málo výsky
   aliasu tedy `confirmed` nedá. Je-li doložen jen alias, třída je `weak`
   a v důkazu je uvedeno, který tvar zabral (`matched_en`). Aliasy jsou doplňkový
   důkaz pro člověka, ne podklad pro automatické potvrzení.
-- **Předvyplnění `cz` u alias-only nálezu** je povoleno jen tehdy, je-li doložený
-  tvar slovem (nebo souvislou posloupností slov) primárního povrchu:
-  `Dresden` ⊂ `Harry Dresden` ano, přezdívka `Hoss` ne. Důvod: 976 výskytů
-  `Dresden` v deseti dílech je silný důkaz, že jméno nebylo přeloženo, a u postavy
-  `render=keep` znamená `cz = canonical_en` z definice. Nesouvisející alias
-  takovou inferenci neunese a `cz` zůstává prázdné.
+- **Alias-only nález nepředvyplní `cz` ani `render`** - slouží jen jako
+  zobrazený důkaz. Výskyt `Dresden` nedokládá tvar `Harry Dresden`: překlad může
+  příjmení ponechat a křestní jméno počeštit. Nic se tím neztrácí, protože
+  `weak` položka je ve formuláři rozbalená i s důkazem („976× v 10 dílech")
+  a člověk ji doplní za dvě vteřiny. Cena za nepředvyplnění je nulová, cena za
+  špatné předvyplnění je chybný termín protažený celou knihou.
 
 **Složené položky se před těžbou rozdělí.** Draft obsahuje 11 položek, které
 nejsou jedním povrchem, ale výčtem variant: `White Court / Red Court / Vampire
@@ -200,16 +205,28 @@ Courts`, `veil/veiling spell`, `Will/Billy`, `naagloshii/skinwalker` a další.
 Přesné hledání takový řetězec nikdy nenajde, takže by všechny skončily jako
 `not_attested`, ačkoli samotný `skinwalker` má v referencích 58 výskytů.
 
-Kanonizace:
-- položka se rozdělí na varianty podle `/` a `" or "`, každá se ořízne
-- první neprázdná varianta je **primární**, ostatní se přidají k aliasům
-- hledá se přes všechny varianty podle pravidel pro aliasy
-- **původní řetězec zůstává jako `surface`** a je klíčem zpět do draftu -
-  UI a `merge_sources` položku poznají podle něj
-- dvě položky se stejnou **množinou** variant jsou duplicita bez ohledu na
-  pořadí (`skinwalker / naagloshii` = `naagloshii/skinwalker`) a sloučí se
+**Výčet není alias.** `White Court / Red Court / Vampire Courts` jsou tři různé
+dvory a každý potřebuje vlastní překlad; `Flickum bicus / Forzare / Aparturum`
+jsou tři různá zaklínadla. Slít je do jedné položky s jedním `cz` je věcná chyba.
 
-Zároveň se opravuje prompt scouta: jedna položka = jeden povrch, varianty patří
+Kanonizace:
+- položka se rozdělí podle `/` a `" or "` na **samostatné položky**, každá
+  s vlastním `id`, vlastním hledáním a vlastním `cz`
+- žádné slučování podle interpunkce. Synonyma (`skinwalker / naagloshii`) tím
+  dostanou dva řádky - a to je správně: jsou to dva různé anglické povrchy,
+  které se v textu vyskytují a oba potřebují záznam v glosáři, aby je
+  concordance uměla najít
+- obrácené duplicity (`skinwalker / naagloshii` vs. `naagloshii/skinwalker`) se
+  rozpadnou na tytéž položky a splynou přirozeně přes `id`
+- prázdná varianta se zahodí; položka bez jediné neprázdné varianty se přeskočí
+
+**Kanonizace je sdílená, ne interní záležitost těžby.** Kdyby výčet rozdělila
+jen těžba, formulář by dál ukazoval jeden řádek z draftu a tři nálezy by neměl
+kam pověsit. Bydlí proto v `guide.canonical_items(draft) -> list[dict]`, kterou
+volá těžba **i** `merge_sources`; formulář zobrazí tři řádky, každý s vlastním
+polem. Draft na disku zůstává beze změny.
+
+Zároveň se opravuje prompt scouta: jedna položka = jeden povrch, synonyma patří
 do `aliases`. Kanonizace zůstává i tak - starší drafty se nepřegenerovávají.
 
 **Identita položek se před těžbou validuje.** `scan_book` prázdné ani duplicitní
@@ -416,7 +433,8 @@ vytěžená hodnota do UI vůbec nedostala.
 ```json
 "reference": {"klasifikace": "...", "hits": 0, "books": [], "per_form": {},
               "matched_en": "...", "matched_cz": "...", "navrh": "...",
-              "cooccurrence": [], "stale": false, "fresh": true}
+              "cooccurrence": [], "stale": false,
+              "draft_fresh": true, "corpus_fresh": true, "thresholds_fresh": true}
 ```
 
 - **Tři samostatné příznaky čerstvosti:** `draft_fresh`, `corpus_fresh`,
@@ -536,10 +554,11 @@ skončí `FatalRunError` - stávající chování `PipelineLLMClient`.
    a `Listens-to-Wind` se najdou i s pomlčkou, prefixové pravidlo najde
    skloňované tvary, slovo kratší než 4 znaky musí sedět přesně, velikost písmen
    se v surovém textu zachovává.
-3. **Kanonizace vstupu:** `White Court / Red Court / Vampire Courts` se rozdělí
-   na tři varianty a najde se přes ně, `skinwalker / naagloshii`
-   a `naagloshii/skinwalker` se sloučí jako jedna položka, původní řetězec
-   zůstane klíčem zpět do draftu, prázdný klíč se přeskočí.
+3. **Kanonizace vstupu (`guide.canonical_items`):** `White Court / Red Court /
+   Vampire Courts` se rozdělí na **tři samostatné položky** s vlastními `id`
+   a vlastními poli, `skinwalker / naagloshii` a `naagloshii/skinwalker` dají
+   tytéž dvě položky (splynou přes `id`), prázdná varianta se zahodí,
+   `merge_sources` vrátí rozdělené řádky stejně jako těžba.
 4. **Korpus:** párování dílů, odmítnutí duplicitního čísla i malého korpusu,
    `stole` skončí nejvýš `weak` i při stovkách výskytů, `Mab` (3 znaky, velké
    písmeno) smí být `confirmed`, sjednocení rozsahů u překryvu
@@ -575,7 +594,7 @@ skončí `FatalRunError` - stávající chování `PipelineLLMClient`.
 
 ## Otevřené otázky k ověření prvním během
 
-- Kolik ze 121 povrchů vyřeší stupeň 0 a kolik stupeň 1?
+- Kolik povrchů (132 po rozdělení výčtů ještě víc) vyřeší stupeň 0 a kolik stupeň 1?
 - Jak často skončí návrh jako `not_attested`? Vysoké číslo = model českou edici
   nezná a stupeň 2 bude nutný.
 - Sedí prahy 5 výskytů / 2 díly, nebo je většina nálezů těsně pod nimi?
