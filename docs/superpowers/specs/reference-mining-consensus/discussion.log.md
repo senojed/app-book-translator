@@ -79,3 +79,34 @@ Spec přepsán celý — po třech kolech se sekce rozcházely.
 
 Sporné body: žádné.
 
+## Kolo 4 — 2026-09-07
+
+- Codex: `round-4-codex.md` — VERDICT: CHANGES_NEEDED (3 BLOCKING, 7 IMPORTANT)
+- Claude: `round-4-claude.md` — VERDICT: CHANGES_NEEDED (1 vlastní IMPORTANT)
+
+Zrušeno rozhodnutí z kola 3. `concordance.find_form_occurrences` se pro doložení
+termínů použít nedá, ověřeno spuštěním:
+  form_key("Bílá rada") == form_key("Bída rana")   → True
+  find_form_occurrences("Byl to Za-Lord.", "Za-Lord") → []
+Kmen zkracuje "bílá" i "bída" na "bí", "rada" i "rana" na "ra"; tokenizace přes
+\w+ rozseká Za-Lord na pomlčce. Pro drift v jedné kapitole to stačí, pro doložení
+v milionovém korpusu ne. `reference.py` dostává vlastní matcher se dvěma
+kontrakty (přesný pro stupeň 0, prefixový pro stupeň 1), `concordance` zůstává
+beze změny.
+
+Další blokující: normalize_key vždy casefolduje, takže "case-sensitive hledání"
+na normalizovaném textu bylo nemožné — normalizace nově slouží jen k identitě,
+hledá se v surovém textu. `reference_path` musí být keyword-only (třetí poziční
+parametr build_app je on_saved, server.py:108). `id` z draftu nejsou zaručeně
+unikátní — scan_book duplicity nekontroluje, dedup je jen ve scan_chunks.
+
+Důležité: write_reference dostal úplný stavový automat včetně nálezů stupně 0;
+chybějící id v odpovědi modelu se nově liší od explicitního null (stale vs
+unresolved); fresh:false nesmí předvyplňovat vůbec; prahy confirmed se počítají
+jen z primárního tvaru; UI fallback `c.render || "keep"` (index.html:111) se ruší
+ve prospěch prázdné volby; report se generuje z finálního slitého payloadu.
+
+Claude přidal: částečný běh přes --limit se tvářil jako úplný, doplněno `coverage`.
+
+Sporné body: žádné.
+
