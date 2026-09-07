@@ -259,3 +259,40 @@ jestli se modelu posílá všech 132 povrchů. Obnoveno a ověřeno.
 VÝSLEDEK: MAX_ROUNDS. Shoda vyžaduje CONSENSUS od obou ve stejném kole; Codex
 hodnotil verzi před touto opravou. Nedořešené body: žádné. Sporné body: žádné.
 Viz `final-verdict.md`.
+## Kolo 11 — 2026-09-07 (fresh-eyes, změněný formát)
+
+- Codex: `round-11-codex.md` — VERDICT: CHANGES_NEEDED (3 BLOCKING, 13 IMPORTANT,
+  5 OVER-ENGINEERED)
+- Claude: `round-11-claude.md` — VERDICT: CHANGES_NEEDED (1 vlastní BLOCKING)
+
+ZMĚNA FORMÁTU: Codex dostal spec BEZ historie a s výslovnou otázkou na proporce
+("je to na osobní nástroj překombinované? co bys škrtl?"). Vyneslo to víc než
+tři předchozí kola dohromady.
+
+Nejzávažnější (Claude ověřil a rozšířil): validace kolizí z kola 8 by znemožnila
+uložit formulář. Reálný draft má 15 kolizí, ne jednu — Morgan/Donald Morgan,
+Thomas/Thomas Raith, Karrin Murphy/Murphy, Rashid/the Gatekeeper... a většinou
+jde o DUPLICITY OD SCOUTA, ne o skutečné konflikty. UI nemá na kanonická jména
+editaci ani mazání, takže by nešlo uložit nic.
+
+ZÁSADNÍ OBRAT: příčinou většiny složitosti specu byla vadná data draftu
+(11 výčtů + 15 duplicit), kolem nichž spec postavil tři podsystémy. Nově se
+draft JEDNOU normalizuje (samostatný krok 0, rozhoduje člověk) a podsystémy se
+ruší. Levnější odstranit příčinu než obsluhovat následek.
+
+Přijaty všechny čtyři nálezy o překombinovanosti:
+- editor složených položek, dočasná id, přemapování must_decide → pryč
+- stale, čtyři stavy coverage, obnova po položkách, --limit → pryč, nahrazeno
+  ATOMICKÝM SELHÁNÍM (selže cokoli → předchozí soubor zůstane, spusť znovu)
+- tři příznaky čerstvosti → jeden
+- morfologie v kontraktu B, fixture 40 dvojic, checkpoint na 20 dotazech → pryč,
+  nahrazeno přesnou shodou celého slova; stupeň 1 stejně nikdy nepředvyplňuje,
+  takže tolerance skloňování kupovala málo za tři neúspěšné pokusy o matcher
+- samostatný reference_report.md → pryč, souhrn na konzoli
+
+Opraveny dvě reálné chyby stupně 0: obecné slovo (stole) se předvyplňovalo
+a zároveň se nedostalo do stupně 1 — nejhorší kombinace; a case-insensitive
+shoda mohla dát confirmed na nesouvisejícím českém slově.
+
+Spec: 619 → 484 řádků.
+
