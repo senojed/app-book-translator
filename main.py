@@ -92,6 +92,13 @@ def _cmd_scan(args) -> int:
                 text = "\n\n".join(c["raw_text"] for c in chs)
                 result = scout.scan_book(text, cf("scout"))
         except (OutputTruncated, ValueError) as e:
+            raw = getattr(e, "raw", "")
+            if raw:
+                # Bez surového výstupu je další pokus slepý; do gitu se nedostane.
+                dump = os.path.join(config.DATA_DIR, "scout_raw_last.txt")
+                with open(dump, "w", encoding="utf-8") as f:
+                    f.write(raw)
+                print(f"Surový výstup scouta uložen: {dump}")
             raise FatalRunError(
                 f"Scout výstup je neúplný/rozbitý ({e}). Zkus `scan --chunked` "
                 "nebo zvyš MAX_TOKENS_SCOUT v config.py.")

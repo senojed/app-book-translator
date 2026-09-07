@@ -16,6 +16,15 @@ from src.llm.parsing import extract_json
 _REQUIRED_KEYS = ("characters", "places", "terms", "relationships",
                   "style_notes", "must_decide")
 
+
+class ScoutOutputError(ValueError):
+    """Scout vrátil něco, co se nedá použít. Nese surový výstup modelu -
+    bez něj se selhání nedá diagnostikovat a další pokus je slepý."""
+
+    def __init__(self, message: str, raw: str = ""):
+        super().__init__(message)
+        self.raw = raw
+
 SYSTEM_PROMPT = """Jsi literární scout. Dostaneš text knihy v angličtině a
 připravíš podklad pro překlad do češtiny.
 
@@ -31,6 +40,8 @@ Vrať POUZE JSON (žádný text kolem, žádné ```), přesně v tomto tvaru:
 }
 
 Pravidla:
+- VŠECH ŠEST klíčů musí být v odpovědi vždy, i kdyby byl seznam prázdný.
+  Odpověď bez některého klíče je nepoužitelná.
 - "characters": vlastní jména postav. "keep" = ponechat anglicky, "translate" = přeložit.
 - "terms": pojmy specifické pro tento svět (organizace, magie, artefakty).
 - "relationships": dvojice, které spolu mluví; "suggested" = jestli si mají v
@@ -50,10 +61,14 @@ def scan_book(book_text: str, client, *, model=None, max_tokens=None) -> dict:
         raise OutputTruncated(
             "Scout výstup useknutý na max_tokens. Částečný návod znehodnotí celý "
             "běh - zvyš MAX_TOKENS_SCOUT nebo použij `scan --chunked`.")
-    data = extract_json(comp.text)
+    try:
+        data = extract_json(comp.text)
+    except ValueError as e:
+        raise ScoutOutputError(str(e), raw=comp.text) from e
     missing = [k for k in _REQUIRED_KEYS if k not in data]
     if missing:
-        raise ValueError(f"Scout výstup nemá povinné klíče: {', '.join(missing)}")
+        raise ScoutOutputError(
+            f"Scout výstup nemá povinné klíče: {', '.join(missing)}", raw=comp.text)
     return data
 
 
