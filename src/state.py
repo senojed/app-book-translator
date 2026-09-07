@@ -145,3 +145,184 @@ def set_run_spend_ceiling(db_path: str, run_id: int, value: float) -> None:
     with connect(db_path) as conn:
         conn.execute("UPDATE runs SET spend_ceiling = ? WHERE id = ?",
                      (value, run_id))
+
+
+# --- kapitoly ---------------------------------------------------------------
+
+_UPDATABLE = ("translated_text", "status", "revision_rounds", "notes")
+
+
+def seed_chapters(db_path: str, chapters) -> None:
+    """Nasype kapitoly z ingestu. Idempotentní - existující idx nechá být."""
+    with connect(db_path) as conn:
+        for ch in chapters:
+            conn.execute(
+                "INSERT OR IGNORE INTO chapters (idx,title,raw_text,status) "
+                "VALUES (?,?,?,'pending')", (ch.index, ch.title, ch.raw_text))
+
+
+def get_chapter(db_path: str, idx: int):
+    with connect(db_path) as conn:
+        r = conn.execute("SELECT * FROM chapters WHERE idx = ?", (idx,)).fetchone()
+    return dict(r) if r else None
+
+
+def chapters_by_status(db_path: str, statuses: tuple) -> list:
+    marks = ",".join("?" * len(statuses))
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM chapters WHERE status IN ({marks}) ORDER BY idx",
+            tuple(statuses)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def queue_for_run(db_path: str) -> list:
+    """Co bere `run`: pending a error (error = automatický retry).
+    needs_human a flagged čekají na člověka."""
+    return chapters_by_status(db_path, ("pending", "error"))
+
+
+def recover_processing(db_path: str) -> int:
+    """Kapitola uvízlá v `processing` = pád v půlce. Vrať ji do fronty."""
+    with connect(db_path) as conn:
+        cur = conn.execute("UPDATE chapters SET status='pending', "
+                           "updated_at=CURRENT_TIMESTAMP WHERE status='processing'")
+        return cur.rowcount
+
+
+def set_status(db_path: str, idx: int, status: str) -> None:
+    update_chapter(db_path, idx, status=status)
+
+
+def update_chapter(db_path: str, idx: int, **fields) -> None:
+    cols = [k for k in fields if k in _UPDATABLE]
+    if not cols:
+        return
+    sets = ", ".join(f"{c} = ?" for c in cols) + ", updated_at = CURRENT_TIMESTAMP"
+    with connect(db_path) as conn:
+        conn.execute(f"UPDATE chapters SET {sets} WHERE idx = ?",
+                     tuple(fields[c] for c in cols) + (idx,))
+
+
+def retry_flagged(db_path: str, idxs) -> int:
+    """flagged → pending a vynuluj kola revize, ať smyčka může znovu doopravdy běžet."""
+    with connect(db_path) as conn:
+        if idxs:
+            marks = ",".join("?" * len(idxs))
+            cur = conn.execute(
+                f"UPDATE chapters SET status='pending', revision_rounds=0, "
+                f"updated_at=CURRENT_TIMESTAMP WHERE status='flagged' AND idx IN ({marks})",
+                tuple(idxs))
+        else:
+            cur = conn.execute(
+                "UPDATE chapters SET status='pending', revision_rounds=0, "
+                "updated_at=CURRENT_TIMESTAMP WHERE status='flagged'")
+        return cur.rowcount
+
+
+def counts_by_status(db_path: str) -> dict:
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT status, COUNT(*) c FROM chapters "
+                            "GROUP BY status").fetchall()
+    return {r["status"]: r["c"] for r in rows}
+
+
+def is_db_empty(db_path: str) -> bool:
+    with connect(db_path) as conn:
+        return conn.execute("SELECT COUNT(*) c FROM chapters").fetchone()["c"] == 0
+
+
+def reset_book(db_path: str) -> None:
+    """Smaže veškerý stav knihy. Pro `init --reset`. Pořadí kvůli FK."""
+    with connect(db_path) as conn:
+        for table in ("term_mentions", "questions", "drift_reports", "llm_calls",
+                      "runs", "glossary", "chapters"):
+            conn.execute(f"DELETE FROM {table}")
+
+
+# --- run lock ---------------------------------------------------------------
+
+class LockError(RuntimeError):
+    """Jiný mutující příkaz už běží."""
+
+
+_LOCK_STALE_SECONDS = 6 * 3600
+
+
+def _pid_alive(pid: int) -> bool:
+    """Nedestruktivní zjištění, jestli proces žije.
+    Na Windows NIKDY os.kill - ten volá TerminateProcess."""
+    if pid is None or pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _lock_is_live(lock_path: str) -> bool:
+    """Zámek je živý jen když jde přečíst, má živý PID a není starší 6 h."""
+    import datetime
+    import json as _json
+    try:
+        with open(lock_path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        pid = int(data["pid"])
+        ts = datetime.datetime.fromisoformat(data["ts"])
+    except Exception:
+        return False   # nečitelný / poškozený zámek bereme jako zastaralý
+    if (datetime.datetime.now() - ts).total_seconds() > _LOCK_STALE_SECONDS:
+        return False
+    return _pid_alive(pid)
+
+
+def acquire_lock(lock_path: str) -> None:
+    import datetime
+    import json as _json
+    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+    for _ in range(3):
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if _lock_is_live(lock_path):
+                raise LockError(
+                    f"Běží jiný příkaz (zámek {lock_path}). Počkej na jeho konec.")
+            try:
+                os.unlink(lock_path)   # zastaralý zámek přebíráme
+            except FileNotFoundError:
+                pass
+            continue
+        payload = _json.dumps({"pid": os.getpid(),
+                               "ts": datetime.datetime.now().isoformat()})
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+        return
+    raise LockError(f"Zámek {lock_path} se nepodařilo získat.")
+
+
+def release_lock(lock_path: str) -> None:
+    try:
+        os.unlink(lock_path)
+    except FileNotFoundError:
+        pass
+
+
+@contextmanager
+def run_lock(lock_path: str):
+    acquire_lock(lock_path)
+    try:
+        yield
+    finally:
+        release_lock(lock_path)
