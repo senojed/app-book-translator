@@ -192,3 +192,39 @@ def test_review_does_not_reseed_on_failure(tmp_path, monkeypatch):
     rc = _run(["review"], tmp_path, monkeypatch)
     assert rc == 1
     assert glossary.all_terms("data/state.sqlite3") == []   # ŽÁDNÝ reseed
+
+
+def _init_4ch_pending(tmp_path, monkeypatch):
+    book = tmp_path / "k.txt"
+    body = "t " * 60
+    book.write_text("".join(f"Chapter {i}\n{body}\n" for i in range(1, 5)), encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    return "data/state.sqlite3"
+
+
+def test_run_only_processes_selected_chapters(tmp_path, monkeypatch):
+    db = _init_4ch_pending(tmp_path, monkeypatch)
+    import src.pipeline as P
+    seen = []
+    def fake(db_path, chapter, *, client_factory, guide):
+        seen.append(chapter["idx"])
+        state.update_chapter(db_path, chapter["idx"], status="done", translated_text="x")
+        return {"idx": chapter["idx"], "status": "done", "revision_rounds": 0}
+    monkeypatch.setattr(P, "process_chapter", fake)
+    assert _run(["run", "--only", "1", "3"], tmp_path, monkeypatch) == 0
+    assert seen == [1, 3]
+    assert state.get_chapter(db, 2)["status"] == "pending"   # nedotčené
+    assert state.get_chapter(db, 4)["status"] == "pending"
+
+
+def test_run_without_only_still_takes_whole_queue(tmp_path, monkeypatch):
+    db = _init_4ch_pending(tmp_path, monkeypatch)
+    import src.pipeline as P
+    seen = []
+    def fake(db_path, chapter, *, client_factory, guide):
+        seen.append(chapter["idx"])
+        state.update_chapter(db_path, chapter["idx"], status="done", translated_text="x")
+        return {"idx": chapter["idx"], "status": "done", "revision_rounds": 0}
+    monkeypatch.setattr(P, "process_chapter", fake)
+    assert _run(["run"], tmp_path, monkeypatch) == 0
+    assert seen == [1, 2, 3, 4]

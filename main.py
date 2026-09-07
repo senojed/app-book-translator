@@ -134,7 +134,16 @@ def _cmd_run(args) -> int:
     try:
         g = guide_mod.load_guide(config.GUIDE_PATH)
         cf = _client_factory(rid, interactive=True)
-        for ch in state.queue_for_run(db):
+        queue = state.queue_for_run(db)
+        if args.only:
+            # Pilot: přelož jen vyjmenované kapitoly, zbytek nech ve frontě.
+            wanted = set(args.only)
+            queue = [c for c in queue if c["idx"] in wanted]
+            chybi = sorted(wanted - {c["idx"] for c in queue})
+            if chybi:
+                print("Přeskočeno (nejsou ve frontě - už hotové, flagged nebo "
+                      "needs_human): " + ", ".join(str(i) for i in chybi))
+        for ch in queue:
             try:
                 summary = pipeline.process_chapter(db, ch, client_factory=cf, guide=g)
             except FatalRunError:
@@ -286,6 +295,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--retry-flagged", nargs="*", type=int, default=None,
                        dest="retry_flagged",
                        help="vrať flagged kapitoly do fronty (bez IDX = všechny)")
+    p_run.add_argument("--only", nargs="+", type=int, default=None,
+                       help="přelož jen tyhle kapitoly (pilot); zbytek zůstane ve frontě")
     p_run.set_defaults(func=_cmd_run)
 
     sub.add_parser("status", help="přehled kapitol").set_defaults(func=_cmd_status)

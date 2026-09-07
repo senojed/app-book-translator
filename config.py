@@ -1,5 +1,40 @@
-"""Centrální konfigurace. API klíč z env. Model IDs a ceny jsou tady, ne v logice."""
+"""Centrální konfigurace. API klíč z env (nebo z .env). Model IDs a ceny jsou
+tady, ne v logice."""
 import os
+
+
+def _load_dotenv(path: str, env=None) -> None:
+    """Doplní chybějící proměnné ze souboru .env. Skutečné prostředí vyhrává -
+    .env je jen pohodlný fallback, ne přepisovač.
+
+    Vlastní mini-parser, aby projekt nepotřeboval další závislost.
+    Umí: komentáře, prázdné řádky, `export FOO=bar`, uvozovky, mezery kolem =.
+    """
+    env = os.environ if env is None else env
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        name = name.strip()
+        if name.startswith("export "):
+            name = name[len("export "):].strip()
+        if not name:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        env.setdefault(name, value)
+
+
+# .env hledáme vedle tohoto souboru, ne v aktuálním adresáři - CLI se pouští
+# odkudkoli. Načítá se při importu, tedy dřív než se čte ANTHROPIC_API_KEY.
+_load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 DATA_DIR = "data"
 OUTPUT_DIR = "output"
