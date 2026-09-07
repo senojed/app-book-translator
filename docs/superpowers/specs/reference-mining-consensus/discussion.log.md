@@ -110,3 +110,31 @@ Claude přidal: částečný běh přes --limit se tvářil jako úplný, dopln�
 
 Sporné body: žádné.
 
+## Kolo 5 — 2026-09-07
+
+- Codex: `round-5-codex.md` — VERDICT: CHANGES_NEEDED (2 BLOCKING, 2 IMPORTANT)
+- Claude: `round-5-claude.md` — VERDICT: CHANGES_NEEDED (1 vlastní IMPORTANT,
+  1 částečný nesouhlas)
+
+Nejzávažnější: draft obsahuje 11 složených položek (`White Court / Red Court /
+Vampire Courts`, `veil/veiling spell`, `Will/Billy`), které nejsou jedním
+povrchem. Přesné hledání by je nikdy nenašlo a všechny by skončily jako
+not_attested, ačkoli samotný skinwalker má 58 výskytů. Claude o nich věděl
+z vlastní úvodní analýzy (přeskakoval je podmínkou na "/"), ale do specu je
+nezanesl. Doplněn kanonizační krok + oprava promptu scouta. Mezi položkami jsou
+i duplicity v opačném pořadí (skinwalker/naagloshii vs naagloshii/skinwalker).
+
+Dále: `coverage` neuchovával failed ani missing_response, takže po skončení
+příkazu nešlo odlišit "model řekl neznám" od "dávka spadla"; testy si
+protiřečily (řádky 510 a 512); `fresh` se kontroloval jen proti draftu, ačkoli
+fingerprint zahrnuje i korpus a prahy — nově tři samostatné příznaky.
+
+ČÁSTEČNÝ NESOUHLAS: Codex chtěl u alias-only nálezů zakázat předvyplnění `cz`
+plošně. Claude přijal princip, ale nahradil plošný zákaz pravidlem "doložený tvar
+musí být slovem primárního povrchu" (Dresden ⊂ Harry Dresden ano, Hoss ne).
+Důvod: 976 výskytů "Dresden" v deseti dílech je silný důkaz nepřeloženého jména
+a u postavy render=keep znamená cz=canonical_en z definice.
+
+Claude přidal: korpusový fingerprint se musí brát z cache manifestu, jinak by
+review kvůli formuláři načítal 20 EPUBů (~30 s).
+

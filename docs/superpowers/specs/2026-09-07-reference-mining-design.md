@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 4 oponentury (Codex + Claude)
+Stav: po kole 5 oponentury (Codex + Claude)
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -187,6 +187,30 @@ povrchu by u překladu, který používá zkrácenou podobu, našlo málo výsky
   aliasu tedy `confirmed` nedá. Je-li doložen jen alias, třída je `weak`
   a v důkazu je uvedeno, který tvar zabral (`matched_en`). Aliasy jsou doplňkový
   důkaz pro člověka, ne podklad pro automatické potvrzení.
+- **Předvyplnění `cz` u alias-only nálezu** je povoleno jen tehdy, je-li doložený
+  tvar slovem (nebo souvislou posloupností slov) primárního povrchu:
+  `Dresden` ⊂ `Harry Dresden` ano, přezdívka `Hoss` ne. Důvod: 976 výskytů
+  `Dresden` v deseti dílech je silný důkaz, že jméno nebylo přeloženo, a u postavy
+  `render=keep` znamená `cz = canonical_en` z definice. Nesouvisející alias
+  takovou inferenci neunese a `cz` zůstává prázdné.
+
+**Složené položky se před těžbou rozdělí.** Draft obsahuje 11 položek, které
+nejsou jedním povrchem, ale výčtem variant: `White Court / Red Court / Vampire
+Courts`, `veil/veiling spell`, `Will/Billy`, `naagloshii/skinwalker` a další.
+Přesné hledání takový řetězec nikdy nenajde, takže by všechny skončily jako
+`not_attested`, ačkoli samotný `skinwalker` má v referencích 58 výskytů.
+
+Kanonizace:
+- položka se rozdělí na varianty podle `/` a `" or "`, každá se ořízne
+- první neprázdná varianta je **primární**, ostatní se přidají k aliasům
+- hledá se přes všechny varianty podle pravidel pro aliasy
+- **původní řetězec zůstává jako `surface`** a je klíčem zpět do draftu -
+  UI a `merge_sources` položku poznají podle něj
+- dvě položky se stejnou **množinou** variant jsou duplicita bez ohledu na
+  pořadí (`skinwalker / naagloshii` = `naagloshii/skinwalker`) a sloučí se
+
+Zároveň se opravuje prompt scouta: jedna položka = jeden povrch, varianty patří
+do `aliases`. Kanonizace zůstává i tak - starší drafty se nepřegenerovávají.
 
 **Identita položek se před těžbou validuje.** `scan_book` prázdné ani duplicitní
 položky nekontroluje (dedup je jen v `scan_chunks`), takže `id` z draftu není
@@ -353,15 +377,23 @@ ResolveResult = TypedDict("ResolveResult", {
   },
   "coverage": {
     "attempted": ["terms/white council"],
+    "failed": ["terms/warlock"],
+    "missing_response": ["terms/threshold"],
     "skipped_by_limit": ["terms/nevernever"]
   },
   "findings": [ { ...Finding... } ]
 }
 ```
 
-`coverage` odlišuje „zkoušeno a nic se nenašlo" od „nezkoušeno". Bez něj by se
-částečný běh přes `--limit` tvářil jako úplný: fingerprint sedí s draftem, takže
-UI by u nezkoušených položek tvrdilo, že se nic nenašlo.
+`coverage` odlišuje čtyři různé důvody, proč položka nemá nález: zkoušeno
+a model řekl „neznám" (`attempted`, výsledek `unresolved`), dávka technicky
+selhala (`failed`), model položku v odpovědi vynechal (`missing_response`),
+nebo se nezkoušela kvůli `--limit`. Bez toho rozlišení by se částečný běh tvářil
+jako úplný a technické selhání jako odpověď modelu.
+
+**Bez předchůdce** (položka selhala a v předchozím souboru nález nemá) je
+výsledek `unresolved`, ale zůstává v `coverage.failed` - UI pak neříká „nic se
+nenašlo", nýbrž „nepodařilo se zjistit".
 
 `load_reference(path) -> dict | None`:
 - soubor neexistuje → `None` (běh bez těžby je legitimní)
@@ -387,12 +419,17 @@ vytěžená hodnota do UI vůbec nedostala.
               "cooccurrence": [], "stale": false, "fresh": true}
 ```
 
-- `fresh = false`, neodpovídá-li fingerprint draftu aktuálnímu draftu. Pak se
-  reference k předvyplnění **nepoužije vůbec** - ani `cz`, ani `render`, ani
-  číselné důkazy. Zobrazí se jen poznámka, že existuje nález z jiného běhu.
-  Skrýt čísla a hodnotu ponechat by nestačilo: opakovaný `scan` může změnit
-  aliasy při zachovaném hlavním klíči, takže by ve formuláři zůstala hodnota
-  opřená o už neplatný důkaz. `run_id` čerstvost neprokazuje.
+- **Tři samostatné příznaky čerstvosti:** `draft_fresh`, `corpus_fresh`,
+  `thresholds_fresh`. Předvyplnění (`cz` i `render`) i číselné důkazy se použijí
+  **jen když sedí všechny tři**; jinak se zobrazí pouze poznámka, že existuje
+  nález z jiného běhu. Skrýt čísla a hodnotu ponechat by nestačilo: opakovaný
+  `scan` může změnit aliasy při zachovaném hlavním klíči, takže by ve formuláři
+  zůstala hodnota opřená o už neplatný důkaz. `run_id` čerstvost neprokazuje.
+- **Odkud se otisky berou při `review`:** draft a prahy jsou levné (čtení JSONu
+  a `config`). Korpusový otisk se porovnává proti manifestu v
+  `REFERENCE_CACHE_PATH` - načítat kvůli formuláři 20 EPUBů (~30 s) nepřipadá
+  v úvahu. Chybí-li cache, je `corpus_fresh` **`unknown`** a chová se jako
+  `false`; radši nepředvyplnit než předvyplnit z neznámého podkladu.
 - **Vazba důkazu na hodnotu** platí jen pro `confirmed` a `weak` (tedy tam, kde
   je `cz` předvyplněné): liší-li se zobrazované `cz` od `matched_cz`, číselný
   důkaz se vynechá. Klasifikace a `navrh` se zobrazují vždy - u `proposed` /
@@ -499,31 +536,38 @@ skončí `FatalRunError` - stávající chování `PipelineLLMClient`.
    a `Listens-to-Wind` se najdou i s pomlčkou, prefixové pravidlo najde
    skloňované tvary, slovo kratší než 4 znaky musí sedět přesně, velikost písmen
    se v surovém textu zachovává.
-3. **Korpus:** párování dílů, odmítnutí duplicitního čísla i malého korpusu,
+3. **Kanonizace vstupu:** `White Court / Red Court / Vampire Courts` se rozdělí
+   na tři varianty a najde se přes ně, `skinwalker / naagloshii`
+   a `naagloshii/skinwalker` se sloučí jako jedna položka, původní řetězec
+   zůstane klíčem zpět do draftu, prázdný klíč se přeskočí.
+4. **Korpus:** párování dílů, odmítnutí duplicitního čísla i malého korpusu,
    `stole` skončí nejvýš `weak` i při stovkách výskytů, `Mab` (3 znaky, velké
    písmeno) smí být `confirmed`, sjednocení rozsahů u překryvu
    `Harry Dresden`/`Dresden` (žádné dvojí započtení), doložený jen alias →
    `weak` s `matched_en`, pravidlo o začátku věty včetně hranice dokumentů,
    escapování metaznaků, pomlčka uvnitř povrchu, cache round-trip a invalidace.
-4. **Agent (fake klient):** dávkování, obálka `{"proposals":[...]}`, párování
+5. **Agent (fake klient):** dávkování, obálka `{"proposals":[...]}`, párování
    přes `id` (stejný `term_en` ve dvou sekcích se nesplete), duplicitní `id` →
-   `ValueError`, cizí `id` se ignoruje, chybějící → `unresolved`,
+   `ValueError`, cizí `id` se ignoruje,
    `OutputTruncated` → jeden pokus s dvojnásobkem, pak `failed`,
    chybějící `id` → `stale` (ne `unresolved`), explicitní `null` → `unresolved`,
    síťová výjimka → `failed`.
-5. **Orchestrace (fake klient, mini korpus):** pět tříd, `proposed`/`not_attested`
+6. **Orchestrace (fake klient, mini korpus):** pět tříd, `proposed`/`not_attested`
    nechávají `cz` prázdné, hraniční testy souvýskytu (přesně na poměru, těsně
    pod, prázdné `E`), skloňovaný tvar prefixové porovnání najde (nespadne do
    `not_attested`), selhaná dávka převezme předchozí nález s `stale`,
    `--limit` nesmaže položky mimo limit a zapíše se do `coverage`, zmizelý
    povrch se odstraní, prahy se počítají jen z primárního tvaru (jeden výskyt
    primárního + sto u aliasu → `weak`), report vzniká z finálního payloadu.
-6. **Slití (`merge_sources`):** přednost `guide` > `reference` > `draft`;
+7. **Slití (`merge_sources`):** přednost `guide` > `reference` > `draft`;
    číselný důkaz se vynechá při neshodě `cz`/`matched_cz`, klasifikace a `navrh`
    zůstanou; `fresh: false` při změněném fingerprintu; volání bez reference se
-   chová jako dnes; **`fresh: false` nepředvyplní vůbec nic**; poškozený nebo
+   chová jako dnes; **kterýkoli z `draft_fresh`/`corpus_fresh`/`thresholds_fresh`
+   nepravdivý → nepředvyplní se vůbec nic**; chybějící cache → `corpus_fresh`
+   je `unknown` a chová se jako `false`; alias-only nález předvyplní `cz` jen
+   když je doložený tvar slovem primárního povrchu (`Dresden` ano, `Hoss` ne); poškozený nebo
    schématu neodpovídající `reference.json` UI neshodí.
-7. **End-to-end invariant:** `reference.json` → `GET /api/guide` → POST →
+8. **End-to-end invariant:** `reference.json` → `GET /api/guide` → POST →
    `guide.json` → `glossary.seed_from_guide`. Musí prokázat, že metadata přežijí
    slití, že se `proposed`/`not_attested` **nemůže** dostat do glosáře bez
    ručního vypsání, že **postava bez doložení neprojde bez aktivní volby
