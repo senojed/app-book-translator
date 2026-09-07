@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 1 oponentury (Codex + Claude)
+Stav: po kole 2 oponentury (Codex + Claude)
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -92,26 +92,54 @@ pro anglické homografy na CZ straně.
   příslušný anglický termín. Souvýskyt vazbu neprokazuje, ale vyvrací ji, když
   chybí - to stačí na odlišení `proposed` od `contradicted`.
 
+**Přesný predikát souvýskytu.** Buď `E` = množina dílů, kde je anglický povrch
+(nebo některý jeho alias) na EN straně, a `C` = množina dílů, kde je navržený
+český tvar na CZ straně. Uvažují se jen spárované díly.
+
+```
+souvyskyt = E ∩ C
+proposed  ⇔  |E| > 0  a  |souvyskyt| >= max(1, ceil(REFERENCE_COOCCUR_RATIO * |E|))
+```
+
+`REFERENCE_COOCCUR_RATIO = 0.5` (počáteční odhad). Jinak `contradicted`.
+Prázdné `E` (anglický termín v referencích vůbec není, protože je nový až
+v jedenáctce) → `contradicted`; korpus k němu nemá co říct a člověk rozhodne sám.
+
 ### 4. Falešné shody a pravidla hledání
 
-Pokus ukázal past: hledání `stole` bez ohledu na velikost písmen našlo 79 výskytů
-v 10/10 dílech - jenže to je český lokativ slova *stůl*, ne ponechaný termín.
+Pokus ukázal past: hledání `stole` našlo 79 výskytů v 10/10 dílech - jenže to je
+český lokativ slova *stůl* (*na stole*), ne ponechaný anglický termín. Povrch
+`stole` v draftu scouta skutečně je (ve významu „štóla").
+
+**Case-sensitivita tenhle případ neřeší** a první verze specu se v tom mýlila:
+české „na stole" je malými písmeny, takže case-sensitive dotaz na `stole` ho
+najde stejně dobře. Ošetřila by jen varianty `Stole`/`STOLE`, které v textu
+nejsou. Jediná spolehlivá obrana je nedůvěřovat automatu u obecných slov.
 
 **Pravidla hledání** (platí pro obě strany korpusu):
 
-- Text i dotaz se normalizují na Unicode NFC.
-- Hranice slova se hledají přes `regex` s `\b` a `re.UNICODE`; víceslovný povrch
-  se hledá jako posloupnost slov oddělená libovolným bílým znakem.
-- Povrch začínající **velkým** písmenem (vlastní jméno): hledá se
-  case-insensitive.
-- Povrch začínající **malým** písmenem (obecné slovo): hledá se
-  **case-sensitive**.
-- Délka povrchu: 1-2 znaky se nehledají vůbec (`hits = 0`, třída `unresolved`).
-  3-4 znaky se hledají, ale nikdy nedosáhnou třídy `confirmed` - jdou nejvýš do
-  `weak`. 5+ znaků bez omezení.
+- Text i dotaz se normalizují na Unicode NFC, přes sdílenou `guide.normalize_key()`.
+- Dotaz se escapuje (`re.escape`), hranice slova přes `\b` s `re.UNICODE`.
+  Víceslovný povrch se hledá jako posloupnost slov oddělená libovolným bílým
+  znakem; apostrof a pomlčka uvnitř povrchu se berou jako součást slova, ne jako
+  hranice (`Listens-to-Wind`, `Za-Lord`).
+- Povrch začínající **velkým** písmenem (vlastní jméno): case-insensitive.
+- Povrch začínající **malým** písmenem (obecné slovo): case-sensitive **a
+  nikdy nedosáhne třídy `confirmed`** - končí nejvýš `weak` a jde před oči
+  člověku. Case-sensitivita je slabý filtr, ne záruka.
+- Délka povrchu: 1-2 znaky se nehledají vůbec (`hits = 0` → `unresolved`).
+  3-4 znaky se hledají, ale nedosáhnou `confirmed`. 5+ znaků bez omezení.
 - Povrch kratší než 5 znaků musí mít alespoň jeden výskyt **mimo začátek věty**,
-  jinak se nepočítá. Chrání před jmény, která jsou zároveň českými slovy
-  (`Bob` na začátku věty vs. luštěnina).
+  jinak se nepočítá. Začátek věty = pozice 0 textu, nebo první nebílý znak po
+  `.`, `!`, `?`, `…` následovaném bílým znakem. Chrání před jmény, která jsou
+  zároveň českými slovy (`Bob` na začátku věty vs. luštěnina).
+
+**Stupeň 0 hledá i aliasy.** Scout u `Harry Dresden` uvádí `Dresden`, `Harry`,
+`Hoss`. Používá-li překlad převážně zkrácenou podobu, hledání jen primárního
+povrchu by našlo málo výskytů a položka by spadla do `weak`, ačkoli je jméno
+prokazatelně ponechané. Výskyty se proto sčítají přes primární klíč i všechny
+aliasy a `Evidence.matched_en` říká, který povrch zabral. Aliasy nejsou
+samostatné položky, jen rozšiřují dotaz.
 
 ## Stupně řešení
 
@@ -193,8 +221,16 @@ class Corpus:
   `[{term_en, kind, note}]`, výstup `[{term_en, cz | None}]`.
 - **Obálka odpovědi je objekt**, ne seznam: `{"proposals": [...]}`. Sdílený
   `parsing.extract_json` umí regexem `\{.*\}` vytáhnout jen objekt, seznam by
-  neprošel. Neparsovatelná odpověď → `ValueError`; volající dávku přeskočí a
-  pokračuje další.
+  neprošel.
+- **Validace odpovědi** (bez ní by model tiše zaměnil nebo vynechal položky):
+  párování zpět na dotaz přes `guide.normalize_key(term_en)`, ne přes syrový
+  řetězec. Duplicitní klíč v odpovědi → `ValueError`. Klíč, který nebyl v dotazu
+  → ignoruje se a nahlásí. Klíč z dotazu, který v odpovědi chybí → `unresolved`.
+  `cz` musí být `str` nebo `null`; jiný typ → `ValueError`.
+- **Chyby:** neparsovatelná odpověď i `ValueError` z validace → volající dávku
+  přeskočí a pokračuje další. `OutputTruncated` se řeší stejně jako u kritika:
+  jeden pokus s dvojnásobným `max_tokens`, pak se dávka přeskočí. Přeskočená
+  dávka nikdy nesmí smazat dřívější platné nálezy - viz `write_reference`.
 
 ### `src/reference_mine.py`
 
@@ -221,10 +257,18 @@ Finding = TypedDict("Finding", {
   položky (sekce je součástí identity); v rámci jedné sekce je duplicita chyba
   vstupu a nahlásí se.
 - `resolve(corpus, surfaces, client_factory, cfg) -> list[Finding]`
-- `write_reference(findings, path)` - `data/reference.json`, atomicky
-  (temp + `os.replace`), **nahrazuje soubor celý**.
-- `write_report(findings, path)` - `data/reference_report.md`, zapisuje se
-  **až po** úspěšném zápisu `reference.json`; nese id běhu.
+- `write_reference(findings, path, run_id)` - `data/reference.json`, atomicky
+  (temp + `os.replace`), **nahrazuje soubor celý**. Soubor nese `run_id`
+  a `schema_version`.
+  **Přeskočená dávka nesmí smazat dříve platné nálezy:** pro položky, které
+  v tomhle běhu selhaly, se převezme nález z předchozího `reference.json`
+  a označí se `"stale": true`. Nález bez předchůdce zůstane `unresolved`.
+- `write_report(findings, path, run_id)` - `data/reference_report.md`, zapisuje
+  se **až po** úspěšném zápisu `reference.json`.
+  Report je **odvoditelný artefakt, ne transakční partner dat.** Pád mezi dvěma
+  `os.replace` nutně vyrobí stav „data nová, report starý" - tvrdit atomicitu
+  přes dva soubory by byla lež. Report proto nese `run_id`; neshoda s `run_id`
+  v `reference.json` znamená „report je zastaralý, spusť znovu", ne poškozený stav.
 
 ### Rozšíření `src/guide.py`
 
@@ -240,10 +284,23 @@ Přednost: `guide` > `reference` > `draft`. U každé položky navíc blok:
               "navrh": "...", "cooccurrence": []}
 ```
 
-Blok se **vynechá**, liší-li se zobrazovaná hodnota `cz` od `matched_cz` -
-důkaz posbíraný pro jiný tvar nesmí viset u hodnoty, ke které nepatří.
+**Vazba důkazu na hodnotu** platí jen pro třídy s předvyplněným `cz`
+(`confirmed`, `weak`): liší-li se zobrazované `cz` od `matched_cz`, číselný důkaz
+(`hits`, `books`, `cooccurrence`) se **vynechá** - důkaz posbíraný pro jiný tvar
+nesmí viset u hodnoty, ke které nepatří. Klasifikace a `navrh` se zobrazují vždy.
+
+U `proposed` a `contradicted` je `cz` prázdné záměrně, takže podmínka
+`cz == matched_cz` by tam metadata vždy zahodila a UI by nemělo co ukázat -
+proto se na ně nevztahuje.
+
 Stará `merge_draft_and_guide` zůstane jako tenký obal (volá `merge_sources`
 s `reference=None`), aby stávající testy a volání platily.
+
+**Sdílená normalizace.** Dnešní `guide.normalize()` je `strip().lower()`, těžba
+potřebuje NFC + `casefold()` + zúžení bílých znaků. Dvě různá pravidla by klíče
+rozešla. Zavádí se `guide.normalize_key()` s přísnější variantou a používá ji
+těžba, `merge_sources` i upsert v UI. `normalize()` zůstává pro `relationship_key`,
+aby se nezměnily existující klíče vztahů.
 
 ## Chyby
 
@@ -261,7 +318,7 @@ Těžba je **volitelný krok**, ne podmínka běhu.
 | chybí `guide.draft.json` | `FatalRunError` s vysvětlením, že má běžet `scan` |
 
 `reference.json` se zapisuje **až na konci**, jedním atomickým zápisem. Report se
-zapisuje až po něm. Pád uprostřed nenechá report bez dat ani data bez reportu.
+zapisuje až po něm a je odvoditelný (viz `write_report`).
 
 **Co příkaz zapisuje do DB:** jen `runs` (`create_run` / `finish_run`) a
 `llm_calls` (přes `PipelineLLMClient`). Tabulek `chapters`, `glossary`,
@@ -269,6 +326,22 @@ zapisuje až po něm. Pád uprostřed nenechá report bez dat ani data bez repor
 „na databázi nesahá vůbec" bylo nepřesné.
 
 ## Review UI
+
+Dnešní `build_app(draft_path, guide_path, on_saved)` a
+`run_review_server(draft_path, guide_path)` třetí zdroj vůbec nemají a
+`main.py:123` je volá po staru - výsledek těžby by se do UI nikdy nedostal.
+
+**Změny:**
+
+- obě signatury dostanou `reference_path: str | None = None` (výchozí `None`
+  drží zpětnou kompatibilitu se stávajícími testy)
+- `GET /api/guide` volá `guide.merge_sources(draft, guide, reference)`
+- `_cmd_review` předá `config.REFERENCE_PATH`
+- **POST metadata odstraní.** Dnes `server.py:129` ukládá `save_guide(guide_path,
+  payload)`, tedy celý payload včetně bloků `reference`. Ty by zůstaly ležet
+  v `guide.json` mezi lidskými rozhodnutími a po dalším běhu těžby zastaraly.
+  Server proto před uložením bloky `reference` (a `must_decide`, které se už dnes
+  vyprazdňuje) z payloadu odstraní. `guide.json` zůstává kanonický lidský model.
 
 `GET /api/guide` vrací u položek blok `reference`. Formulář podle něj:
 
@@ -281,25 +354,66 @@ zapisuje až po něm. Pád uprostřed nenechá report bez dat ani data bez repor
 Validace se nemění. Chybějící blok `reference` (běh bez těžby) nesmí UI rozbít -
 sekce se pak nezobrazí.
 
+## CLI a konfigurace
+
+```
+python main.py reference [--dir CESTA] [--refresh-cache] [--limit N]
+```
+
+- `--dir` přebije `config.REFERENCE_DIR`; `--refresh-cache` postaví korpus znovu
+  bez ohledu na platnost cache; `--limit N` zpracuje jen prvních N nevyřešených
+  povrchů (na levné vyzkoušení).
+- Příkaz patří do `_MUTATING` (drží zámek), lifecycle `create_run` / `finish_run`
+  jako `scan`, cost guard `interactive=False` - je to dávková operace bez dohledu.
+- Pořadí: `scan` → `reference` → `review`. Chybí-li `guide.draft.json`, skončí
+  s vysvětlením, že má běžet `scan`.
+
+Nové klíče v `config.py`:
+
+| Klíč | Výchozí | K čemu |
+|---|---|---|
+| `REFERENCE_DIR` | `""` (nutno zadat `--dir`) | kořen se složkami `EN/` a `CZ/` |
+| `REFERENCE_PATH` | `data/reference.json` | výsledek těžby |
+| `REFERENCE_CACHE_PATH` | `data/reference_corpus.json` | předžvýkaný korpus |
+| `REFERENCE_REPORT_PATH` | `data/reference_report.md` | souhrn pro člověka |
+| `MODEL_LEXICOGRAPHER` | `claude-sonnet-5` | model pro návrhy |
+| `MAX_TOKENS_LEXICOGRAPHER` | `4000` | krátké odpovědi, žádná próza |
+| `REFERENCE_BATCH_SIZE` | `30` | termínů na jedno volání |
+| `REFERENCE_MIN_HITS` | `5` | práh pro `confirmed` (odhad) |
+| `REFERENCE_MIN_BOOKS` | `2` | práh pro `confirmed` (odhad) |
+| `REFERENCE_MIN_CORPUS_BOOKS` | `3` | pod tím se `confirmed` netvrdí vůbec |
+| `REFERENCE_COOCCUR_RATIO` | `0.5` | podíl dílů pro souvýskyt (odhad) |
+
+Ceny za `MODEL_LEXICOGRAPHER` musí být v `PRICE_*_PER_MTOK`, jinak cost guard
+skončí `FatalRunError` - to je stávající chování `PipelineLLMClient`.
+
 ## Testy
 
 1. **Korpus (bez API):** párování dílů, odmítnutí duplicitního čísla, odmítnutí
-   příliš malého korpusu, case-sensitive pravidlo (`stole` se jako termín
-   nenajde, `Mab` ano), délková pravidla včetně tříznakových povrchů, pravidlo
-   o začátku věty, NFC normalizace, cache round-trip a invalidace při změně
-   velikosti/mtime/kořene.
+   příliš malého korpusu, **`stole` skončí nejvýš `weak` i při stovkách výskytů**
+   (obecné slovo se nikdy nepotvrdí automaticky) zatímco `Mab` může být
+   `confirmed`, sčítání výskytů přes aliasy a `matched_en`, délková pravidla
+   včetně tříznakových povrchů, pravidlo o začátku věty, escapování metaznaků,
+   pomlčka uvnitř povrchu (`Listens-to-Wind`), NFC normalizace, cache round-trip
+   a invalidace při změně velikosti/mtime/kořene.
 2. **Agent (fake klient):** sestavení dávky, parsování obálky `{"proposals":[...]}`,
-   `null` jako „neznám", rozbitá dávka → `ValueError` a běh pokračuje.
+   `null` jako „neznám", duplicitní klíč → `ValueError`, cizí klíč se ignoruje,
+   chybějící klíč → `unresolved`, `OutputTruncated` → jeden pokus s dvojnásobkem,
+   rozbitá dávka → běh pokračuje další dávkou.
 3. **Orchestrace (fake klient, mini korpus):** klasifikace do pěti tříd,
-   `proposed`/`contradicted` nechávají `cz` prázdné, souvýskyt rozhoduje mezi
-   nimi, `reference.json` se nahrazuje celý (idempotence), report až po datech.
+   `proposed`/`contradicted` nechávají `cz` prázdné, hraniční testy predikátu
+   souvýskytu (přesně na poměru, těsně pod, prázdné `E`),
+   **selhaná dávka převezme předchozí nález a označí ho `stale`**,
+   `reference.json` se nahrazuje celý (idempotence), report nese stejný `run_id`.
 4. **Slití (`merge_sources`):** přednost `guide` > `reference` > `draft`;
-   blok `reference` se vynechá při neshodě `cz` a `matched_cz`; volání bez
-   reference se chová jako dnes.
+   číselný důkaz se vynechá při neshodě `cz` a `matched_cz`, ale klasifikace
+   a `navrh` zůstanou; u `proposed`/`contradicted` se blok zobrazí i s prázdným
+   `cz`; volání bez reference se chová jako dnes.
 5. **End-to-end invariant:** obohacený `reference.json` → `GET /api/guide` →
    POST → `guide.json` → `glossary.seed_from_guide`. Musí prokázat, že
-   metadata přežijí slití a že se `proposed`/`contradicted` **nemůže** dostat
-   do glosáře bez toho, aby ho člověk vypsal ručně.
+   metadata přežijí slití, že se `proposed`/`contradicted` **nemůže** dostat
+   do glosáře bez toho, aby ho člověk vypsal ručně, a že **`guide.json` po POSTu
+   neobsahuje žádný blok `reference`**.
 
 ## Otevřené otázky k ověření prvním během
 
