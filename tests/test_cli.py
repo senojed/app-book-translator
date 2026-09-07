@@ -159,3 +159,36 @@ def test_scan_scout_bad_json_is_fatal(tmp_path, monkeypatch):
     monkeypatch.setattr(SC, "scan_book", lambda *a, **k: (_ for _ in ()).throw(
         ValueError("rozbitý JSON")))
     assert _run(["scan"], tmp_path, monkeypatch) == 1
+
+
+def test_review_reseeds_on_success(tmp_path, monkeypatch):
+    book = tmp_path / "k.txt"; book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    import src.review_ui.server as SRV
+    from src import guide as G, glossary
+    def fake_ok(*a, **k):
+        G.save_guide("data/guide.json", {"characters": [{"name_en": "Harry",
+            "render": "keep"}], "places": [], "terms": [], "relationships": [],
+            "style": "", "rules": []})
+        return 0
+    monkeypatch.setattr(SRV, "run_review_server", fake_ok)
+    assert _run(["review"], tmp_path, monkeypatch) == 0
+    assert any(t["canonical_en"] == "Harry" and t["status"] == "seeded"
+               for t in glossary.all_terms("data/state.sqlite3"))
+
+
+def test_review_does_not_reseed_on_failure(tmp_path, monkeypatch):
+    book = tmp_path / "k.txt"; book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    import src.review_ui.server as SRV
+    from src import guide as G, glossary
+    def fake_fail(*a, **k):
+        # UI "uložilo" guide, ale server skončil chybou (rc=1)
+        G.save_guide("data/guide.json", {"characters": [{"name_en": "Zed",
+            "render": "keep"}], "places": [], "terms": [], "relationships": [],
+            "style": "", "rules": []})
+        return 1
+    monkeypatch.setattr(SRV, "run_review_server", fake_fail)
+    rc = _run(["review"], tmp_path, monkeypatch)
+    assert rc == 1
+    assert glossary.all_terms("data/state.sqlite3") == []   # ŽÁDNÝ reseed

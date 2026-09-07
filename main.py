@@ -110,6 +110,19 @@ def _cmd_scan(args) -> int:
         state.finish_run(db, rid, status)
 
 
+def _cmd_review(args) -> int:
+    from src import glossary
+    from src.review_ui import server
+    rc = server.run_review_server(config.GUIDE_DRAFT_PATH, config.GUIDE_PATH)
+    if rc != 0:
+        print("Návod nebyl uložen - glosář zůstává beze změny.")
+        return rc
+    # Reseed dělá CLI, ne UI - UI o DB nic neví (izolace modulů).
+    glossary.seed_from_guide(config.DB_PATH, guide_mod.load_guide(config.GUIDE_PATH))
+    print("Návod uložen, glosář naseedován. Dál: `python main.py run`")
+    return 0
+
+
 def _cmd_run(args) -> int:
     db = config.DB_PATH
     state.recover_processing(db)
@@ -265,6 +278,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("--chunked", action="store_true",
                         help="po částech, když se kniha nevejde do kontextu")
     p_scan.set_defaults(func=_cmd_scan)
+
+    sub.add_parser("review", help="web UI: potvrď návod → guide.json"
+                   ).set_defaults(func=_cmd_review)
 
     p_run = sub.add_parser("run", help="překladová smyčka")
     p_run.add_argument("--retry-flagged", nargs="*", type=int, default=None,

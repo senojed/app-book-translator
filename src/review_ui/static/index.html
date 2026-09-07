@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<title>Review překladatelského návodu</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 60rem; margin: 2rem auto;
+         padding: 0 1rem; line-height: 1.5; }
+  h2 { border-bottom: 1px solid #ccc; padding-bottom: .2rem; margin-top: 2rem; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { border: 1px solid #ddd; padding: .3rem .5rem; text-align: left;
+           vertical-align: top; }
+  input[type=text], textarea, select { width: 100%; box-sizing: border-box; }
+  textarea { min-height: 8rem; }
+  .must { background: #fff6d5; border: 2px solid #e6b800; padding: 1rem;
+          border-radius: .4rem; }
+  .note { color: #666; font-size: .85rem; }
+  .err { color: #b00; white-space: pre-wrap; }
+  button { padding: .6rem 1.2rem; font-size: 1rem; margin-top: 1.5rem; }
+</style>
+</head>
+<body>
+<h1>Překladatelský návod</h1>
+<p class="note">Návrhy vyplnil scout. Uprav, co nesedí, a ulož. Uložením se
+okno může zavřít - server skončí sám.</p>
+
+<div id="app">Načítám…</div>
+<p class="err" id="errors"></p>
+<button id="save">Ulož a zavři</button>
+
+<script>
+let data = null;
+
+function el(tag, attrs, children) {
+  const e = document.createElement(tag);
+  for (const k in (attrs || {})) {
+    if (k === "value") e.value = attrs[k]; else e.setAttribute(k, attrs[k]);
+  }
+  (children || []).forEach(c => e.appendChild(typeof c === "string"
+    ? document.createTextNode(c) : c));
+  return e;
+}
+
+function select(options, value) {
+  const s = el("select");
+  options.forEach(([v, label]) => {
+    const o = el("option", { value: v }, [label]);
+    if (v === value) o.selected = true;
+    s.appendChild(o);
+  });
+  return s;
+}
+
+function section(title, node) {
+  const wrap = el("div");
+  wrap.appendChild(el("h2", {}, [title]));
+  wrap.appendChild(node);
+  return wrap;
+}
+
+function render() {
+  const app = document.getElementById("app");
+  app.innerHTML = "";
+
+  if ((data.must_decide || []).length) {
+    const box = el("div", { class: "must" });
+    box.appendChild(el("h2", {}, ["Musíš rozhodnout"]));
+    data.must_decide.forEach((md, i) => {
+      box.appendChild(el("p", {}, [`${md.kind}: ${md.question} (${md.scope_key || ""})`]));
+      const inp = el("input", { type: "text", value: md.answer || md.default || "" });
+      inp.oninput = e => data.must_decide[i].answer = e.target.value;
+      box.appendChild(inp);
+    });
+    app.appendChild(box);
+  }
+
+  const chars = el("table");
+  chars.appendChild(el("tr", {}, [el("th", {}, ["Jméno"]), el("th", {}, ["Aliasy"]),
+    el("th", {}, ["Co s ním"]), el("th", {}, ["Česky"]), el("th", {}, ["Poznámka"])]));
+  (data.characters || []).forEach((c, i) => {
+    const sel = select([["keep", "ponechat"], ["translate", "přeložit"]], c.render || "keep");
+    sel.onchange = e => data.characters[i].render = e.target.value;
+    const cz = el("input", { type: "text", value: c.cz || "" });
+    cz.oninput = e => data.characters[i].cz = e.target.value;
+    const al = el("input", { type: "text", value: (c.aliases || []).join(", ") });
+    al.oninput = e => data.characters[i].aliases =
+      e.target.value.split(",").map(s => s.trim()).filter(Boolean);
+    chars.appendChild(el("tr", {}, [el("td", {}, [c.name_en]), el("td", {}, [al]),
+      el("td", {}, [sel]), el("td", {}, [cz]),
+      el("td", { class: "note" }, [c.note || ""])]));
+  });
+  app.appendChild(section("Postavy", chars));
+
+  [["places", "name_en", "Místa"], ["terms", "term_en", "Termíny"]].forEach(
+    ([key, nameKey, title]) => {
+      const t = el("table");
+      t.appendChild(el("tr", {}, [el("th", {}, ["Originál"]), el("th", {}, ["Česky"]),
+        el("th", {}, ["Poznámka"])]));
+      (data[key] || []).forEach((item, i) => {
+        const cz = el("input", { type: "text", value: item.cz || "" });
+        cz.oninput = e => data[key][i].cz = e.target.value;
+        t.appendChild(el("tr", {}, [el("td", {}, [item[nameKey]]), el("td", {}, [cz]),
+          el("td", { class: "note" }, [item.note || ""])]));
+      });
+      app.appendChild(section(title, t));
+    });
+
+  const rels = el("table");
+  rels.appendChild(el("tr", {}, [el("th", {}, ["A"]), el("th", {}, ["B"]),
+    el("th", {}, ["Oslovení"])]));
+  (data.relationships || []).forEach((r, i) => {
+    const sel = select([["", "-"], ["tyka", "tykají si"], ["vyka", "vykají si"]],
+      r.address || "");
+    sel.onchange = e => data.relationships[i].address = e.target.value;
+    rels.appendChild(el("tr", {}, [el("td", {}, [r.a]), el("td", {}, [r.b]),
+      el("td", {}, [sel])]));
+  });
+  const add = el("button", {}, ["Přidej dvojici"]);
+  add.onclick = () => {
+    const a = prompt("Jméno A"); const b = prompt("Jméno B");
+    if (a && b) { data.relationships.push({ a, b, address: "vyka" }); render(); }
+  };
+  const relWrap = el("div"); relWrap.appendChild(rels); relWrap.appendChild(add);
+  app.appendChild(section("Vztahy (tykání/vykání)", relWrap));
+
+  const style = el("textarea", {}, [data.style || ""]);
+  style.value = data.style || "";
+  style.oninput = e => data.style = e.target.value;
+  app.appendChild(section("Styl", style));
+}
+
+fetch("/api/guide").then(r => r.json()).then(d => { data = d; render(); });
+
+document.getElementById("save").onclick = () => {
+  document.getElementById("errors").textContent = "";
+  fetch("/api/guide", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data)
+  }).then(async r => {
+    const body = await r.json();
+    if (r.ok && body.ok) {
+      document.body.innerHTML = "<h1>Hotovo</h1><p>Návod uložen, server skončil. " +
+        "Okno můžeš zavřít.</p>";
+    } else {
+      document.getElementById("errors").textContent =
+        (body.errors || ["Neznámá chyba"]).join("\n");
+    }
+  });
+};
+</script>
+</body>
+</html>
