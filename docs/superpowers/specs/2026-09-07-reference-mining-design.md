@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 11 oponentury (fresh-eyes review + zjednodušení)
+Stav: po kole 12 oponentury (zkouška proveditelnosti)
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -15,9 +15,21 @@ nástroj vzniká.**
 **Cíl:** před fází `review` předvyplnit návod tím, co je **doložitelné**
 z profesionálních překladů, a u každé položky ukázat důkaz.
 
-**Invariant:** žádná hodnota, kterou navrhl model a korpus ji nedoložil, se
-**nepředvyplní automaticky**. Člověk může ručně napsat cokoli - to je jeho
-právo a nástroj mu v tom nebrání; jen mu nic nepodstrčí.
+**Invariant:** **odhad se nikdy nesmí tvářit jako důkaz.** Každá předvyplněná
+hodnota nese viditelnou provenienci a hodnota bez doložení se nesmí ocitnout
+v poli, které vypadá jako doložené. Člověk může ručně napsat cokoli - to je
+jeho právo.
+
+Dřívější znění („nedoložená hodnota se nikdy nepředvyplní") bylo **v rozporu
+s tím, co nástroj už dnes dělá**: `guide.py:92` a `:111` předvyplňují `render`
+ze scoutova `suggested` a `cz` ze `suggested_cz`, tedy modelové odhady bez
+jakéhokoli doložení. Invariant psaný jen pro těžbu ten rozpor zakrýval.
+Rozdíl mezi scoutovým návrhem a návrhem lexikografa je jen v tom, že druhý se
+tváří jako podložený referencemi - proto se **nepředvyplňuje**, zatímco
+scoutův návrh předvyplněný zůstává, ale je označený jako odhad.
+
+**Otevřená otázka pro člověka (nerozhoduje spec):** má se zrušit i předvyplňování
+scoutových návrhů? Bezpečnější, ale znamená vypsat ~59 termínů ručně.
 
 ## Zdrojová data
 
@@ -45,10 +57,14 @@ draft má 15 kolizí a UI nemá na kanonická jména editaci ani mazání.
 **Zvoleno:** samostatný jednorázový krok, výsledkem je opravený
 `guide.draft.json`. Není to součást těžby a nespouští se opakovaně.
 
-- pomocný skript vypíše kandidáty na sloučení (kanonické jméno jedné položky je
-  aliasem jiné) a výčty rozdělené podle `/` a `" or "` (normalizovaně,
-  bez ohledu na velikost písmen a mezery)
-- **rozhoduje člověk**, skript nic nemění sám
+- **skript je report-only.** Vypíše kandidáty na sloučení (kanonické jméno jedné
+  položky je aliasem jiné) a výčty rozdělené podle `/` a samostatného `" or "`
+  (case-insensitive, po zúžení bílých znaků). Nic nemění a nic se ho neptá -
+  interaktivní nástroj ani soubor s deklarativními rozhodnutími se nestaví,
+  je to jednorázová operace na 26 řádcích.
+- **rozhoduje člověk** a upraví `guide.draft.json` ručně (nebo s pomocí
+  asistenta); skript slouží jen jako seznam míst, kam se podívat
+- záloha původního draftu: `data/guide.draft.pre-reference.json`
 - sloučení: zůstane delší kanonický tvar, aliasy se sjednotí, poznámky spojí
 - výčet: rozdělí se na samostatné položky, `suggested_cz` se rozdělí týmž
   oddělovačem a spáruje pozičně, nesedí-li počty, zůstane prázdné
@@ -225,8 +241,9 @@ Výjimka: `FatalRunError` (auth, cost guard) ukončí příkaz stejně.
 kde stojí doslova (tokenizace `\w+` ho rozseká na pomlčce). Pro drift v jedné
 kapitole to stačí, pro doložení v milionovém korpusu ne.
 
-`textnorm.normalize_key()` (NFC, `casefold`, zúžení bílých znaků) slouží
-**jen k identitě položek, nikdy k hledání** - casefold by velikost písmen
+`textnorm.normalize_key()` slouží **jen k identitě položek, nikdy k hledání**.
+Přesně: NFC → `casefold()` → každá sekvence bílých znaků na jednu ASCII mezeru
+→ `strip()` - casefold by velikost písmen
 zahodil. Hledá se v surovém textu po NFC. `guide.normalize()`
 (`strip().lower()`) zůstává beze změny kvůli `relationship_key`.
 
@@ -250,14 +267,22 @@ class Corpus:
 ```
 
 - `load_corpus(root) -> Corpus` - páruje podle čísla (`^(\d+)` u CZ, `#(\d+)`
-  nebo `Book (\d+)` u EN). Duplicitní číslo dílu na téže straně → `ValueError`.
+  nebo `Book (\d+)` u EN). Text dílu vznikne spojením **jen `Chapter.raw_text`**
+  (bez `Chapter.title`, ty bývají jen „Chapter 1" a zkreslily by počty)
+  oddělovačem `"
+ 
+"`. Soubor bez rozpoznatelného čísla se přeskočí
+  s varováním; chybou je jen **duplicitní** rozpoznané číslo na téže straně →
+  `ValueError`.
   **Selže-li jedna strana dvojice, vypadne celý díl** (obě strany), a teprve
   potom se kontroluje minimum `REFERENCE_MIN_CORPUS_BOOKS` (3); pod ním
   `ValueError`.
 - `count_en_surface(corpus, surface, side="cz") -> Evidence`
 - `count_cz_form(corpus, form) -> Evidence` - přesná shoda celého slova
 - `books_with_en(corpus, surfaces) -> set[int]` - viz rozhodnutí 4
-- `build_manifest(root) -> dict` - jen `os.stat`, EPUBy se neparsují
+- `build_manifest(root) -> dict` - `{relativní cesta: [velikost, st_mtime_ns]}`,
+  jen `os.stat`, EPUBy se neparsují. `st_mtime_ns` (ne desetinné `st_mtime`)
+  kvůli stabilitě porovnání napříč souborovými systémy.
 - `save_cache` / `load_cache(path, root)` - nese `schema_version`,
   `source_root` a manifest; neshoda → staví se znovu
 
@@ -269,8 +294,11 @@ class Corpus:
   vstup `[{id, term_en, kind, note}]`, výstup mapa `id -> cz | None`.
 - **Identita je `id = "{section}/{normalize_key(klíč)}"`**; stejné jméno může
   být v `places` i `terms`.
-- **Obálka odpovědi je objekt:** `{"proposals": [{"id": ..., "cz": ...}]}`;
-  `parsing.extract_json` umí vytáhnout jen objekt, ne seznam.
+- **Obálka odpovědi je objekt:** `{"proposals": [{"id": ..., "cz": ...}]}`.
+  (Ne proto, že by `extract_json` seznam neuměl - ověřeno, `json.loads` vrátí
+  i top-level seznam. Objekt je zvolený proto, že regexový fallback při
+  ukecaném modelu hledá `\{.*\}`, takže seznam by se z textu s okolním
+  povídáním nevytáhl.)
 - **Validace:** duplicitní `id` → `ValueError`; cizí `id` se ignoruje a nahlásí;
   `cz` musí být `str` nebo `null`; **chybějící `id` v jinak platné odpovědi →
   `ValueError`** (model položku vynechal, výsledek je neúplný a běh selže
@@ -303,7 +331,22 @@ Finding = TypedDict("Finding", {
 })
 ```
 
-- `resolve(corpus, surfaces, client_factory, cfg) -> list[Finding]`
+- `resolve(corpus, items, client_factory, cfg) -> list[Finding]`, kde
+  `items: list[SurfaceItem]` a
+
+  ```python
+  SurfaceItem = TypedDict("SurfaceItem", {
+      "id": str,          # "{section}/{normalize_key(klíč)}"
+      "section": str,     # characters | places | terms
+      "surface": str,     # primární povrch
+      "aliases": list[str],
+      "note": str,        # posílá se lexikografovi, ovlivňuje návrh
+  })
+  ```
+
+  Pouhý „seznam povrchů" nestačí: nález i lexikograf potřebují `id`, sekci,
+  aliasy i poznámku. Sestavení `items` z draftu je věc volajícího
+  (`_cmd_reference`), ne `resolve`.
 - `write_reference(findings, path, run_id, fingerprint, source_root)` - atomicky
   (temp + `os.replace`), **nahrazuje soubor celý**. Žádné slévání s předchozím -
   selhání je atomické, takže se sem dostane jen kompletní výsledek.

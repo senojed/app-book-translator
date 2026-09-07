@@ -296,3 +296,31 @@ shoda mohla dát confirmed na nesouvisejícím českém slově.
 
 Spec: 619 → 484 řádků.
 
+## Kolo 12 — 2026-09-07 (zkouška proveditelnosti)
+
+- Codex: `round-12-codex.md` — VERDICT: CHANGES_NEEDED (10 dohadů, 2 zásadní;
+  2 rozpory se stávajícím kódem)
+- Claude: `round-12-claude.md` — VERDICT: CHANGES_NEEDED
+
+FORMÁT: Codex měl ze specu napsat první tři úkoly implementačního plánu a vést
+seznam všeho, co musel dohadovat. Jiný druh kontroly než kritika.
+
+NEJZÁVAŽNĚJŠÍ NÁLEZ CELÉ OPONENTURY: invariant specu byl jedenáct kol v rozporu
+s chováním, které nástroj má už dnes. Ověřeno — guide.py:92 předvyplňuje
+`render` ze scoutova `suggested` a :111 `cz` ze `suggested_cz`, tedy modelové
+odhady bez jakéhokoli doložení, které uložením jdou do glosáře jako závazné.
+Invariant byl psaný jen pro těžbu, takže rozpor zůstal skrytý; deset kol
+oponentury ho nenašlo, protože všichni posuzovali těžbu izolovaně.
+
+Invariant přeformulován: "odhad se nikdy nesmí tvářit jako důkaz" — každá
+předvyplněná hodnota nese viditelnou provenienci. Návrh lexikografa se
+nepředvyplňuje proto, že by byl nerozeznatelný od hodnoty podložené
+referencemi; scoutův návrh zůstává, ale označený.
+OTEVŘENÁ OTÁZKA PRO ČLOVĚKA: zrušit i předvyplňování scoutových návrhů?
+Bezpečnější, ale znamená vypsat ~59 termínů ručně. Spec to nerozhoduje.
+
+Dále: doplněn typ SurfaceItem jako vstup resolve() (zásadní, veřejná hranice
+orchestru), určeno rozhraní normalizačního kroku (report-only, ne interaktivní),
+kontrakt spojování dokumentů (raw_text bez title), st_mtime_ns, zúžení bílých
+znaků. Opraveno nepravdivé tvrzení, že extract_json neumí top-level seznam.
+
