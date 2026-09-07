@@ -67,3 +67,26 @@ def test_replace_term_mentions_and_lookup(tmp_path):
     assert state.chapters_mentioning_term(db, "t1") == [1]
     state.replace_term_mentions(db, 1, [])  # smaže
     assert state.chapters_mentioning_term(db, "t1") == []
+
+
+def test_commit_chapter_result_is_atomic(tmp_path):
+    db = _db(tmp_path)  # má chapter 1 (status processing), glossary t1
+    good_cand = {"term_id": "cand_new", "canonical_en": "New", "aliases": [],
+                 "cz": "Nový", "accepted_alt": [], "note": "", "type": "term",
+                 "status": "candidate"}
+    bad_mention = {"term_id": "NEEXISTUJE", "cz_form": "x", "scene_idx": None,
+                   "source": "detected"}  # poruší FK → výjimka uprostřed transakce B
+    import pytest
+    with pytest.raises(Exception):
+        state.commit_chapter_result(db, 1, translated_text="CZ", revision_rounds=1,
+            notes_json="[]", status="done", new_candidates=[good_cand],
+            mentions=[bad_mention],
+            questions=[{"chapter_idx": 1, "kind": "term", "text": "q", "scope_key": "t1",
+                        "guess_answer": None, "severity": "guess"}])
+    # VŠECHNO se rollbacklo - kandidát, otázka, stav kapitoly
+    assert state.get_chapter(db, 1)["status"] == "processing"
+    assert state.get_chapter(db, 1)["translated_text"] is None
+    assert state.unanswered_questions(db) == []
+    with state.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) c FROM glossary WHERE term_id='cand_new'"
+                            ).fetchone()["c"] == 0

@@ -345,20 +345,25 @@ def _open_question_row(conn, q: dict):
         (q["chapter_idx"], q["kind"], q["scope_key"], q["severity"])).fetchone()
 
 
+def _upsert_question_conn(conn, q: dict) -> int:
+    """Upsert nad otevřeným spojením - používá i transakce B (commit_chapter_result)."""
+    existing = _open_question_row(conn, q)
+    if existing:
+        conn.execute("UPDATE questions SET text=?, guess_answer=? WHERE id=?",
+                     (q.get("text", ""), q.get("guess_answer"), existing["id"]))
+        return existing["id"]
+    cur = conn.execute(
+        "INSERT INTO questions (chapter_idx,kind,text,scope_key,guess_answer,"
+        "severity) VALUES (?,?,?,?,?,?)",
+        (q.get("chapter_idx"), q["kind"], q.get("text", ""), q["scope_key"],
+         q.get("guess_answer"), q["severity"]))
+    return cur.lastrowid
+
+
 def upsert_open_question(db_path: str, q: dict) -> int:
     """Zapíše otázku. Zodpovězená otázka stejného klíče novou NEblokuje."""
     with connect(db_path) as conn:
-        existing = _open_question_row(conn, q)
-        if existing:
-            conn.execute("UPDATE questions SET text=?, guess_answer=? WHERE id=?",
-                         (q.get("text", ""), q.get("guess_answer"), existing["id"]))
-            return existing["id"]
-        cur = conn.execute(
-            "INSERT INTO questions (chapter_idx,kind,text,scope_key,guess_answer,"
-            "severity) VALUES (?,?,?,?,?,?)",
-            (q.get("chapter_idx"), q["kind"], q.get("text", ""), q["scope_key"],
-             q.get("guess_answer"), q["severity"]))
-        return cur.lastrowid
+        return _upsert_question_conn(conn, q)
 
 
 def delete_open_questions_for_chapter(db_path: str, chapter_idx: int) -> None:
@@ -442,3 +447,93 @@ def save_drift_report(db_path: str, up_to_chapter: int, report) -> None:
     with connect(db_path) as conn:
         conn.execute("INSERT INTO drift_reports (up_to_chapter, report) VALUES (?,?)",
                      (up_to_chapter, _json.dumps(report, ensure_ascii=False)))
+
+
+# --- transakce kolem zpracování kapitoly ------------------------------------
+
+def begin_chapter(db_path: str, idx: int) -> None:
+    """Transakce A: kapitola jde do `processing` a její staré nezodpovězené
+    otázky zmizí (rerun je založí znovu podle aktuálního překladu)."""
+    with connect(db_path) as conn:
+        conn.execute("UPDATE chapters SET status='processing', "
+                     "updated_at=CURRENT_TIMESTAMP WHERE idx=?", (idx,))
+        conn.execute("DELETE FROM questions WHERE chapter_idx=? AND answer IS NULL",
+                     (idx,))
+
+
+def _insert_candidate(conn, cand: dict) -> str:
+    """Vloží kandidáta a vrátí term_id, pod kterým skutečně žije.
+
+    Kolize term_id má dvě příčiny: (a) tentýž povrch už v glosáři je - pak jen
+    vrátíme existující id; (b) dva RŮZNÉ povrchy se slugifikovaly stejně - pak
+    hledáme volné id se suffixem. Nikdy nesmí vzniknout mention na cizí entitě.
+    """
+    import json as _json
+    base = cand["term_id"]
+    tid = base
+    n = 2
+    while True:
+        try:
+            conn.execute(
+                "INSERT INTO glossary (term_id,canonical_en,aliases,cz,accepted_alt,"
+                "note,type,status) VALUES (?,?,?,?,?,?,?,?)",
+                (tid, cand.get("canonical_en", ""),
+                 _json.dumps(cand.get("aliases") or [], ensure_ascii=False),
+                 cand.get("cz", ""),
+                 _json.dumps(cand.get("accepted_alt") or [], ensure_ascii=False),
+                 cand.get("note", ""), cand.get("type", "term"),
+                 cand.get("status", "candidate")))
+            return tid
+        except sqlite3.IntegrityError:
+            row = conn.execute("SELECT canonical_en, aliases FROM glossary "
+                               "WHERE term_id=?", (tid,)).fetchone()
+            if row is not None:
+                surfaces = [(row["canonical_en"] or "").strip().lower()]
+                surfaces += [(a or "").strip().lower()
+                             for a in _json.loads(row["aliases"] or "[]")]
+                if (cand.get("canonical_en", "") or "").strip().lower() in surfaces:
+                    return tid          # táž entita, jen už tam je
+            tid = f"{base}_{n}"
+            n += 1
+
+
+def commit_chapter_result(db_path: str, idx: int, *, translated_text: str,
+                          revision_rounds: int, notes_json: str, status: str,
+                          new_candidates: list, mentions: list,
+                          questions: list) -> dict:
+    """Transakce B: glosář + term_mentions + otázky + kapitola najednou.
+    Výjimka kdekoli uvnitř = nic se necommitne (connect commituje jen na
+    čistý průchod), stav zůstane `processing` a další `run` kapitolu zopakuje."""
+    with connect(db_path) as conn:
+        remap: dict = {}
+        for cand in new_candidates or []:
+            final = _insert_candidate(conn, cand)
+            if final != cand["term_id"]:
+                remap[cand["term_id"]] = final
+
+        conn.execute("DELETE FROM term_mentions WHERE chapter_idx=?", (idx,))
+        for m in mentions or []:
+            d = m if isinstance(m, dict) else {
+                "term_id": m.term_id, "cz_form": m.cz_form,
+                "scene_idx": m.scene_idx, "source": m.source}
+            tid = remap.get(d["term_id"], d["term_id"])
+            conn.execute(
+                "INSERT INTO term_mentions (term_id,cz_form,chapter_idx,scene_idx,"
+                "source) VALUES (?,?,?,?,?)",
+                (tid, d.get("cz_form"), idx, d.get("scene_idx"),
+                 d.get("source", "detected")))
+
+        created = 0
+        for q in questions or []:
+            q = dict(q)
+            q["scope_key"] = remap.get(q.get("scope_key"), q.get("scope_key"))
+            _upsert_question_conn(conn, q)
+            created += 1
+
+        conn.execute(
+            "UPDATE chapters SET translated_text=?, revision_rounds=?, notes=?, "
+            "status=?, updated_at=CURRENT_TIMESTAMP WHERE idx=?",
+            (translated_text, revision_rounds, notes_json, status, idx))
+
+    return {"questions_created": created,
+            "candidates_created": len(new_candidates or [])}
