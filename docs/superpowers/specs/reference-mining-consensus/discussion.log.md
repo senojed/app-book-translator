@@ -464,3 +464,24 @@ změněné na jednom místě, staré znění přežívající jinde. Našlo pět
 5. End-to-end test žádal, aby se hodnota nedostala do glosáře "bez ručního
    vypsání", ale tlačítko "použít návrh" ji tam dostane bez psaní.
 
+## Kolo 19 — 2026-09-07
+
+- Codex: `round-19-codex.md` — VERDICT: CHANGES_NEEDED (1 BLOCKING, 3 IMPORTANT, 2 NITS)
+- Claude: `round-19-claude.md` — VERDICT: CONSENSUS
+
+Kolo mělo ověřit, jestli opravy z kola 18 nezavedly nové rozpory. ZAVEDLY,
+a jeden blokující: precedence klasifikace přidaná v kole 18 měla krok 2 jako
+"primární povrch doložen → weak" BEZ podmínek způsobilosti. weak předvyplňuje,
+takže "stole" (79 výskytů, malé písmeno) by se předvyplnilo — přesně ta chyba,
+kvůli které celý aparát vznikl, znovu zavedená opravou, která měla dokument
+sjednotit.
+
+Opraveno zavedením explicitní definice způsobilosti (velké počáteční písmeno,
+>=3 znaky, výskyt shodný i ve velikosti písmen, u krátkých povrchů mimo začátek
+věty); kroky 1 a 2 se týkají jen způsobilých povrchů.
+
+Dále: test agenta si protiřečil s novou precedencí u explicitního null; pravidlo
+o zobrazení důkazu zabíjelo evidence_only (třídu, jejímž jediným obsahem je
+důkaz); postpodmínka 6 nešla mechanicky ověřit — doplněn konkrétní predikát pro
+označení podezřelých aliasů.
+

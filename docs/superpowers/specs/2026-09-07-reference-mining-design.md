@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 18 oponentury
+Stav: po kole 19 oponentury
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -123,8 +123,12 @@ Prompt scouta se zároveň opravuje (jedna položka = jeden povrch, synonyma do
    tabulku), takže sekčně oddělené `id` před kolizí nechrání a druhý seed by
    první tiše přepsal. Buď je to jedna entita (nechat v jedné sekci), nebo dvě
    různé a musí se přejmenovat.
-6. aliasy jsou **identifikující**. `sir`, `kid`, `apprentice`, `Captain`, `Bob`
-   a spol. se odeberou - jako dotaz do korpusu nic neurčují a jen zašumí důkaz.
+6. aliasy jsou **identifikující**. Skript označí za podezřelý každý alias,
+   který splňuje aspoň jedno: začíná malým písmenem; má ≤ 3 znaky; je v krátkém
+   seznamu oslovení a rolí (`sir`, `captain`, `kid`, `apprentice`, `boss`,
+   `boy`, `girl`, `master`, `mister`, `miss`). Rozhoduje člověk - skript jen
+   vypíše seznam. Test vynucuje, že v normalizovaném draftu **žádný označený
+   alias nezůstal**. Bez mechanického predikátu by postpodmínka nešla ověřit.
 
 ## Stupně řešení
 
@@ -267,13 +271,24 @@ stupňů. Bez explicitního pořadí by `evidence_only` nikdy nepřežilo úpln�
 protože stupeň 1 klasifikaci přepíše - a přitom ji formulář i testy berou jako
 konečnou. Pořadí:
 
-1. primární povrch doložen včetně shody velikosti písmen a nad prahy → `confirmed`
-2. primární povrch doložen → `weak`
+Nejdřív definice: povrch je **způsobilý** (`confirm_eligible`), splňuje-li
+současně: velké počáteční písmeno, délka ≥ 3 znaky, alespoň jeden výskyt
+**shodný i ve velikosti písmen**, a u povrchů kratších než 5 znaků výskyt mimo
+začátek věty. Obecné slovo s malým písmenem způsobilé není nikdy.
+
+1. **způsobilý** primární povrch doložen a nad prahy → `confirmed`
+2. **způsobilý** primární povrch doložen, ale pod prahy → `weak`
 3. model vrátil návrh → `proposed` / `not_attested` podle souvýskytu
-4. existuje důkaz ze stupně 0 (jen alias, nebo obecné slovo) → `evidence_only`
+4. existuje jakýkoli důkaz ze stupně 0 (nezpůsobilý povrch, jen alias, nebo
+   obecné slovo) → `evidence_only`
 5. jinak → `unresolved`
 
-Důkazy ze stupně 0 (`hits`, `books`, `per_form`, `matched_en`) se **drží vždy**,
+**Kroky 1 a 2 se týkají jen způsobilých povrchů.** Bez toho by `stole`
+(79 výskytů, malé písmeno) spadlo do `weak`, `weak` předvyplňuje - a byla by zpět
+přesně ta chyba, kvůli které tenhle aparát existuje. Nezpůsobilý povrch jde vždy
+do stupně 1 a končí nejvýš `evidence_only`.
+
+Důkazy ze stupně 0 (`hits`, `books`, `per_form`, `matched_forms`) se **drží vždy**,
 bez ohledu na výslednou třídu; stupeň 1 je nepřepisuje, jen přidává vlastní.
 `evidence_only` je tedy konečná třída pro položku, kde stupeň 0 něco našel
 a model vrátil `null`.
@@ -398,7 +413,9 @@ Finding = TypedDict("Finding", {
     "cooccurrence": list[int],
     "matched_forms": list[str],
     "matched_cz": str | None,
-    "source": str,             # kept | proposed | none (u unresolved)
+    "source": str,             # kept (confirmed/weak/evidence_only)
+                               #   | proposed (proposed/not_attested)
+                               #   | none (unresolved)
 })
 ```
 
@@ -481,10 +498,12 @@ formulář nabídne oba, každý s vlastním tlačítkem.
   nález z jiného běhu.
 - **Čerstvost omezuje výhradně hodnoty z `reference`.** Lidská rozhodnutí
   z `guide.json` platí vždy; priorita `guide > reference > draft` zůstává.
-- **Vazba důkazu na hodnotu:** liší-li se zobrazované `cz` od `matched_cz`,
-  číselný důkaz se vynechá. Klasifikace a návrh se zobrazují vždy - **s výjimkou
-  nečerstvé reference**, kde se nezobrazuje nic než poznámka (viz výš).
-  Dřívější znění si v tomhle protiřečilo.
+- **Vazba důkazu na hodnotu** platí **jen pro třídy s předvyplněnou hodnotou**
+  (`confirmed`, `weak`): liší-li se zobrazované `cz` od `matched_cz`, číselný
+  důkaz se vynechá. U `evidence_only` je `cz` prázdné **záměrně** a jeho důkaz
+  se zobrazuje vždy - jinak by třída, jejímž jediným obsahem je důkaz, neměla
+  co ukázat. Klasifikace a návrh se zobrazují vždy, **s výjimkou nečerstvé
+  reference**, kde se nezobrazuje nic než poznámka.
 - Korpusový otisk se počítá `reference.build_manifest(source_root)`, kde
   `source_root` pochází **ze souboru `reference.json`**. Porovnávat otisk proti
   manifestu v cache nestačí - to jsou dva historické údaje.
@@ -647,7 +666,7 @@ skončí `FatalRunError`.
    round-trip a invalidace při změně velikosti/mtime/kořene.
 6. **Agent:** dávkování, obálka `{"proposals":[...]}`, párování přes `id`,
    duplicitní `id` → `ValueError`, cizí `id` se ignoruje, **chybějící `id` →
-   `ValueError`**, explicitní `null` → `unresolved`.
+   `ValueError`**, explicitní `null` → `unresolved` **jen když není důkaz ze stupně 0**, jinak zůstává `evidence_only`.
 7. **Atomické selhání:** selhaná dávka → předchozí `reference.json`
    **nedotčený**, exit ≠ 0, souhrn vypíše co selhalo.
 8. **Normalizace draftu (krok 0):** test vynucuje **všech šest postpodmínek**
