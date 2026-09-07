@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 13 oponentury
+Stav: po kole 14 oponentury
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -49,6 +49,11 @@ Draft od scouta má vadná data, která se ukázala až při návrhu těžby:
 |---|---|---|
 | výčty místo jednoho povrchu | 11 | `White Court / Red Court / Vampire Courts` |
 | duplicitní entity | 15 | `Morgan` i `Donald Morgan`, `Thomas` i `Thomas Raith` |
+| `must_decide` klíč neodkazuje na žádnou položku ve své sekci | 9 | `Warden`, `the Nevernever`, `Mouse (pes)`, `grasshopper_nickname` |
+| vztah s lomítkem ve jméně | 4 | `Harry` + `Will/Georgia` (dva různí lidé) |
+
+Celkem ~39 řádků. Pořád jednorázová práce, ale spec o ní musí mluvit přesně -
+dřívější znění počítalo jen s prvními dvěma řádky tabulky.
 
 Dřívější verze specu kolem těchto vad stavěla tři podsystémy: editor složených
 položek ve formuláři, přemapování `must_decide` a validaci kolizí při ukládání.
@@ -70,9 +75,25 @@ draft má 15 kolizí a UI nemá na kanonická jména editaci ani mazání.
 - sloučení: zůstane delší kanonický tvar, aliasy se sjednotí, poznámky spojí
 - výčet: rozdělí se na samostatné položky, `suggested_cz` se rozdělí týmž
   oddělovačem a spáruje pozičně, nesedí-li počty, zůstane prázdné
-- `must_decide` se složeným `scope_key` (v draftu dvě:
-  `naagloshii/skinwalker`, `Shagnasty/skinwalker`) se přepíše na zvolenou
-  variantu ručně
+- **každý `scope_key` u `must_decide` musí po normalizaci ukazovat právě na
+  jednu položku ve své sekci.** Devět jich dnes neukazuje nikam
+  (`Warden`, `the Nevernever`, `Za-Lord's Militia`, `grasshopper_nickname`,
+  `Mouse (pes)`, `Shagnasty/skinwalker`, ...). `apply_must_decide` při
+  nenalezení klíče **založí nový řádek**, takže by z nich vznikly duplicitní
+  nebo špatně zařazené položky. Pro každý takový klíč se ručně zvolí jedno ze
+  tří: opravit klíč na existující položku, povýšit otázku na samostatnou
+  položku, nebo otázku smazat.
+- **vztahy musí mít v obou koncích jedno jméno.** Čtyři dnes nemají
+  (`Billy/Will`, `Gatekeeper/Rashid`, `Rashid/Gatekeeper`, `Will/Georgia`);
+  první tři jsou duplicitní zápisy téže dvojice, `Will/Georgia` jsou dva různí
+  lidé a patří rozdělit na dva vztahy. Bez toho je zaškrtnutí „vztahy
+  zkontrolovány" bezobsažné - a jména vztahů nejdou ve formuláři editovat.
+- **alias, který potřebuje vlastní překlad, není alias.** `Injun Joe` je dnes
+  alias `Listens-to-Wind` a zároveň má vlastní otázku na překlad. Glosářový
+  řádek má ale **jedno `cz` pro kanonický tvar i všechny aliasy**, takže
+  přezdívka s vlastním překladem se do něj nevejde. Takové položky se povýší na
+  samostatné (a jejich povrch se z aliasů odebere, aby nespustil guard proti
+  kolizi).
 - výsledek se uloží jako nový `guide.draft.json`, původní se zazálohuje
 
 Prompt scouta se zároveň opravuje (jedna položka = jeden povrch, synonyma do
@@ -329,7 +350,7 @@ Finding = TypedDict("Finding", {
     "cooccurrence": list[int],
     "matched_forms": list[str],
     "matched_cz": str | None,
-    "source": str,             # kept | proposed
+    "source": str,             # kept | proposed | none (u unresolved)
 })
 ```
 
@@ -413,7 +434,9 @@ formulář nabídne oba, každý s vlastním tlačítkem.
 - **Čerstvost omezuje výhradně hodnoty z `reference`.** Lidská rozhodnutí
   z `guide.json` platí vždy; priorita `guide > reference > draft` zůstává.
 - **Vazba důkazu na hodnotu:** liší-li se zobrazované `cz` od `matched_cz`,
-  číselný důkaz se vynechá. Klasifikace a návrh se zobrazují vždy.
+  číselný důkaz se vynechá. Klasifikace a návrh se zobrazují vždy - **s výjimkou
+  nečerstvé reference**, kde se nezobrazuje nic než poznámka (viz výš).
+  Dřívější znění si v tomhle protiřečilo.
 - Korpusový otisk se počítá `reference.build_manifest(source_root)`, kde
   `source_root` pochází **ze souboru `reference.json`**. Porovnávat otisk proti
   manifestu v cache nestačí - to jsou dva historické údaje.
@@ -453,8 +476,16 @@ a `llm_calls` (přes `PipelineLLMClient`). Tabulek `chapters`, `glossary`,
   První krok nesmí zmizet ani se posunout: `apply_must_decide` (`server.py:43`)
   prázdné odpovědi **přeskočí** a na konci seznam vymaže, takže by je pozdější
   `validate` neviděla. Dnešní kód to má správně (`:122` před `:125`).
-- bloky `reference` se před uložením odstraní; `guide.json` zůstává čistě
-  lidský model (dnes `server.py:129` ukládá celý payload)
+- **před uložením se odstraní všechna průběžná metadata, ne jen bloky
+  `reference`:** `provenance`, `scout_suggestion`, `lexicographer_suggestion`
+  a příznak `relationships_reviewed`. Ukládá se **allowlist**: u postav
+  `name_en`, `aliases`, `render`, `cz`; u míst a termínů `name_en`/`term_en`,
+  `cz`; u vztahů `a`, `b`, `address`; plus `style` a `rules`. Cokoli jiného se
+  zahodí. Dnes `server.py:129` ukládá celý payload, takže by v `guide.json`
+  zůstala i pomocná pole formuláře.
+- **zaškrtnutí „vztahy zkontrolovány"** jede v payloadu jako
+  `relationships_reviewed: bool`; validace odmítne uložení, je-li `false`
+  nebo chybí a sekce vztahů není prázdná; do `guide.json` se nezapisuje.
 
 ### Chování polí podle původu hodnoty
 
@@ -566,7 +597,11 @@ skončí `FatalRunError`.
    `ValueError`**, explicitní `null` → `unresolved`.
 7. **Atomické selhání:** selhaná dávka → předchozí `reference.json`
    **nedotčený**, exit ≠ 0, souhrn vypíše co selhalo.
-8. **Chování polí:** rozsah pravidla (vztahy a styl se předvyplňují, sekce
+8. **Normalizace draftu (krok 0):** po ní každý `must_decide.scope_key` ukazuje
+   právě na jednu položku ve své sekci; žádný vztah nemá lomítko ve jméně;
+   žádné kanonické jméno není aliasem jiné položky; žádná položka není výčet.
+   Test běží proti **skutečnému** normalizovanému draftu.
+9. **Chování polí:** rozsah pravidla (vztahy a styl se předvyplňují, sekce
    vztahů vyžaduje zaškrtnutí „zkontrolováno"; vztahové `must_decide` mají
    prázdnou volbu); `provenance` a oba návrhy odděleně v payloadu z `GET`;
    „přijmout všechny" nepřepíše ručně vyplněné ani doložené pole a „zpět" vrátí
@@ -575,13 +610,13 @@ skončí `FatalRunError`.
    nevyplní, „použít návrh" ano a „zpět" ho zase vyprázdní; „přijmout všechny"
    je vratné; **testuje se serializovaný payload**, ne vzhled - nepoužitý návrh
    se do payloadu nesmí dostat.
-9. **Slití:** přednost `guide` > `reference` > `draft`; číselný důkaz se vynechá
+10. **Slití:** přednost `guide` > `reference` > `draft`; číselný důkaz se vynechá
    při neshodě `cz`/`matched_cz`; `fresh == false` → nepředvyplní se nic
    **z reference**, ale lidská rozhodnutí zůstanou; nedostupný `source_root` →
    `fresh` nepravdivý; poškozený `reference.json` UI neshodí.
-10. **Glosář:** `seed_from_guide` vrací seznam konfliktů; řádek nalezený jen
+11. **Glosář:** `seed_from_guide` vrací seznam konfliktů; řádek nalezený jen
    přes alias se nepřepíše, liší-li se `canonical_en`.
-11. **End-to-end:** `reference.json` → `GET /api/guide` → POST → `guide.json` →
+12. **End-to-end:** `reference.json` → `GET /api/guide` → POST → `guide.json` →
     `glossary.seed_from_guide`. Musí prokázat, že metadata přežijí slití, že se
     `evidence_only`/`proposed`/`not_attested` **nemůže** dostat do glosáře bez
     ručního vypsání, že postava bez doložení neprojde bez aktivní volby

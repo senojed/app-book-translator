@@ -370,3 +370,25 @@ case-insensitive nad prahem → evidence_only).
 
 Potvrzeno, že po zjednodušení nezůstaly viset odkazy na zrušené podsystémy.
 
+## Kolo 14 — 2026-09-07
+
+- Codex: `round-14-codex.md` — VERDICT: CHANGES_NEEDED (3 BLOCKING, 4 IMPORTANT)
+- Claude: `round-14-claude.md` — VERDICT: CHANGES_NEEDED
+
+Všech sedm ověřeno MĚŘENÍM na skutečném draftu. Krok 0 byl specifikovaný proti
+neúplnému obrazu poškození dat:
+- 9 must_decide klíčů neukazuje na žádnou položku ve své sekci (Warden,
+  the Nevernever, Mouse (pes), grasshopper_nickname, ...). apply_must_decide
+  při nenalezení klíče ZALOŽÍ NOVÝ ŘÁDEK → duplicitní/špatně zařazené položky.
+- 4 vztahy mají lomítko ve jméně (Will/Georgia jsou dva různí lidé).
+- Alias s vlastním překladem se do glosářového řádku nevejde (jedno cz pro
+  kanonický tvar i aliasy) — Injun Joe je alias Listens-to-Wind a zároveň má
+  vlastní otázku na překlad. Nově se takové položky povyšují na samostatné.
+
+Celkem ~39 řádků k ruční opravě místo původně uváděných 26.
+
+Dále: POST musí čistit allowlistem (provenance, scout_suggestion,
+lexicographer_suggestion a relationships_reviewed by jinak zůstaly v guide.json);
+Finding.source doplněn o none pro unresolved; sjednoceno chování při nečerstvé
+referenci (jen poznámka, nic jiného); zaškrtnutí vztahů dostalo payload kontrakt.
+
