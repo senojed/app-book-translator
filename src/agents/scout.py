@@ -47,6 +47,10 @@ Pravidla:
 - "relationships": dvojice, které spolu mluví; "suggested" = jestli si mají v
   češtině tykat nebo vykat, podle tónu jejich řeči.
 - "must_decide": jen věci, kde bez rozhodnutí člověka hrozí nekonzistentní překlad.
+  "scope_key" u kind="relationship" piš VŽDY jako "JmenoA|JmenoB" se svislítkem,
+  nikdy s pomlčkou - jména sama pomlčky obsahují.
+  "default" ať je rovnou použitelná odpověď (u termínu český tvar, u vztahu
+  "tyka"/"vyka"), ne věta o tom, co by se dalo udělat.
 - Nic nevynechávej kvůli délce. Když je toho moc, zkracuj poznámky, ne seznamy."""
 
 
@@ -134,6 +138,42 @@ def _merge_entities(partials, section: str, name_key: str, kind: str,
     return [merged[k] for k in order]
 
 
+def normalize_must_decide(items: list, relationships: list) -> list:
+    """Srovná scope_key u vztahových otázek na tvar 'a|b' (relationship_key).
+
+    Model si pro vztahy vymýšlí vlastní klíč ('Harry-Ebenezar'), zbytek systému
+    používá 'ebenezar|harry'. Bez srovnání je jedna dvojice ve formuláři dvakrát
+    a zápis odpovědi rozdělí klíč na špatném místě - jména sama obsahují pomlčky
+    (Listens-to-Wind), takže dělit podle pomlčky nejde.
+
+    Dvojici proto dohledáváme podle známých vztahů. Co se dohledat nedá,
+    necháváme být - zkomolený klíč je horší než cizí.
+    """
+    known = {}
+    for r in relationships or []:
+        a, b = r.get("a", ""), r.get("b", "")
+        if not a or not b:
+            continue
+        key = relationship_key(a, b)
+        # obě pořadí povrchu, jak je model může napsat
+        known[f"{a}-{b}".casefold()] = key
+        known[f"{b}-{a}".casefold()] = key
+        known[key] = key
+
+    out, seen = [], set()
+    for md in items or []:
+        md = dict(md)
+        scope = (md.get("scope_key") or "").strip()
+        if md.get("kind") == "relationship" and "|" not in scope:
+            md["scope_key"] = known.get(scope.casefold(), scope)
+        dedup = (md.get("kind"), (md.get("scope_key") or "").casefold())
+        if dedup in seen:
+            continue
+        seen.add(dedup)
+        out.append(md)
+    return out
+
+
 def merge_scout_facts(partials: list) -> dict:
     """Slití dílčích výstupů z `--chunked` běhu. Bez dalšího LLM volání."""
     must_decide: list = []
@@ -182,6 +222,7 @@ def merge_scout_facts(partials: list) -> dict:
         seen_md.add(k)
         all_md.append(md)
 
+    rel_list = [rels[k] for k in rel_order]
     return {"characters": characters, "places": places, "terms": terms,
-            "relationships": [rels[k] for k in rel_order],
-            "style_notes": style_notes, "must_decide": all_md}
+            "relationships": rel_list, "style_notes": style_notes,
+            "must_decide": normalize_must_decide(all_md, rel_list)}

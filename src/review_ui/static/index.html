@@ -65,11 +65,41 @@ function render() {
   if ((data.must_decide || []).length) {
     const box = el("div", { class: "must" });
     box.appendChild(el("h2", {}, ["Musíš rozhodnout"]));
+    const HINT = {
+      term: "odpověď = český tvar termínu (nebo anglické slovo, chceš-li ponechat)",
+      place: "odpověď = český název místa (nebo anglický, chceš-li ponechat)",
+      name: "odpověď = české jméno (nebo anglické, chceš-li ponechat)",
+      relationship: "odpověď = tyka nebo vyka",
+      style: "odpověď = pravidlo větou, půjde do návodu pro překladatele",
+    };
     data.must_decide.forEach((md, i) => {
       box.appendChild(el("p", {}, [`${md.kind}: ${md.question} (${md.scope_key || ""})`]));
-      const inp = el("input", { type: "text", value: md.answer || md.default || "" });
-      inp.oninput = e => data.must_decide[i].answer = e.target.value;
-      box.appendChild(inp);
+
+      if (md.kind === "relationship") {
+        // Volný text by server odmítl - address smí být jen tyka/vyka.
+        const pre = (md.default || "").toLowerCase();
+        if (!md.answer) {
+          data.must_decide[i].answer =
+            pre.includes("tyka") || pre.includes("tyká") ? "tyka"
+            : pre.includes("vyka") || pre.includes("vyká") ? "vyka" : "";
+        }
+        const sel = select([["", "-- vyber --"], ["tyka", "tykají si"], ["vyka", "vykají si"]],
+                           data.must_decide[i].answer);
+        sel.onchange = e => data.must_decide[i].answer = e.target.value;
+        box.appendChild(sel);
+      } else {
+        // Schválně NEpředvyplňujeme scoutovým návrhem: u termínů a jmen se
+        // odpověď zapíše do glosáře jako český tvar, a návrhy jsou často věty
+        // ("použít pouze Listens-to-Wind"). Odkliknutím by ses zanesl nesmysl.
+        const inp = el("input", { type: "text", value: md.answer || "" });
+        inp.oninput = e => data.must_decide[i].answer = e.target.value;
+        box.appendChild(inp);
+      }
+
+      box.appendChild(el("p", { class: "note" }, [HINT[md.kind] || HINT.style]));
+      if (md.default) {
+        box.appendChild(el("p", { class: "note" }, [`návrh scouta: ${md.default}`]));
+      }
     });
     app.appendChild(box);
   }
