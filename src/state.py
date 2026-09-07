@@ -98,3 +98,50 @@ def init_db(db_path: str) -> None:
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     with connect(db_path) as conn:
         conn.executescript(_SCHEMA)
+
+
+# --- běhy a účtování LLM volání -------------------------------------------
+
+def create_run(db_path: str, command: str) -> int:
+    with connect(db_path) as conn:
+        cur = conn.execute("INSERT INTO runs (command) VALUES (?)", (command,))
+        return cur.lastrowid
+
+
+def finish_run(db_path: str, run_id: int, status: str) -> None:
+    with connect(db_path) as conn:
+        conn.execute("UPDATE runs SET ended_at = CURRENT_TIMESTAMP, status = ? "
+                     "WHERE id = ?", (status, run_id))
+
+
+def record_llm_call(db_path: str, *, run_id, agent, provider, model,
+                    input_tokens, output_tokens, cost_usd, truncated,
+                    status, error_class) -> None:
+    """Zápis po KAŽDÉM volání (i selhaném) - audit i cost guard čtou odtud."""
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO llm_calls (run_id,agent,provider,model,input_tokens,"
+            "output_tokens,cost_usd,truncated,status,error_class) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (run_id, agent, provider, model, input_tokens, output_tokens,
+             cost_usd, int(bool(truncated)), status, error_class))
+
+
+def spent_so_far(db_path: str, run_id: int) -> float:
+    with connect(db_path) as conn:
+        r = conn.execute("SELECT COALESCE(SUM(cost_usd),0) AS s FROM llm_calls "
+                         "WHERE run_id = ?", (run_id,)).fetchone()
+        return float(r["s"])
+
+
+def get_run_spend_ceiling(db_path: str, run_id: int):
+    with connect(db_path) as conn:
+        r = conn.execute("SELECT spend_ceiling FROM runs WHERE id = ?",
+                         (run_id,)).fetchone()
+        return r["spend_ceiling"] if r else None
+
+
+def set_run_spend_ceiling(db_path: str, run_id: int, value: float) -> None:
+    with connect(db_path) as conn:
+        conn.execute("UPDATE runs SET spend_ceiling = ? WHERE id = ?",
+                     (value, run_id))

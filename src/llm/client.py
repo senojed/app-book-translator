@@ -98,3 +98,99 @@ class FakeLLMClient:
 
     def count_tokens(self, *, system: str, user: str, model: str) -> int:
         return max(1, (len(system) + len(user)) // 4)
+
+
+class PipelineLLMClient:
+    """Obal kolem reálného klienta: cost guard před voláním, zápis do
+    `llm_calls` po každém volání (i selhaném). Pipeline ho vyrábí zvlášť pro
+    každého agenta - `agent` je jen label do logu."""
+
+    def __init__(self, inner: LLMClient, *, run_id: int, agent: str,
+                 db_path: str, config_mod, confirm=input, interactive: bool = True):
+        self._inner = inner
+        self._run_id = run_id
+        self._agent = agent
+        self._db = db_path
+        self._cfg = config_mod
+        self._confirm = confirm
+        self._interactive = interactive
+
+    def count_tokens(self, *, system: str, user: str, model: str) -> int:
+        return self._inner.count_tokens(system=system, user=user, model=model)
+
+    def _price(self, model: str) -> tuple[float, float]:
+        if model not in self._cfg.PRICE_IN_PER_MTOK or model not in self._cfg.PRICE_OUT_PER_MTOK:
+            raise FatalRunError(
+                f"Model {model!r} nemá sazby v config.PRICE_*_PER_MTOK - "
+                "cost guard by byl slepý. Doplň sazby.")
+        return (self._cfg.PRICE_IN_PER_MTOK[model], self._cfg.PRICE_OUT_PER_MTOK[model])
+
+    def _ask(self, prompt: str) -> str:
+        """Zeptá se uživatele. Když stdin není k dispozici (pipe, CI, testy),
+        ber to jako 'stop' - guard nesmí spadnout na OSError."""
+        try:
+            return (self._confirm(prompt) or "").strip()
+        except (EOFError, OSError):
+            raise FatalRunError("Cost guard: stdin není k dispozici, zastavuji.")
+
+    def _guard(self, system: str, user: str, max_tokens: int, model: str) -> None:
+        from src import state
+        in_rate, out_rate = self._price(model)   # může vyhodit FatalRunError
+        try:
+            in_tok = self._inner.count_tokens(system=system, user=user, model=model)
+        except FatalRunError:
+            raise
+        except Exception:
+            # KONZERVATIVNÍ nadhad (reálně ~4 znaky/token) - guard nesmí podcenit
+            in_tok = (len(system) + len(user)) // 2
+        est = in_tok / 1e6 * in_rate + max_tokens / 1e6 * out_rate
+        spent = state.spent_so_far(self._db, self._run_id)
+        ceiling = state.get_run_spend_ceiling(self._db, self._run_id) or 0.0
+        limit = max(self._cfg.MAX_SPEND_USD, ceiling)
+        if spent + est <= limit:
+            return
+        if not self._interactive:
+            raise FatalRunError(
+                f"Cost guard: strop ${limit:.2f} překročen (utraceno ~${spent:.2f} "
+                f"+ odhad ~${est:.2f}). Non-interactive režim, zastavuji.")
+        need = spent + est
+        for _ in range(2):   # 1 prompt + 1 reprompt na nevalidní/nízký vstup
+            ans = self._ask(
+                f"Cost guard: utraceno ~${spent:.2f}, odhad ~${est:.2f}, "
+                f"strop ${limit:.2f}. Nový strop v $ (>= ${need:.2f}) [prázdné = stop]: ")
+            if not ans:
+                raise FatalRunError("Cost guard: běh zastaven uživatelem.")
+            try:
+                new_limit = float(ans)
+            except ValueError:
+                continue
+            if new_limit < need:
+                continue   # strop pod potřebu = nesmysl, reprompt
+            state.set_run_spend_ceiling(self._db, self._run_id, new_limit)
+            return
+        raise FatalRunError("Cost guard: nevalidní/nízký strop, zastavuji.")
+
+    def complete(self, *, system: str, user: str, max_tokens: int, model: str) -> Completion:
+        from src import state
+        self._guard(system, user, max_tokens, model)
+        in_rate, out_rate = self._price(model)
+        status, err, comp = "ok", None, None
+        try:
+            comp = self._inner.complete(system=system, user=user,
+                                        max_tokens=max_tokens, model=model)
+            if comp.truncated:
+                status = "truncated"
+            return comp
+        except Exception as e:
+            status, err = "error", type(e).__name__
+            raise
+        finally:
+            it = comp.input_tokens if comp else None
+            ot = comp.output_tokens if comp else None
+            cost = (it / 1e6 * in_rate + ot / 1e6 * out_rate) if comp else None
+            state.record_llm_call(
+                self._db, run_id=self._run_id, agent=self._agent,
+                provider=getattr(self._inner, "provider", "unknown"),
+                model=model, input_tokens=it, output_tokens=ot, cost_usd=cost,
+                truncated=bool(comp.truncated) if comp else False,
+                status=status, error_class=err)
