@@ -221,3 +221,27 @@ Věcné nálezy kola:
 - Matcher dostal měřitelná kritéria: eval fixture >=40 anotovaných dvojic,
   100 % na negativní množině, >=90 % na pozitivní.
 
+## Kolo 9 — 2026-09-07
+
+- Codex: `round-9-codex.md` — VERDICT: CHANGES_NEEDED (2 BLOCKING, 2 IMPORTANT)
+- Claude: `round-9-claude.md` — VERDICT: CHANGES_NEEDED (0 vlastních)
+
+Kolo bylo zaměřeno na ověření, že konsolidační přepis z kola 8 neztratil žádné
+rozhodnutí z logu. Ukázalo se, že ztratil dvě a jedno rozbil:
+
+1. ZTRACENO: validace identity z kola 4 (prázdné klíče, duplicitní (section,
+   klíč)). Ověřeno grepem — nula výskytů v konsolidovaném dokumentu. Obnoveno.
+2. ZTRACENO: význam coverage v UI. Ukládání zůstalo, ale formulář ukazoval
+   všechny čtyři důvody prázdné položky stejně. Doplněno včetně testu.
+3. REGRESE: nové pořadí POSTu vypustilo _check_must_decide_answered. Ověřeno
+   v kódu, že apply_must_decide (server.py:43) prázdné odpovědi přeskočí a pak
+   seznam vymaže, takže dnešní kód tu kontrolu volá PŘED ní (:122 před :125).
+   Bez ní by nezodpovězená otázka tiše propadla. Pořadí opraveno na šest
+   očíslovaných kroků.
+4. Doplněno: přemapování must_decide u složené položky s více ponechanými
+   variantami potřebuje explicitní cílové id v payloadu — u naagloshii/skinwalker
+   se z textu odvodit nedá, komu odpověď patří.
+
+Poučení: konsolidační přepis je nejrizikovější operace celé smyčky a patří k němu
+kontrola proti logu rozhodnutí, ne jen kontrola vnitřní soudržnosti.
+

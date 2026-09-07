@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 8 oponentury (Codex + Claude), konsolidovaný přepis
+Stav: po kole 9 oponentury (Codex + Claude)
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -176,6 +176,17 @@ předepisuje **přejímací kritéria**:
 - `Finding.primary_attested` říká, jestli byl doložen primární povrch.
   **Předvyplnění `cz`/`render` se řídí jím, ne třídou.**
 
+**Identita položek se před těžbou validuje.** `scan_book` prázdné ani
+duplicitní položky nekontroluje (dedup je jen v `scan_chunks`), takže `id`
+z draftu není zaručeně unikátní a dvě položky by dostaly týž klíč - návrh ani
+nález by pak nešlo jednoznačně přiřadit. Před stavbou `id`:
+- položka s prázdným klíčem se **přeskočí** a nahlásí
+- duplicitní `(section, normalize_key(klíč))` se **deterministicky sloučí**:
+  sjednotí se aliasy, poznámky se spojí `"; "`, první výskyt určí pořadí
+- sloučení se nahlásí, aby bylo dohledatelné
+
+(Rozhodnutí z kola 4; konsolidační přepis v kole 8 ho vypustil.)
+
 **Složené položky (11 v aktuálním draftu):** `White Court / Red Court / Vampire
 Courts`, `Flickum bicus / Forzare / Aparturum`, `Will/Billy`, `veil/veiling
 spell`, `naagloshii/skinwalker` a další.
@@ -195,8 +206,11 @@ nemá jak poznat výčet od synonym.
 3. POST **nejdřív** složené položky rozbalí na samostatné, teprve **potom**
    spustí `apply_must_decide`
 4. `must_decide` se složeným `scope_key` (v draftu jsou dvě:
-   `naagloshii/skinwalker` a `Shagnasty/skinwalker`) se přemapuje na zvolenou
-   variantu, nebo zahodí, zvolil-li člověk všechny varianty smazat
+   `naagloshii/skinwalker` a `Shagnasty/skinwalker`) se přemapuje na **variantu,
+   kterou člověk výslovně určí**. Odvodit ji z rozděleného textu nejde: ponechá-li
+   člověk u `naagloshii/skinwalker` oba řádky, odpověď patří jen jednomu z nich.
+   Formulář proto u každé takové otázky nabídne roletku s variantami a payload
+   nese cílové `id`; nechá-li člověk všechny varianty smazat, otázka se zahodí
 5. validace odmítne payload, v němž po rozbalení zůstal jakýkoli klíč
    obsahující `/` nebo `" or "`
 
@@ -468,8 +482,18 @@ a `llm_calls` (přes `PipelineLLMClient`). Tabulek `chapters`, `glossary`,
 souboru, takže se `reference_dir` nemusí protahovat třemi vrstvami.
 
 - `GET /api/guide` volá `merge_sources(draft, guide, load_reference(path))`
-- **POST v tomto pořadí:** rozbal složené položky → `apply_must_decide`
-  (přemapované klíče) → validace → odstraň bloky `reference` → `save_guide`.
+- **POST v tomto pořadí:**
+  1. rozbal složené položky a přemapuj/zahoď jejich `must_decide`
+  2. **`_check_must_decide_answered`** - kontrola nezodpovězených otázek
+  3. `apply_must_decide`
+  4. `validate`
+  5. odstraň bloky `reference`
+  6. `save_guide`
+
+  Krok 2 nesmí zmizet ani se posunout za krok 3: `apply_must_decide`
+  (`server.py:43`) prázdné odpovědi **přeskočí** a na konci celý seznam vymaže,
+  takže by je pozdější `validate` už neviděla a nezodpovězená otázka by tiše
+  propadla. Dnešní kód to má správně (`server.py:122` před `:125`).
   Dnes `server.py:129` ukládá celý payload, takže by metadata skončila
   v `guide.json` mezi lidskými rozhodnutími a po dalším běhu zastarala.
 - validace odmítne payload s klíčem obsahujícím `/` nebo `" or "` a payload
@@ -480,6 +504,11 @@ Formulář:
 - **Potvrzeno referencemi** (`confirmed`), sbalené, s počtem
 - `weak` rozbalené s důkazem; alias-only `weak` s prázdným polem
 - `proposed` a `not_attested` s prázdným polem a návrhem vedle
+- `unresolved` **není jeden stav.** Podle `coverage` se rozliší čtyři důvody
+  a každý má vlastní hlášku: „model termín nezná" (`attempted`), „dávku se
+  nepodařilo zpracovat" (`failed`), „model položku vynechal"
+  (`missing_response`), „nezkoušeno kvůli `--limit`" (`skipped_by_limit`).
+  Bez toho by prázdné pole tvrdilo „nic se nenašlo" i tam, kde se nehledalo.
 - `stale` a nečerstvé viditelně odlišené
 - pole zůstávají editovatelná - ruka člověka vyhrává vždy
 
@@ -521,33 +550,42 @@ skončí `FatalRunError`.
    množině, >=90 % na pozitivní; celá tabulka z rozhodnutí 4; `Za-Lord`
    a `Listens-to-Wind` s pomlčkou; velikost písmen zachována; výpis zachycených
    tvarů pro 20 dotazů na skutečném korpusu.
-3. **Složené položky:** `White Court / Red Court / Vampire Courts` dostane
-   `compound`, těžba ji přeskočí; POST ji rozbalí **před** `apply_must_decide`;
-   `must_decide` se `scope_key = "naagloshii/skinwalker"` se přemapuje nebo
-   zahodí; validace odmítne zbylý klíč se `/`.
+3. **Složené položky a pořadí POSTu:** `White Court / Red Court / Vampire
+   Courts` dostane `compound`, těžba ji přeskočí; POST ji rozbalí **před**
+   `apply_must_decide`; **nezodpovězená `must_decide` po rozbalení musí payload
+   odmítnout** (regrese: `apply_must_decide` prázdné odpovědi přeskočí a seznam
+   vymaže, takže kontrola nesmí přijít až po ní); otázka
+   `scope_key = "naagloshii/skinwalker"` se přemapuje na variantu, kterou
+   payload výslovně určí, i když člověk ponechá obě; validace odmítne zbylý
+   klíč se `/`.
 4. **Kolize identity:** ruční položka `Billy` proti existujícímu aliasu
    `Billy Borden` → **chyba validace**, ne tiché sloučení ani přepsání;
    `seed_from_guide` guard nepřepíše `canonical_en` řádku nalezeného jen
    přes alias.
-5. **Korpus:** párování dílů, odmítnutí duplicitního čísla i malého korpusu,
+5. **Identita vstupu:** položka s prázdným klíčem se přeskočí, duplicitní
+   `(section, normalize_key)` se sloučí včetně aliasů a poznámek, sloučení se
+   nahlásí.
+6. **Korpus:** párování dílů, odmítnutí duplicitního čísla i malého korpusu,
    `stole` skončí nejvýš `weak`, `Mab` (3 znaky) smí být `confirmed`,
    sjednocení rozsahů u `Harry Dresden`/`Dresden`, alias-only →
    `primary_attested = false` a **žádné předvyplnění**, pravidlo o začátku věty
    včetně hranice dokumentů, cache round-trip a invalidace.
-6. **Agent:** dávkování, obálka `{"proposals":[...]}`, párování přes `id`,
+7. **Agent:** dávkování, obálka `{"proposals":[...]}`, párování přes `id`,
    duplicitní `id` → `ValueError`, cizí `id` se ignoruje, chybějící `id` →
    `stale`, explicitní `null` → `unresolved`, `OutputTruncated` → pokus
    s dvojnásobkem, síťová výjimka → `failed`.
-7. **Orchestrace:** všechny třídy včetně `compound`, hraniční testy souvýskytu
+8. **Orchestrace:** všechny třídy včetně `compound`, hraniční testy souvýskytu
    (přesně na poměru, těsně pod, prázdné `E`), selhaná dávka → `stale`,
-   `--limit` nesmaže položky mimo limit a zapíše se do `coverage`, zmizelý
+   `--limit` nesmaže položky mimo limit a zapíše se do `coverage`, UI rozliší
+   všechny čtyři důvody prázdné položky (`attempted` / `failed` /
+   `missing_response` / `skipped_by_limit`), zmizelý
    povrch se odstraní, prahy jen z primárního tvaru, report z finálního payloadu.
-8. **Slití:** přednost `guide` > `reference` > `draft`; číselný důkaz se vynechá
+9. **Slití:** přednost `guide` > `reference` > `draft`; číselný důkaz se vynechá
    při neshodě `cz`/`matched_cz`; kterýkoli příznak čerstvosti nepravdivý →
    nepředvyplní se nic **z reference**, ale lidská rozhodnutí zůstanou;
    nedostupný `source_root` → `corpus_fresh` je `unknown`; poškozený
    `reference.json` UI neshodí.
-9. **End-to-end:** `reference.json` → `GET /api/guide` → POST → `guide.json` →
+10. **End-to-end:** `reference.json` → `GET /api/guide` → POST → `guide.json` →
    `glossary.seed_from_guide`. Musí prokázat, že metadata přežijí slití, že se
    `proposed`/`not_attested`/alias-only **nemůže** dostat do glosáře bez ručního
    vypsání, že postava bez doložení neprojde bez aktivní volby `render`, a že
