@@ -326,3 +326,119 @@ def run_lock(lock_path: str):
         yield
     finally:
         release_lock(lock_path)
+
+
+# --- otázky -----------------------------------------------------------------
+
+def _open_question_row(conn, q: dict):
+    """Najde otevřenou otázku se stejným klíčem. Globální (chapter_idx NULL) a
+    kapitolové otázky mají různý predikát - proto explicitní větvení místo
+    obecného ON CONFLICT."""
+    if q.get("chapter_idx") is None:
+        return conn.execute(
+            "SELECT * FROM questions WHERE chapter_idx IS NULL AND kind=? "
+            "AND scope_key=? AND severity=? AND answer IS NULL",
+            (q["kind"], q["scope_key"], q["severity"])).fetchone()
+    return conn.execute(
+        "SELECT * FROM questions WHERE chapter_idx=? AND kind=? AND scope_key=? "
+        "AND severity=? AND answer IS NULL",
+        (q["chapter_idx"], q["kind"], q["scope_key"], q["severity"])).fetchone()
+
+
+def upsert_open_question(db_path: str, q: dict) -> int:
+    """Zapíše otázku. Zodpovězená otázka stejného klíče novou NEblokuje."""
+    with connect(db_path) as conn:
+        existing = _open_question_row(conn, q)
+        if existing:
+            conn.execute("UPDATE questions SET text=?, guess_answer=? WHERE id=?",
+                         (q.get("text", ""), q.get("guess_answer"), existing["id"]))
+            return existing["id"]
+        cur = conn.execute(
+            "INSERT INTO questions (chapter_idx,kind,text,scope_key,guess_answer,"
+            "severity) VALUES (?,?,?,?,?,?)",
+            (q.get("chapter_idx"), q["kind"], q.get("text", ""), q["scope_key"],
+             q.get("guess_answer"), q["severity"]))
+        return cur.lastrowid
+
+
+def delete_open_questions_for_chapter(db_path: str, chapter_idx: int) -> None:
+    """Rerun kapitoly začíná načisto - staré nezodpovězené otázky zahodíme."""
+    with connect(db_path) as conn:
+        conn.execute("DELETE FROM questions WHERE chapter_idx=? AND answer IS NULL",
+                     (chapter_idx,))
+
+
+def unanswered_questions(db_path: str) -> list:
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM questions WHERE answer IS NULL "
+                            "ORDER BY id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_question(db_path: str, qid: int):
+    with connect(db_path) as conn:
+        r = conn.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
+    return dict(r) if r else None
+
+
+def answer_question(db_path: str, qid: int, answer_text: str):
+    with connect(db_path) as conn:
+        conn.execute("UPDATE questions SET answer=?, resolved_at=CURRENT_TIMESTAMP "
+                     "WHERE id=?", (answer_text, qid))
+        r = conn.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
+    return dict(r) if r else None
+
+
+def chapter_has_open_blocking(db_path: str, chapter_idx: int) -> bool:
+    with connect(db_path) as conn:
+        r = conn.execute(
+            "SELECT COUNT(*) c FROM questions WHERE chapter_idx=? "
+            "AND severity='blocking' AND answer IS NULL", (chapter_idx,)).fetchone()
+    return r["c"] > 0
+
+
+# --- pozorované výskyty termínů + drift -------------------------------------
+
+def replace_term_mentions(db_path: str, chapter_idx: int, mentions) -> None:
+    """Kapitola se může přeložit znovu - staré výskyty musí zmizet, jinak by
+    drift počítal s tvary z výsledku, který už neexistuje."""
+    with connect(db_path) as conn:
+        conn.execute("DELETE FROM term_mentions WHERE chapter_idx=?", (chapter_idx,))
+        for m in mentions or []:
+            d = m if isinstance(m, dict) else {
+                "term_id": m.term_id, "cz_form": m.cz_form,
+                "scene_idx": m.scene_idx, "source": m.source}
+            conn.execute(
+                "INSERT INTO term_mentions (term_id,cz_form,chapter_idx,scene_idx,"
+                "source) VALUES (?,?,?,?,?)",
+                (d["term_id"], d.get("cz_form"), chapter_idx, d.get("scene_idx"),
+                 d.get("source", "detected")))
+
+
+def chapters_mentioning_term(db_path: str, term_id: str,
+                             statuses=("done", "flagged")) -> list:
+    marks = ",".join("?" * len(statuses))
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT DISTINCT tm.chapter_idx AS idx FROM term_mentions tm "
+            f"JOIN chapters c ON c.idx = tm.chapter_idx "
+            f"WHERE tm.term_id = ? AND c.status IN ({marks}) ORDER BY tm.chapter_idx",
+            (term_id,) + tuple(statuses)).fetchall()
+    return [r["idx"] for r in rows]
+
+
+def all_term_mentions(db_path: str, statuses=("done", "flagged")) -> list:
+    """Podklad pro drift check - jen kapitoly, jejichž překlad platí."""
+    marks = ",".join("?" * len(statuses))
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT tm.* FROM term_mentions tm JOIN chapters c ON c.idx = tm.chapter_idx "
+            f"WHERE c.status IN ({marks}) ORDER BY tm.id", tuple(statuses)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_drift_report(db_path: str, up_to_chapter: int, report) -> None:
+    import json as _json
+    with connect(db_path) as conn:
+        conn.execute("INSERT INTO drift_reports (up_to_chapter, report) VALUES (?,?)",
+                     (up_to_chapter, _json.dumps(report, ensure_ascii=False)))
