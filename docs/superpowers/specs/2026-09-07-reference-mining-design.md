@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 19 oponentury
+Stav: po kole 20 oponentury
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -186,7 +186,9 @@ skutečně je (ve významu „štóla").
   nikdy `confirmed`, **`cz` se nepředvyplňuje** a položka **zůstává způsobilá
   pro stupeň 1**. Dřívější verze ji označila za `weak`, předvyplnila a ze
   stupně 1 vyřadila - tedy nejhorší možná kombinace.
-- 1-2 znaky se nehledají vůbec
+- 1-2 znaky se ve stupni 0 **nehledají vůbec** (žádný důkaz), do stupně 1 ale
+  jdou normálně - model může zavedený tvar znát i u dvouznakového jména.
+  Klasifikace se pak řídí běžnou precedencí.
 - povrch kratší než 5 znaků musí mít výskyt **mimo začátek věty** (chrání před
   jmény, která jsou zároveň českými slovy). Začátek věty = pozice 0 dokumentu,
   první nebílý znak po `.`/`!`/`?`/`…` s bílým znakem, nebo znak po oddělovači
@@ -264,17 +266,22 @@ validace by znemožnila uložit cokoli.
 | `evidence_only` | stupeň 0 | doložen jen alias; nebo obecné slovo s malým písmenem; nebo vlastní jméno nalezené **jen** shodou bez ohledu na velikost písmen (byť nad prahem) | **ne** | důkaz zobrazen, položka jde do stupně 1 |
 | `proposed` | stupeň 1 | model navrhl, tvar přesně doložen, souvýskyt sedí | **ne** | návrh vedle prázdného pole |
 | `not_attested` | stupeň 1 | model navrhl, tvar v tomto tvaru nedoložen nebo souvýskyt nesedí | **ne** | návrh vedle pole, označený jako slabý signál |
-| `unresolved` | - | model nenavrhl nic, nebo povrch pod 3 znaky | ne | prázdné |
+| `unresolved` | - | stupeň 0 nic nedoložil **a** model nenavrhl nic | ne | prázdné |
 
 **Precedence klasifikace.** Nález má jednu třídu, ale drží důkazy z obou
 stupňů. Bez explicitního pořadí by `evidence_only` nikdy nepřežilo úplný běh,
 protože stupeň 1 klasifikaci přepíše - a přitom ji formulář i testy berou jako
 konečnou. Pořadí:
 
-Nejdřív definice: povrch je **způsobilý** (`confirm_eligible`), splňuje-li
-současně: velké počáteční písmeno, délka ≥ 3 znaky, alespoň jeden výskyt
-**shodný i ve velikosti písmen**, a u povrchů kratších než 5 znaků výskyt mimo
-začátek věty. Obecné slovo s malým písmenem způsobilé není nikdy.
+Nejdřív definice: povrch je **způsobilý** (`confirm_eligible`), má-li velké
+počáteční písmeno, délku ≥ 3 znaky a **existuje-li alespoň jeden jediný výskyt,
+který splňuje všechny podmínky současně**: je shodný i ve velikosti písmen
+a (u povrchů kratších než 5 znaků) není na začátku věty.
+
+**Podmínky musí splnit tentýž výskyt, ne každá jiný.** Jinak by u `Mab` stačil
+jeden správně psaný výskyt na začátku věty plus nesouvisející `mab` uprostřed -
+každá podmínka splněná jiným místem, dohromady falešné potvrzení. Obecné slovo
+s malým písmenem způsobilé není nikdy.
 
 1. **způsobilý** primární povrch doložen a nad prahy → `confirmed`
 2. **způsobilý** primární povrch doložen, ale pod prahy → `weak`
@@ -649,7 +656,10 @@ skončí `FatalRunError`.
 1. **Normalizace (`textnorm`):** NFC, `casefold`, bílé znaky; `guide.normalize`
    beze změny (klíče vztahů se nesmí posunout).
 2. **Hledání stupně 0:** `stole` (malé písmeno) → `evidence_only`, **žádné
-   předvyplnění**, položka jde do stupně 1; `Mab` (3 znaky, velké písmeno) smí
+   předvyplnění**, položka jde do stupně 1; **kombinovaný regresní test
+   způsobilosti** - povrch, kde jeden výskyt má správnou velikost písmen na
+   začátku věty a jiný výskyt je uprostřed věty ale špatnou velikostí, **není
+   způsobilý**; povrch s jedním výskytem splňujícím obojí naráz způsobilý je; `Mab` (3 znaky, velké písmeno) smí
    být `confirmed`; povrch doložený jen shodou bez ohledu na velikost písmen
    **nesmí** být `confirmed`; sjednocení rozsahů u `Harry Dresden`/`Dresden`;
    alias-only → `primary_attested = false` a žádné předvyplnění; pravidlo

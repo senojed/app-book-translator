@@ -485,3 +485,18 @@ o zobrazení důkazu zabíjelo evidence_only (třídu, jejímž jediným obsahem
 důkaz); postpodmínka 6 nešla mechanicky ověřit — doplněn konkrétní predikát pro
 označení podezřelých aliasů.
 
+## Kolo 20 — 2026-09-07
+
+- Codex: `round-20-codex.md` — VERDICT: CHANGES_NEEDED (1 BLOCKING, 1 IMPORTANT)
+- Claude: `round-20-claude.md` — VERDICT: CONSENSUS
+
+BLOKUJÍCÍ: podmínky způsobilosti (zavedené v kole 19) šlo splnit RŮZNÝMI
+výskyty. U "Mab" by stačil jeden správně psaný výskyt na začátku věty plus
+nesouvisející "mab" uprostřed — každá podmínka splněná jiným místem, dohromady
+falešné potvrzení. Opraveno: podmínky musí splnit tentýž výskyt. Doplněn
+kombinovaný regresní test.
+
+DŮLEŽITÉ: rozpor u povrchů pod 3 znaky — tabulka je posílala rovnou do
+unresolved, precedence z nich při návrhu modelu dělala proposed. Sjednoceno:
+ve stupni 0 se nehledají, do stupně 1 jdou normálně.
+
