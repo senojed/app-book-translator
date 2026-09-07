@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 14 oponentury
+Stav: po kole 15 oponentury
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -51,6 +51,10 @@ Draft od scouta má vadná data, která se ukázala až při návrhu těžby:
 | duplicitní entity | 15 | `Morgan` i `Donald Morgan`, `Thomas` i `Thomas Raith` |
 | `must_decide` klíč neodkazuje na žádnou položku ve své sekci | 9 | `Warden`, `the Nevernever`, `Mouse (pes)`, `grasshopper_nickname` |
 | vztah s lomítkem ve jméně | 4 | `Harry` + `Will/Georgia` (dva různí lidé) |
+| povrch s poznámkou v závorce | 6 | `Warden(s)`, `the Merlin (title)`, `Stroger's (hospital)` |
+| homonymum napříč sekcemi | 1 | `Demonreach` je postava **i** místo |
+| neidentifikující alias | 9 | `sir`, `kid`, `apprentice`, `Captain`, `Bob` |
+| vztah odkazující zkráceným jménem | 2 | `Ebenezar` vs `Ebenezar McCoy`, `Lara` vs `Lara Raith` |
 
 Celkem ~39 řádků. Pořád jednorázová práce, ale spec o ní musí mluvit přesně -
 dřívější znění počítalo jen s prvními dvěma řádky tabulky.
@@ -68,7 +72,9 @@ draft má 15 kolizí a UI nemá na kanonická jména editaci ani mazání.
   položky je aliasem jiné) a výčty rozdělené podle `/` a samostatného `" or "`
   (case-insensitive, po zúžení bílých znaků). Nic nemění a nic se ho neptá -
   interaktivní nástroj ani soubor s deklarativními rozhodnutími se nestaví,
-  je to jednorázová operace na 26 řádcích.
+  je to jednorázová operace na ~39 řádcích.
+- **skript kontroluje všechny postpodmínky**, ne jen kolize a lomítka - jinak
+  by report tvrdil „hotovo" u draftu, který podmínky nesplňuje.
 - **rozhoduje člověk** a upraví `guide.draft.json` ručně (nebo s pomocí
   asistenta); skript slouží jen jako seznam míst, kam se podívat
 - záloha původního draftu: `data/guide.draft.pre-reference.json`
@@ -99,9 +105,24 @@ draft má 15 kolizí a UI nemá na kanonická jména editaci ani mazání.
 Prompt scouta se zároveň opravuje (jedna položka = jeden povrch, synonyma do
 `aliases`), aby další knihy tenhle krok nepotřebovaly.
 
-**Po tomto kroku platí:** každá položka draftu je jeden povrch a žádné kanonické
-jméno není aliasem jiné položky. Těžba, formulář ani glosář pak nemusí řešit
-výčty, kolize ani přemapování otázek.
+**Postpodmínky (skript je všechny kontroluje a test je vynucuje):**
+
+1. každá položka je **jeden povrch** - žádné `/`, `" or "`, ani poznámka
+   v závorce. `Warden(s)` → `Warden`; `the Merlin (title)` → `the Merlin`;
+   `evocation words (Forzare, ...)` se rozdělí nebo smaže. Povrch s poznámkou
+   přesné hledání nikdy nenajde.
+2. žádné kanonické jméno není aliasem jiné položky
+3. každý `must_decide.scope_key` ukazuje právě na jednu položku ve své sekci
+4. oba konce každého vztahu jsou **kanonická jména** existujících postav;
+   dvojice lišící se jen zkráceným tvarem (`Harry|Lara` vs `Harry|Lara Raith`)
+   se sloučí a vztahové `scope_key` se přemapují
+5. **žádné homonymum napříč sekcemi.** `Demonreach` je dnes postava i místo;
+   glosář má identitu **globální** (`_seed_one` hledá povrch přes celou
+   tabulku), takže sekčně oddělené `id` před kolizí nechrání a druhý seed by
+   první tiše přepsal. Buď je to jedna entita (nechat v jedné sekci), nebo dvě
+   různé a musí se přejmenovat.
+6. aliasy jsou **identifikující**. `sir`, `kid`, `apprentice`, `Captain`, `Bob`
+   a spol. se odeberou - jako dotaz do korpusu nic neurčují a jen zašumí důkaz.
 
 ## Stupně řešení
 
@@ -200,10 +221,16 @@ proposed  <=>  |E| > 0  a  |E ∩ C| >= max(1, ceil(REFERENCE_COOCCUR_RATIO * |E
 Jinak `not_attested`. Prázdné `E` (termín je nový až v jedenáctce) →
 `not_attested`.
 
-`books_with_en(corpus, surfaces)` používá **stejná pravidla jako stupeň 0, ale
+`books_with_en(corpus, surface)` používá **stejná pravidla jako stupeň 0, ale
 na EN straně**: case-insensitive, tytéž hranice slova, **bez** pravidla
 o začátku věty (anglický text, nehrozí kolize s českým slovem) a bez délkových
 omezení nad 2 znaky.
+
+**Jen primární povrch, ne aliasy.** Alias typu `sir` nebo `kid` by `E` rozšířil
+skoro na celý korpus a klasifikaci `proposed` znehodnotil. Krok 0 sice takové
+aliasy odebírá, ale predikát na tom nemá stát - primární povrch je jednoznačný
+vždy. Aliasy zůstávají užitečné pro **důkaz** ve stupni 0, kde nikdy samy
+nepředvyplňují.
 
 ### 5. Identita při kolizi povrchu s aliasem
 
@@ -293,7 +320,7 @@ class Corpus:
   nebo `Book (\d+)` u EN). Text dílu vznikne spojením **jen `Chapter.raw_text`**
   (bez `Chapter.title`, ty bývají jen „Chapter 1" a zkreslily by počty)
   oddělovačem `"
- 
+\x00
 "`. Soubor bez rozpoznatelného čísla se přeskočí
   s varováním; chybou je jen **duplicitní** rozpoznané číslo na téže straně →
   `ValueError`.
@@ -480,7 +507,7 @@ a `llm_calls` (přes `PipelineLLMClient`). Tabulek `chapters`, `glossary`,
   `reference`:** `provenance`, `scout_suggestion`, `lexicographer_suggestion`
   a příznak `relationships_reviewed`. Ukládá se **allowlist**: u postav
   `name_en`, `aliases`, `render`, `cz`; u míst a termínů `name_en`/`term_en`,
-  `cz`; u vztahů `a`, `b`, `address`; plus `style` a `rules`. Cokoli jiného se
+  `aliases`, `cz`; u vztahů `a`, `b`, `address`; plus `style` a `rules`. Cokoli jiného se
   zahodí. Dnes `server.py:129` ukládá celý payload, takže by v `guide.json`
   zůstala i pomocná pole formuláře.
 - **zaškrtnutí „vztahy zkontrolovány"** jede v payloadu jako
@@ -531,9 +558,10 @@ textové otázky; vztahové se dnes předvyplňují ze `md.default`
   a nešlo by porovnat, co navrhl model a co říká referenční překlad.
 - Zamčení polí doložených referencemi chrání před nechtěným přepsáním; změna
   hodnoty podložené profesionálním překladem má být vědomý úkon.
-- Tentýž vzor už formulář používá u `must_decide` (návrh pod prázdným polem),
-  zavedený ze stejného důvodu - scout tam navrhoval věty typu
+- Tentýž vzor formulář používá u **textových** `must_decide` (návrh pod
+  prázdným polem), zavedený ze stejného důvodu - scout tam navrhoval věty typu
   `"keep Nevernever"`, které by předvyplněné zanesly do glosáře nesmysl.
+  Vztahové `must_decide` se dnes předvyplňují a mění se podle tabulky výše.
 
 Formulář dál:
 - **Potvrzeno referencemi** (`confirmed`) nahoře, sbalené, s počtem

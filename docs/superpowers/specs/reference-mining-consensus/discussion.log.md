@@ -392,3 +392,27 @@ lexicographer_suggestion a relationships_reviewed by jinak zůstaly v guide.json
 Finding.source doplněn o none pro unresolved; sjednoceno chování při nečerstvé
 referenci (jen poznámka, nic jiného); zaškrtnutí vztahů dostalo payload kontrakt.
 
+## Kolo 15 — 2026-09-07
+
+- Codex: `round-15-codex.md` — VERDICT: CHANGES_NEEDED (0 BLOCKING, 5 IMPORTANT, 2 NITS)
+- Claude: `round-15-claude.md` — VERDICT: CHANGES_NEEDED
+
+Poprvé po devíti kolech ŽÁDNÝ BLOKUJÍCÍ NÁLEZ.
+
+Krok 0 nekontroloval všechny postpodmínky, které slibuje. Doplněno šest
+očíslovaných; k tabulce vad přibyly čtyři kategorie, všechny ověřené měřením:
+- 6 povrchů s poznámkou v závorce (Warden(s), the Merlin (title)) — přesné
+  hledání je u nich z principu nefunkční
+- 1 homonymum napříč sekcemi: Demonreach je postava I místo. Sekční id před tím
+  nechrání, protože glosář má identitu GLOBÁLNÍ (_seed_one hledá přes celou
+  tabulku) — druhý seed by první tiše přepsal
+- 9 neidentifikujících aliasů (sir, kid, apprentice, Captain, Bob) — v predikátu
+  souvýskytu by E rozšířily skoro na celý korpus
+- 2 vztahy odkazující zkráceným jménem (Ebenezar vs Ebenezar McCoy)
+
+books_with_en nově používá JEN PRIMÁRNÍ POVRCH, aby predikát nestál na tom, že
+normalizace proběhla dobře. Aliasy míst a termínů doplněny do merge i allowlistu.
+
+Vedlejší nález: do specu se dostal skutečný NUL bajt (neescapovaný oddělovač
+dokumentů v textové náhradě přes shell) a soubor se stal binárním. Opraveno.
+
