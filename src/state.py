@@ -537,3 +537,59 @@ def commit_chapter_result(db_path: str, idx: int, *, translated_text: str,
 
     return {"questions_created": created,
             "candidates_created": len(new_candidates or [])}
+
+
+# --- odpověď na otázku (jedna transakce) ------------------------------------
+
+def _apply_glossary_op(conn, op: str, key: str, value: str, type_: str = "term") -> None:
+    """SQL varianty glossary operací - musí běžet nad JEDNÍM spojením, aby byly
+    ve stejné transakci jako zápis odpovědi a requeue kapitol."""
+    import json as _json
+    from src import glossary          # lazy: glossary importuje state, ne naopak
+    if op == "promote":
+        conn.execute("UPDATE glossary SET status='approved', cz=?, "
+                     "updated_at=CURRENT_TIMESTAMP WHERE term_id=?", (value, key))
+    elif op == "add_approved":
+        tid = "term_" + glossary.slugify(key)
+        conn.execute(
+            "INSERT INTO glossary (term_id,canonical_en,aliases,cz,accepted_alt,"
+            "note,type,status) VALUES (?,?,'[]',?,'[]','',?,'approved')",
+            (tid, key, value, type_))
+    elif op == "add_accepted_alt":
+        r = conn.execute("SELECT accepted_alt FROM glossary WHERE term_id=?",
+                         (key,)).fetchone()
+        if r is None:
+            return
+        alts = _json.loads(r["accepted_alt"] or "[]")
+        if value not in alts:
+            alts.append(value)
+        conn.execute("UPDATE glossary SET accepted_alt=?, updated_at=CURRENT_TIMESTAMP "
+                     "WHERE term_id=?", (_json.dumps(alts, ensure_ascii=False), key))
+    else:
+        raise ValueError(f"neznámá glossary operace: {op}")
+
+
+def commit_answer(db_path: str, *, qid: int, answer_text: str, glossary_ops: list,
+                  requeue_idxs: list, blocking_chapter_idx=None) -> dict:
+    """Zápis odpovědi + glosář + přepočet kapitol v jedné transakci.
+    Pád uprostřed = otázka zůstane nezodpovězená a `answer` se dá pustit znovu."""
+    changed = False
+    with connect(db_path) as conn:
+        for op in glossary_ops or []:
+            _apply_glossary_op(conn, *op)
+        conn.execute("UPDATE questions SET answer=?, resolved_at=CURRENT_TIMESTAMP "
+                     "WHERE id=?", (answer_text, qid))
+        if blocking_chapter_idx is not None:
+            left = conn.execute(
+                "SELECT COUNT(*) c FROM questions WHERE chapter_idx=? "
+                "AND severity='blocking' AND answer IS NULL",
+                (blocking_chapter_idx,)).fetchone()["c"]
+            if left == 0:
+                conn.execute("UPDATE chapters SET status='pending', "
+                             "updated_at=CURRENT_TIMESTAMP WHERE idx=? "
+                             "AND status='needs_human'", (blocking_chapter_idx,))
+                changed = True
+        for idx in requeue_idxs or []:
+            conn.execute("UPDATE chapters SET status='pending', "
+                         "updated_at=CURRENT_TIMESTAMP WHERE idx=?", (idx,))
+    return {"requeued": list(requeue_idxs or []), "chapter_status_changed": changed}

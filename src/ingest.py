@@ -108,7 +108,9 @@ def _load_txt(path: str) -> list[Chapter]:
         end = boundaries[n + 1] if n + 1 < len(boundaries) else len(lines)
         title = lines[start].strip()
         body = "\n".join(lines[start + 1:end]).strip()
-        if len(body) < MIN_CHAPTER_CHARS:
+        # Explicitní nadpis "Chapter N" je dost silný signál - na rozdíl od EPUB
+        # spine tady netřídíme podle délky (jinak by krátká kapitola zmizela).
+        if not body:
             continue
         chapters.append(Chapter(index=len(chapters) + 1, title=title, raw_text=body))
     return chapters
