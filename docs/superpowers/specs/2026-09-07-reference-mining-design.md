@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 12 oponentury (zkouška proveditelnosti)
+Stav: po kole 12 + rozhodnutí uživatele o předvyplňování
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -28,8 +28,10 @@ Rozdíl mezi scoutovým návrhem a návrhem lexikografa je jen v tom, že druhý
 tváří jako podložený referencemi - proto se **nepředvyplňuje**, zatímco
 scoutův návrh předvyplněný zůstává, ale je označený jako odhad.
 
-**Otevřená otázka pro člověka (nerozhoduje spec):** má se zrušit i předvyplňování
-scoutových návrhů? Bezpečnější, ale znamená vypsat ~59 termínů ručně.
+**Rozhodnuto uživatelem:** předvyplňuje se **jen to, co je doloženo
+referencemi**. Scoutův odhad se ukáže vedle prázdného pole jako text
+s tlačítkem „použít návrh" - přijetí je tak jeden vědomý úkon místo sta třiceti
+nevědomých. Podrobnosti v sekci Review UI.
 
 ## Zdrojová data
 
@@ -440,16 +442,36 @@ a `llm_calls` (přes `PipelineLLMClient`). Tabulek `chapters`, `glossary`,
 - bloky `reference` se před uložením odstraní; `guide.json` zůstává čistě
   lidský model (dnes `server.py:129` ukládá celý payload)
 
-Formulář:
+### Chování polí podle původu hodnoty
+
+Zásada: **odhad se nepředvyplňuje, důkaz ano - a každá akce je vratná.**
+Původní hodnota se nikdy neztratí.
+
+| Původ | Pole | Ovládání |
+|---|---|---|
+| doloženo referencemi (`confirmed`, `weak`) | **předvyplněno**, ve výchozím stavu **zamčené**, vedle důkaz („112× v 8 dílech") | „změnit předvyplněné" odemkne; po změně se objeví „vrátit zpět předvyplněné" |
+| jen scoutův odhad | **prázdné**, návrh vedle jako text | „použít návrh" vyplní; poté se tlačítko změní na „zpět", které pole zase vyprázdní |
+| návrh lexikografa (`proposed`, `not_attested`) | **prázdné**, návrh vedle, výrazněji odlišený | totéž co u scouta |
+| nic (`unresolved`) | prázdné | - |
+
+- **„přijmout všechny scoutovy návrhy"** jedním tlačítkem nahoře. Kdo nechce
+  klikat po jednom, udělá jedno vědomé rozhodnutí místo sta třiceti nevědomých.
+  Vratné stejně jako jednotlivé použití.
+- Návrh se **nikdy nedává do editovatelného pole** - po přepsání by zmizel
+  a nešlo by porovnat, co navrhl model a co říká referenční překlad.
+- Zamčení polí doložených referencemi chrání před nechtěným přepsáním; změna
+  hodnoty podložené profesionálním překladem má být vědomý úkon.
+- Tentýž vzor už formulář používá u `must_decide` (návrh pod prázdným polem),
+  zavedený ze stejného důvodu - scout tam navrhoval věty typu
+  `"keep Nevernever"`, které by předvyplněné zanesly do glosáře nesmysl.
+
+Formulář dál:
 - **Potvrzeno referencemi** (`confirmed`) nahoře, sbalené, s počtem
 - `weak` rozbalené s důkazem
-- `evidence_only`, `proposed`, `not_attested` s **prázdným polem**; u prvního
-  se ukáže nalezený důkaz, u dalších dvou návrh modelu
 - `not_attested` označené jako slabý signál („v tomto tvaru nedoloženo",
   ne „model se plete")
 - nečerstvé viditelně odlišené
 - kolize povrchu s aliasem jiné položky → **varování**, ne chyba
-- pole zůstávají editovatelná - ruka člověka vyhrává vždy
 
 Chybějící blok `reference` nesmí UI rozbít.
 
@@ -505,13 +527,18 @@ skončí `FatalRunError`.
    `ValueError`**, explicitní `null` → `unresolved`.
 7. **Atomické selhání:** selhaná dávka → předchozí `reference.json`
    **nedotčený**, exit ≠ 0, souhrn vypíše co selhalo.
-8. **Slití:** přednost `guide` > `reference` > `draft`; číselný důkaz se vynechá
+8. **Chování polí:** hodnota doložená referencemi je předvyplněná a zamčená,
+   „změnit" ji odemkne, „vrátit zpět" obnoví původní; scoutův odhad pole
+   nevyplní, „použít návrh" ano a „zpět" ho zase vyprázdní; „přijmout všechny"
+   je vratné; **testuje se serializovaný payload**, ne vzhled - nepoužitý návrh
+   se do payloadu nesmí dostat.
+9. **Slití:** přednost `guide` > `reference` > `draft`; číselný důkaz se vynechá
    při neshodě `cz`/`matched_cz`; `fresh == false` → nepředvyplní se nic
    **z reference**, ale lidská rozhodnutí zůstanou; nedostupný `source_root` →
    `fresh` nepravdivý; poškozený `reference.json` UI neshodí.
-9. **Glosář:** `seed_from_guide` vrací seznam konfliktů; řádek nalezený jen
+10. **Glosář:** `seed_from_guide` vrací seznam konfliktů; řádek nalezený jen
    přes alias se nepřepíše, liší-li se `canonical_en`.
-10. **End-to-end:** `reference.json` → `GET /api/guide` → POST → `guide.json` →
+11. **End-to-end:** `reference.json` → `GET /api/guide` → POST → `guide.json` →
     `glossary.seed_from_guide`. Musí prokázat, že metadata přežijí slití, že se
     `evidence_only`/`proposed`/`not_attested` **nemůže** dostat do glosáře bez
     ručního vypsání, že postava bez doložení neprojde bez aktivní volby

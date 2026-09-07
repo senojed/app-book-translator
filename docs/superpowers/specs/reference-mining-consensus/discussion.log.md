@@ -324,3 +324,23 @@ orchestru), určeno rozhraní normalizačního kroku (report-only, ne interaktiv
 kontrakt spojování dokumentů (raw_text bez title), st_mtime_ns, zúžení bílých
 znaků. Opraveno nepravdivé tvrzení, že extract_json neumí top-level seznam.
 
+## Rozhodnutí uživatele o předvyplňování (mezi koly 12 a 13)
+
+Otevřená otázka z kola 12 zodpovězena uživatelem a zanesena do specu:
+
+- předvyplňuje se **jen to, co je doloženo referencemi**; scoutův odhad
+  a návrh lexikografa se ukazují vedle prázdného pole jako text
+- **každá akce je vratná a původní hodnota se nikdy neztratí:**
+  - doloženo referencemi → předvyplněno a zamčeno; "změnit předvyplněné"
+    odemkne, "vrátit zpět předvyplněné" obnoví
+  - odhad → prázdné pole + "použít návrh"; po použití se tlačítko změní na
+    "zpět", které pole zase vyprázdní
+- tlačítko "přijmout všechny scoutovy návrhy" pro toho, kdo nechce klikat po
+  jednom — jedno vědomé rozhodnutí místo sta třiceti nevědomých
+- návrh se nikdy nedává do editovatelného pole, aby po přepsání nezmizel
+  a šlo porovnat, co navrhl model a co říká referenční překlad
+
+Claude upozornil na cenu zamčených polí (klik navíc při každé legitimní změně);
+uživatel to potvrdil jako záměr. Vzor je konzistentní s tím, co formulář už
+používá u must_decide.
+
