@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 6 oponentury (Codex + Claude)
+Stav: po kole 7 oponentury (Codex + Claude)
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -157,14 +157,31 @@ textu** (jen NFC), `normalize_key` se používá výhradně na klíče položek.
 - 1-2 znaky se nehledají vůbec (`hits = 0` → `unresolved`)
 
 *Stupeň 1 - doložení navrženého českého tvaru (snese skloňování):*
-- porovnává se **po slovech prefixem**, ne oboustranným zkrácením: slovo v textu
-  odpovídá slovu dotazu, sdílejí-li prefix délky `max(3, len(slovo) - 2)`
-- slovo dotazu kratší než 3 znaky musí sedět **přesně**
-- Ověřeno, že pravidlo spáruje `bílá`↔`bílé`, `rada`↔`radě`, `plášť`↔`pláště`,
-  `rada`↔`radami`, a **nespáruje** `bílá`/`bída` ani `rada`/`rana`. Dřívější
-  varianta s prahem 4 skloňování nezvládala vůbec (`bílá`/`bílé` → False),
-  takže deklarovaná podpora skloňování byla prázdné tvrzení.
+
+**Spec algoritmus nepředepisuje, předepisuje přejímací kritéria.** Tři pokusy
+napsat pravidlo od stolu selhaly: `max(4, len-2)` nespáruje ani `bílá`/`bílé`;
+`max(3, len-2)` dává na skutečném korpusu (270 000 slov) u `práh` 54 tvarů
+včetně `práce`, `právo`, `prázdný`; varianta s uzavřenou množinou koncovek
+propadá na `plášť`/`pláště`, protože předpoklad „prefix = kmen" u řady slov
+neplatí. Volba algoritmu proto patří do implementačního plánu, kde se dá měřit.
+
+Povinná kritéria:
+
+| Musí spárovat | Nesmí spárovat |
+|---|---|
+| `bílá` ↔ `bílé`, `bílou` | `bílá` / `bída` |
+| `rada` ↔ `radě`, `radu`, `radou` | `rada` / `radost`, `raději` |
+| `plášť` ↔ `pláště`, `pláštěm` | `práh` / `práce`, `právo`, `prázdný` |
+| `Bílá rada` ↔ `Bílé radě` | `Bílá rada` / `Bída rana` |
+
 - víceslovný tvar musí sedět jako souvislá posloupnost slov
+- implementace **musí změřit** počet tvarů, které pravidlo zachytí pro vzorek
+  termínů na skutečném korpusu, a číslo uvést; pravidlo, které u čtyřpísmenného
+  dotazu vrátí desítky nesouvisejících tvarů, je nepřijatelné
+- **konzervativní pravidlo se preferuje před velkorysým.** Důsledek chyby je
+  omezený - stupeň 1 nikdy nic nepředvyplní, jen přeřadí mezi `proposed`
+  a `not_attested`. Falešné `not_attested` stojí člověka jeden pohled, falešné
+  `proposed` stojí důvěryhodnost celého nástroje.
 - Oboustranné zkracování (jako `concordance.stem`) je zakázané - právě ono
   slévá `Bílá rada` s `Bída rana`. Regresní test na tuhle dvojici je povinný.
 - Povrch kratší než 5 znaků musí mít alespoň jeden výskyt **mimo začátek věty**.
@@ -209,22 +226,26 @@ Přesné hledání takový řetězec nikdy nenajde, takže by všechny skončily
 dvory a každý potřebuje vlastní překlad; `Flickum bicus / Forzare / Aparturum`
 jsou tři různá zaklínadla. Slít je do jedné položky s jedním `cz` je věcná chyba.
 
-Kanonizace:
-- položka se rozdělí podle `/` a `" or "` na **samostatné položky**, každá
-  s vlastním `id`, vlastním hledáním a vlastním `cz`
-- žádné slučování podle interpunkce. Synonyma (`skinwalker / naagloshii`) tím
-  dostanou dva řádky - a to je správně: jsou to dva různé anglické povrchy,
-  které se v textu vyskytují a oba potřebují záznam v glosáři, aby je
-  concordance uměla najít
-- obrácené duplicity (`skinwalker / naagloshii` vs. `naagloshii/skinwalker`) se
-  rozpadnou na tytéž položky a splynou přirozeně přes `id`
-- prázdná varianta se zahodí; položka bez jediné neprázdné varianty se přeskočí
+**Automatické rozdělování se ruší** (zvažováno v kolech 5 a 6, zamítnuto).
+Rozdělit klíč nestačí: složené položky mají i složené `suggested_cz`, aliasy
+a někdy na ně míří `must_decide.scope_key`; `apply_must_decide` by původní
+klíč vkládal zpět; a bylo by nutné migrovat i existující `guide.json`. K tomu
+přistupuje kolize s glosářem - `Billy Borden` má v draftu aliasy
+`['Billy', 'Will', 'Will Borden']` a `glossary._seed_one` páruje přes aliasy,
+takže rozdělené `Will` a `Billy` by podle pořadí přepsaly jeho řádek. To je
+nepřiměřené strojvedení kvůli 11 položkám.
 
-**Kanonizace je sdílená, ne interní záležitost těžby.** Kdyby výčet rozdělila
-jen těžba, formulář by dál ukazoval jeden řádek z draftu a tři nálezy by neměl
-kam pověsit. Bydlí proto v `guide.canonical_items(draft) -> list[dict]`, kterou
-volá těžba **i** `merge_sources`; formulář zobrazí tři řádky, každý s vlastním
-polem. Draft na disku zůstává beze změny.
+**Zvoleno: rozdělí je člověk ve formuláři.**
+- těžba složenou položku pozná (obsahuje `/` nebo `" or "`), dá jí třídu
+  `compound`, **přeskočí ji** a nic pro ni nenavrhuje
+- formulář ji ukáže ve vlastní sekci „Rozdělit ručně" s předvyplněnými poli
+  pro jednotlivé varianty; člověk potvrdí nebo upraví
+- POST složenou položku nahradí samostatnými položkami a původní řetězec
+  zahodí, takže se do `guide.json` ani do glosáře nikdy nedostane
+- žádná automatická migrace `suggested_cz`, aliasů ani `must_decide`
+
+Prompt scouta se opravuje (jedna položka = jeden povrch, synonyma do `aliases`),
+ale detekce zůstane - starší drafty se nepřegenerovávají.
 
 Zároveň se opravuje prompt scouta: jedna položka = jeden povrch, synonyma patří
 do `aliases`. Kanonizace zůstává i tak - starší drafty se nepřegenerovávají.
@@ -438,16 +459,24 @@ vytěžená hodnota do UI vůbec nedostala.
 ```
 
 - **Tři samostatné příznaky čerstvosti:** `draft_fresh`, `corpus_fresh`,
-  `thresholds_fresh`. Předvyplnění (`cz` i `render`) i číselné důkazy se použijí
-  **jen když sedí všechny tři**; jinak se zobrazí pouze poznámka, že existuje
+  `thresholds_fresh`. Čerstvost omezuje **výhradně hodnoty a důkazy pocházející
+  z `reference`** - uložená lidská rozhodnutí z `guide.json` platí vždy
+  a priorita `guide > reference > draft` zůstává. Předvyplnění z reference
+  (`cz` i `render`) i číselné důkazy se použijí **jen když sedí všechny tři**; jinak se zobrazí pouze poznámka, že existuje
   nález z jiného běhu. Skrýt čísla a hodnotu ponechat by nestačilo: opakovaný
   `scan` může změnit aliasy při zachovaném hlavním klíči, takže by ve formuláři
   zůstala hodnota opřená o už neplatný důkaz. `run_id` čerstvost neprokazuje.
 - **Odkud se otisky berou při `review`:** draft a prahy jsou levné (čtení JSONu
-  a `config`). Korpusový otisk se porovnává proti manifestu v
-  `REFERENCE_CACHE_PATH` - načítat kvůli formuláři 20 EPUBů (~30 s) nepřipadá
-  v úvahu. Chybí-li cache, je `corpus_fresh` **`unknown`** a chová se jako
-  `false`; radši nepředvyplnit než předvyplnit z neznámého podkladu.
+  a `config`). Korpusový otisk se sestaví **znovu z disku** (`os.stat` nad
+  soubory v `REFERENCE_DIR` - cesty, velikosti, mtime); EPUBy se neparsují,
+  takže je to levné. Porovnávat otisk v `reference.json` proti manifestu
+  uloženému v cache nestačí - to jsou dva historické údaje a pozdější změnu
+  EPUBů neodhalí. Není-li složka dostupná, je `corpus_fresh` **`unknown`**
+  a chová se jako `false`.
+
+  `merge_sources` proto dostává i cestu ke korpusu:
+  `merge_sources(draft, guide, reference=None, *, reference_dir=None)`,
+  a `build_app` / `run_review_server` ji předávají dál.
 - **Vazba důkazu na hodnotu** platí jen pro `confirmed` a `weak` (tedy tam, kde
   je `cz` předvyplněné): liší-li se zobrazované `cz` od `matched_cz`, číselný
   důkaz se vynechá. Klasifikace a `navrh` se zobrazují vždy - u `proposed` /
@@ -455,6 +484,18 @@ vytěžená hodnota do UI vůbec nedostala.
 
 `merge_draft_and_guide` zůstane tenkým obalem (`reference=None`), aby stávající
 testy a volání platily.
+
+### Guard v `glossary.seed_from_guide` (oprava latentní chyby)
+
+`_seed_one` dnes páruje nový povrch i přes **aliasy** existujícího řádku a pak
+přepíše `canonical_en`, `cz` i `type`. Na skutečných datech to je past:
+`Billy Borden` má aliasy `['Billy', 'Will', 'Will Borden']`, takže seed položky
+`Billy` by mu přepsal kanonický tvar. Není to chyba zavedená tímhle návrhem,
+ale existující chování, které rozdělené položky snadno spustí.
+
+**Guard:** řádek nalezený **jen přes alias** (ne přes `canonical_en`) se nesmí
+přepsat, liší-li se příchozí `canonical_en` od uloženého. Místo přepsání se
+příchozí povrch přidá k aliasům a nahlásí se konflikt. Povinný end-to-end test.
 
 ## Chyby
 
@@ -549,16 +590,18 @@ skončí `FatalRunError` - stávající chování `PipelineLLMClient`.
 
 1. **Normalizace (`textnorm`):** NFC, `casefold`, bílé znaky; `guide.normalize`
    zůstává beze změny (klíče vztahů se nesmí posunout).
-2. **Matcher (kritické, vlastní implementace):** `Bílá rada` se **nesmí**
-   spárovat s `Bída rana` (regrese proti oboustrannému zkracování), `Za-Lord`
-   a `Listens-to-Wind` se najdou i s pomlčkou, prefixové pravidlo najde
-   skloňované tvary, slovo kratší než 4 znaky musí sedět přesně, velikost písmen
-   se v surovém textu zachovává.
-3. **Kanonizace vstupu (`guide.canonical_items`):** `White Court / Red Court /
-   Vampire Courts` se rozdělí na **tři samostatné položky** s vlastními `id`
-   a vlastními poli, `skinwalker / naagloshii` a `naagloshii/skinwalker` dají
-   tytéž dvě položky (splynou přes `id`), prázdná varianta se zahodí,
-   `merge_sources` vrátí rozdělené řádky stejně jako těžba.
+2. **Matcher (kritické):** celá tabulka přejímacích kritérií z rozhodnutí 4 -
+   musí spárovat `bílá`/`bílé`, `rada`/`radě`, `plášť`/`pláště`,
+   `Bílá rada`/`Bílé radě`; nesmí spárovat `bílá`/`bída`, `rada`/`radost`,
+   `práh`/`práce`, `Bílá rada`/`Bída rana`. `Za-Lord` a `Listens-to-Wind` se
+   najdou i s pomlčkou, velikost písmen se v surovém textu zachovává.
+   Součástí je **měření** počtu zachycených tvarů na skutečném korpusu.
+3. **Složené položky:** `White Court / Red Court / Vampire Courts` dostane třídu
+   `compound`, těžba ji přeskočí a nic pro ni nenavrhne; formulář ji ukáže
+   v sekci „Rozdělit ručně" s předvyplněnými variantami; POST ji nahradí
+   samostatnými položkami a složený řetězec se do `guide.json` nedostane.
+   Test kolize s glosářem: seed položky `Billy` **nesmí** přepsat
+   `canonical_en` řádku `Billy Borden` nalezeného jen přes alias.
 4. **Korpus:** párování dílů, odmítnutí duplicitního čísla i malého korpusu,
    `stole` skončí nejvýš `weak` i při stovkách výskytů, `Mab` (3 znaky, velké
    písmeno) smí být `confirmed`, sjednocení rozsahů u překryvu
@@ -583,8 +626,7 @@ skončí `FatalRunError` - stávající chování `PipelineLLMClient`.
    zůstanou; `fresh: false` při změněném fingerprintu; volání bez reference se
    chová jako dnes; **kterýkoli z `draft_fresh`/`corpus_fresh`/`thresholds_fresh`
    nepravdivý → nepředvyplní se vůbec nic**; chybějící cache → `corpus_fresh`
-   je `unknown` a chová se jako `false`; alias-only nález předvyplní `cz` jen
-   když je doložený tvar slovem primárního povrchu (`Dresden` ano, `Hoss` ne); poškozený nebo
+   je `unknown` a chová se jako `false`; alias-only nález nepředvyplní `cz` ani `render`, jen zobrazí důkaz; poškozený nebo
    schématu neodpovídající `reference.json` UI neshodí.
 8. **End-to-end invariant:** `reference.json` → `GET /api/guide` → POST →
    `guide.json` → `glossary.seed_from_guide`. Musí prokázat, že metadata přežijí

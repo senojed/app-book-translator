@@ -166,3 +166,31 @@ Claude přidal: rozdělení výčtů musí vidět i formulář, jinak nemá kam 
 nálezy na jeden řádek draftu — sdílená guide.canonical_items() volaná těžbou
 i merge_sources.
 
+## Kolo 7 — 2026-09-07
+
+- Codex: `round-7-codex.md` — VERDICT: CHANGES_NEEDED (4 BLOCKING, 2 IMPORTANT)
+- Claude: `round-7-claude.md` — VERDICT: CHANGES_NEEDED (2 vlastní BLOCKING)
+
+PROCESNÍ CHYBA CLAUDEA: dvě opravy z kola 6 (corpus_fresh, alias-only) se do
+specu vůbec nezapsaly — textová náhrada neseděla na vzor změněný v kole 5
+a proběhla naprázdno, což nebylo ověřeno. V shrnutí kola 6 byly přesto hlášeny
+jako hotové. Od tohoto kola se každá změna specu ověřuje grepem; kolo 7 má
+verifikační výpis všech sedmi změn.
+
+Matcher specifikován potřetí neúspěšně. Změřeno na 270 000 slovech korpusu:
+prefix-3 dává u "práh" 54 tvarů (práce, právo, prázdný), u "rada" 25 (radost,
+raději). Varianta s uzavřenou množinou koncovek propadá na plášť/pláště.
+Spec proto přechází z algoritmu na PŘEJÍMACÍ KRITÉRIA + povinné měření
+v implementaci; volba algoritmu patří do plánu.
+
+Automatické rozdělování složených položek zrušeno (zavedeno v kole 5, opraveno
+v kole 6, nyní zamítnuto celé). Důvod: migrace suggested_cz, aliasů,
+must_decide a guide.json plus kolize s glossary._seed_one, který páruje přes
+aliasy — ověřeno, že Billy Borden má aliasy Billy i Will, takže rozdělené
+položky by mu přepsaly kanonický tvar. Nově rozděluje člověk ve formuláři.
+
+Doplněn guard v seed_from_guide proti přepsání řádku nalezeného jen přes alias —
+latentní chyba stávajícího kódu, kterou by rozdělené položky spustily.
+
+Opraveno i to, že freshness nesmí potlačit lidská rozhodnutí z guide.json.
+
