@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 21 oponentury
+Stav: po kole 22 oponentury
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -114,7 +114,14 @@ Prompt scouta se zároveň opravuje (jedna položka = jeden povrch, synonyma do
    `evocation words (Forzare, ...)` se rozdělí nebo smaže. Povrch s poznámkou
    přesné hledání nikdy nenajde.
 2. žádné kanonické jméno není aliasem jiné položky
-3. každý `must_decide.scope_key` ukazuje právě na jednu položku ve své sekci
+3. `must_decide.scope_key` podle druhu otázky:
+   - `name` / `place` / `term` → ukazuje **právě na jednu položku** ve své sekci
+   - `relationship` → tvar `a|b`, oba konce jsou kanonická jména existujících
+     postav (viz podmínka 4)
+   - `style` → **vyjmuto**. Styl není kolekce klíčovaných položek;
+     `apply_must_decide` odpověď přidává do `rules`, takže klíč na nic ukazovat
+     nemusí a podmínka by u něj byla nesplnitelná. V draftu jsou dvě takové
+     otázky (`nicknames`, `Binder_dialect`).
 4. oba konce každého vztahu jsou **kanonická jména** existujících postav;
    dvojice lišící se jen zkráceným tvarem (`Harry|Lara` vs `Harry|Lara Raith`)
    se sloučí a vztahové `scope_key` se přemapují
@@ -690,8 +697,9 @@ skončí `FatalRunError`.
 8. **Normalizace draftu (krok 0):** test vynucuje **všech šest postpodmínek**
    proti **skutečnému** normalizovanému draftu - (1) žádný výčet ani poznámka
    v závorce, (2) žádné kanonické jméno není aliasem jiné položky,
-   (3) každý `must_decide.scope_key` ukazuje právě na jednu položku ve své
-   sekci, (4) oba konce každého vztahu jsou kanonická jména a zkrácené dvojice
+   (3) `must_decide.scope_key` ukazuje právě na jednu položku ve své sekci
+   u druhů `name`/`place`/`term`, u `relationship` má tvar `a|b` s kanonickými
+   konci a u `style` se nekontroluje, (4) oba konce každého vztahu jsou kanonická jména a zkrácené dvojice
    jsou sloučené, (5) žádné homonymum napříč sekcemi, (6) žádný
    neidentifikující alias.
 9. **Zachování `note`:** poznámka od scouta přežije cestu

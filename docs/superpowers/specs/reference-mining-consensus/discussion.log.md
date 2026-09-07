@@ -513,3 +513,16 @@ Oba nálezy jsou důsledky opravy z kola 20:
    která dává návrhu modelu přednost. Přeformulováno na "nikdy se nestane
    confirmed ani weak".
 
+## Kolo 22 — 2026-09-07
+
+- Codex: `round-22-codex.md` — VERDICT: CHANGES_NEEDED (1 IMPORTANT)
+- Claude: `round-22-claude.md` — VERDICT: CONSENSUS
+
+Jediný nález, a poprvé v této sérii NENÍ důsledkem předchozí opravy — spirála
+"oprava rozbije něco jiného" se uzavřela.
+
+Postpodmínka 3 byla u otázek typu style nesplnitelná: styl není kolekce
+klíčovaných položek, jeho odpověď jde do rules. Podmínka rozdělena podle druhu
+otázky (name/place/term ukazují na položku, relationship má tvar a|b
+s kanonickými konci, style vyjmutý).
+
