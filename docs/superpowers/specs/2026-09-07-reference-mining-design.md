@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 20 oponentury
+Stav: po kole 21 oponentury
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -231,8 +231,11 @@ Jinak `not_attested`. Prázdné `E` (termín je nový až v jedenáctce) →
 
 `books_with_en(corpus, surface)` používá **stejná pravidla jako stupeň 0, ale
 na EN straně**: case-insensitive, tytéž hranice slova, **bez** pravidla
-o začátku věty (anglický text, nehrozí kolize s českým slovem) a bez délkových
-omezení nad 2 znaky.
+o začátku věty (anglický text, nehrozí kolize s českým slovem) a **bez
+jakéhokoli délkového omezení** - i jedno- a dvouznakový povrch se hledá.
+Délkové omezení má jen stupeň 0 (ochrana před českými homonymy v CZ textu);
+kdyby ho měl i `books_with_en`, bylo by `E` u krátkých povrchů vždy prázdné
+a nikdy by se nestaly `proposed`.
 
 **Jen primární povrch, ne aliasy.** Alias typu `sir` nebo `kid` by `E` rozšířil
 skoro na celý korpus a klasifikaci `proposed` znehodnotil. Krok 0 sice takové
@@ -292,8 +295,11 @@ s malým písmenem způsobilé není nikdy.
 
 **Kroky 1 a 2 se týkají jen způsobilých povrchů.** Bez toho by `stole`
 (79 výskytů, malé písmeno) spadlo do `weak`, `weak` předvyplňuje - a byla by zpět
-přesně ta chyba, kvůli které tenhle aparát existuje. Nezpůsobilý povrch jde vždy
-do stupně 1 a končí nejvýš `evidence_only`.
+přesně ta chyba, kvůli které tenhle aparát existuje.
+
+Nezpůsobilý povrch se tedy **nikdy nestane `confirmed` ani `weak`**. Jde do
+stupně 1 a skončí jako `proposed` / `not_attested` podle návrhu modelu, nebo
+jako `evidence_only`, vrátí-li model `null` a stupeň 0 něco našel.
 
 Důkazy ze stupně 0 (`hits`, `books`, `per_form`, `matched_forms`) se **drží vždy**,
 bez ohledu na výslednou třídu; stupeň 1 je nepřepisuje, jen přidává vlastní.
@@ -671,6 +677,8 @@ skončí `FatalRunError`.
 4. **Souvýskyt:** hraniční testy (přesně na poměru, těsně pod, prázdné `E`);
    `books_with_en` používá EN stranu bez pravidla o začátku věty a **aliasy
    `E` neovlivňují** - položka s aliasem `sir` musí dát stejné `E` jako bez něj.
+   **Dvouznakový povrch musí dát neprázdné `E`**, je-li v EN textu - délkové
+   omezení platí jen pro stupeň 0.
 5. **Korpus:** párování dílů, odmítnutí duplicitního čísla, **vyřazení celého
    dílu při selhání jedné strany** a kontrola minima až potom, cache
    round-trip a invalidace při změně velikosti/mtime/kořene.

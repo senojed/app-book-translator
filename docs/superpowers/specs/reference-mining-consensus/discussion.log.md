@@ -500,3 +500,16 @@ DŮLEŽITÉ: rozpor u povrchů pod 3 znaky — tabulka je posílala rovnou do
 unresolved, precedence z nich při návrhu modelu dělala proposed. Sjednoceno:
 ve stupni 0 se nehledají, do stupně 1 jdou normálně.
 
+## Kolo 21 — 2026-09-07
+
+- Codex: `round-21-codex.md` — VERDICT: CHANGES_NEEDED (2 IMPORTANT)
+- Claude: `round-21-claude.md` — VERDICT: CONSENSUS
+
+Oba nálezy jsou důsledky opravy z kola 20:
+1. Povolil jsem krátkým povrchům jít do stupně 1, ale books_with_en si ponechal
+   délkové omezení ze stupně 0 — E by u nich bylo vždy prázdné a nikdy by se
+   nestaly proposed. Opraveno, doplněn regresní test.
+2. Věta "nezpůsobilý povrch končí nejvýš evidence_only" odporovala precedenci,
+   která dává návrhu modelu přednost. Přeformulováno na "nikdy se nestane
+   confirmed ani weak".
+
