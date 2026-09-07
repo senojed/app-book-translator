@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 12 + rozhodnutí uživatele o předvyplňování
+Stav: po kole 13 oponentury
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -25,8 +25,8 @@ s tím, co nástroj už dnes dělá**: `guide.py:92` a `:111` předvyplňují `r
 ze scoutova `suggested` a `cz` ze `suggested_cz`, tedy modelové odhady bez
 jakéhokoli doložení. Invariant psaný jen pro těžbu ten rozpor zakrýval.
 Rozdíl mezi scoutovým návrhem a návrhem lexikografa je jen v tom, že druhý se
-tváří jako podložený referencemi - proto se **nepředvyplňuje**, zatímco
-scoutův návrh předvyplněný zůstává, ale je označený jako odhad.
+tváří jako podložený referencemi. Ani jeden se proto **nepředvyplňuje** - oba
+se ukazují vedle prázdného pole (viz Review UI).
 
 **Rozhodnuto uživatelem:** předvyplňuje se **jen to, co je doloženo
 referencemi**. Scoutův odhad se ukáže vedle prázdného pole jako text
@@ -207,7 +207,7 @@ validace by znemožnila uložit cokoli.
 |---|---|---|---|---|
 | `confirmed` | stupeň 0 | primární povrch doložen včetně shody velikosti písmen, >= `MIN_HITS` výskytů ve >= `MIN_BOOKS` dílech, velké počáteční písmeno, >= 3 znaky | ano | sbaleno |
 | `weak` | stupeň 0 | primární povrch doložen, ale pod prahem | ano | rozbaleno s důkazem |
-| `evidence_only` | stupeň 0 | doložen jen alias, nebo obecné slovo s malým písmenem | **ne** | důkaz zobrazen, položka jde do stupně 1 |
+| `evidence_only` | stupeň 0 | doložen jen alias; nebo obecné slovo s malým písmenem; nebo vlastní jméno nalezené **jen** shodou bez ohledu na velikost písmen (byť nad prahem) | **ne** | důkaz zobrazen, položka jde do stupně 1 |
 | `proposed` | stupeň 1 | model navrhl, tvar přesně doložen, souvýskyt sedí | **ne** | návrh vedle prázdného pole |
 | `not_attested` | stupeň 1 | model navrhl, tvar v tomto tvaru nedoložen nebo souvýskyt nesedí | **ne** | návrh vedle pole, označený jako slabý signál |
 | `unresolved` | - | model nenavrhl nic, nebo povrch pod 3 znaky | ne | prázdné |
@@ -390,6 +390,20 @@ hodnota do UI nedostala.
 `guide` > `reference` > `draft`. U položky blok `reference` s klasifikací,
 důkazem, návrhem a jedním příznakem `fresh`.
 
+**Původ hodnoty musí být explicitní**, jinak frontend neví, co zamknout a co
+umí vrátit zpět. Každá položka nese:
+
+```json
+"provenance": "human" | "reference" | "none",
+"scout_suggestion": "..." | null,
+"lexicographer_suggestion": "..." | null
+```
+
+`provenance` popisuje **zobrazenou hodnotu** (`human` = z `guide.json`,
+`reference` = doloženo těžbou, `none` = pole je prázdné). Oba návrhy se drží
+**odděleně a současně** - položka může mít scoutův i lexikografův návrh a
+formulář nabídne oba, každý s vlastním tlačítkem.
+
 - **`fresh`** je jeden příznak, ne tři: pravdivý, jen když sedí otisk draftu,
   korpusu i prahů. `unknown` (nedostupný `source_root`) se chová jako
   nepravdivý.
@@ -447,6 +461,29 @@ a `llm_calls` (přes `PipelineLLMClient`). Tabulek `chapters`, `glossary`,
 Zásada: **odhad se nepředvyplňuje, důkaz ano - a každá akce je vratná.**
 Původní hodnota se nikdy neztratí.
 
+**Rozsah pravidla.** Platí pro hodnoty, které se stanou **závazným glosářovým
+termínem**: `cz` a `render` u postav, míst a termínů. Ostatní sekce mají jiné
+zacházení, protože pro ně těžba žádný důkaz neposkytuje (jsou mimo její rozsah):
+
+| Sekce | Zacházení |
+|---|---|
+| postavy, místa, termíny | pravidlo platí - viz tabulka níže |
+| **vztahy** (tyká/vyká) | scoutův návrh **předvyplněn**, ale sekce vyžaduje jedno zaškrtnutí „zkontrolováno" před uložením |
+| **styl** (jeden blok textu) | předvyplněn scoutem, bez ceremonie - člověk ho stejně přečte celý |
+| `must_decide` textové | prázdné pole, návrh pod ním (už dnes) |
+| `must_decide` vztahové | roletka s prázdnou volbou `-- vyber --`, návrh vedle jako text |
+
+Vztahy jsou vyšší sázka, než se zdá - špatné vykání se táhne celou knihou.
+Vynutit 34 roletek by ale bylo nepřiměřené k binární volbě, kterou lze
+přehlédnout v tabulce. Jedno zaškrtnutí za sekci je vědomý úkon a stojí jeden
+klik.
+
+**Oprava nepravdivého tvrzení:** dřívější znění specu tvrdilo, že formulář už
+vzor „prázdné pole + návrh vedle" používá u `must_decide`. Platí to jen pro
+textové otázky; vztahové se dnes předvyplňují ze `md.default`
+(`index.html:80-88`) a `guide.py:127` předvyplňuje `address` ze scoutova
+`suggested`. Obojí se mění podle tabulky výše.
+
 | Původ | Pole | Ovládání |
 |---|---|---|
 | doloženo referencemi (`confirmed`, `weak`) | **předvyplněno**, ve výchozím stavu **zamčené**, vedle důkaz („112× v 8 dílech") | „změnit předvyplněné" odemkne; po změně se objeví „vrátit zpět předvyplněné" |
@@ -456,7 +493,9 @@ Původní hodnota se nikdy neztratí.
 
 - **„přijmout všechny scoutovy návrhy"** jedním tlačítkem nahoře. Kdo nechce
   klikat po jednom, udělá jedno vědomé rozhodnutí místo sta třiceti nevědomých.
-  Vratné stejně jako jednotlivé použití.
+  **Nepřepíše ručně vyplněná ani referencemi doložená pole** a „zpět" vrátí
+  **jen ta pole, která tahle akce sama změnila** - jinak by hromadná akce
+  porušila zásadu, že se původní hodnota nikdy neztratí.
 - Návrh se **nikdy nedává do editovatelného pole** - po přepsání by zmizel
   a nešlo by porovnat, co navrhl model a co říká referenční překlad.
 - Zamčení polí doložených referencemi chrání před nechtěným přepsáním; změna
@@ -527,7 +566,11 @@ skončí `FatalRunError`.
    `ValueError`**, explicitní `null` → `unresolved`.
 7. **Atomické selhání:** selhaná dávka → předchozí `reference.json`
    **nedotčený**, exit ≠ 0, souhrn vypíše co selhalo.
-8. **Chování polí:** hodnota doložená referencemi je předvyplněná a zamčená,
+8. **Chování polí:** rozsah pravidla (vztahy a styl se předvyplňují, sekce
+   vztahů vyžaduje zaškrtnutí „zkontrolováno"; vztahové `must_decide` mají
+   prázdnou volbu); `provenance` a oba návrhy odděleně v payloadu z `GET`;
+   „přijmout všechny" nepřepíše ručně vyplněné ani doložené pole a „zpět" vrátí
+   jen jím změněná; hodnota doložená referencemi je předvyplněná a zamčená,
    „změnit" ji odemkne, „vrátit zpět" obnoví původní; scoutův odhad pole
    nevyplní, „použít návrh" ano a „zpět" ho zase vyprázdní; „přijmout všechny"
    je vratné; **testuje se serializovaný payload**, ne vzhled - nepoužitý návrh

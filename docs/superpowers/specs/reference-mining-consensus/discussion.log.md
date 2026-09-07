@@ -344,3 +344,29 @@ Claude upozornil na cenu zamčených polí (klik navíc při každé legitimní 
 uživatel to potvrdil jako záměr. Vzor je konzistentní s tím, co formulář už
 používá u must_decide.
 
+## Kolo 13 — 2026-09-07
+
+- Codex: `round-13-codex.md` — VERDICT: CHANGES_NEEDED (1 BLOCKING, 3 IMPORTANT, 2 NITS)
+- Claude: `round-13-claude.md` — VERDICT: CHANGES_NEEDED
+
+BLOKUJÍCÍ: nové pravidlo o předvyplňování nebylo aplikováno na celý formulář
+a spec o tom obsahoval nepravdivé tvrzení. Ověřeno: guide.py:127 předvyplňuje
+oslovení ze scoutova suggested, :138 styl ze style_notes, index.html:80-88
+předvyplňuje odpověď na vztahovou otázku z md.default — vlastní komentář v tom
+souboru přitom říká "schválně NEpředvyplňujeme", což platí jen pro textovou větev.
+
+Doplněn explicitní ROZSAH pravidla: platí pro hodnoty, které se stanou závazným
+glosářovým termínem (postavy, místa, termíny). Vztahy dostanou scoutův návrh
+předvyplněný, ale sekce vyžaduje zaškrtnutí "zkontrolováno" (vztahy jsou vyšší
+sázka — špatné vykání se táhne celou knihou — ale 34 vynucených roletek je
+nepřiměřené k binární volbě). Styl bez ceremonie. Vztahová must_decide dostanou
+prázdnou volbu.
+
+Dále: merge_sources doplněn o provenance (human/reference/none) a oddělené
+držení scoutova i lexikografova návrhu (položka může mít oba); "přijmout
+všechny" nepřepíše ručně vyplněná ani doložená pole a zpět vrátí jen jím
+změněná; doplněn chybějící klasifikační případ (vlastní jméno nalezené jen
+case-insensitive nad prahem → evidence_only).
+
+Potvrzeno, že po zjednodušení nezůstaly viset odkazy na zrušené podsystémy.
+
