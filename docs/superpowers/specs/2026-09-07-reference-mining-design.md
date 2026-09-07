@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 17 oponentury
+Stav: po kole 18 oponentury
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -25,11 +25,13 @@ s tím, co nástroj už dnes dělá**: `guide.py:92` a `:111` předvyplňují `r
 ze scoutova `suggested` a `cz` ze `suggested_cz`, tedy modelové odhady bez
 jakéhokoli doložení. Invariant psaný jen pro těžbu ten rozpor zakrýval.
 Rozdíl mezi scoutovým návrhem a návrhem lexikografa je jen v tom, že druhý se
-tváří jako podložený referencemi. Ani jeden se proto **nepředvyplňuje** - oba
-se ukazují vedle prázdného pole (viz Review UI).
+tváří jako podložený referencemi. **U glosářových polí** (`cz` a `render`
+u postav, míst a termínů) se proto **nepředvyplňuje ani jeden** - oba se
+ukazují vedle prázdného pole. Vztahy a styl mají jiný režim, viz Review UI →
+Rozsah pravidla.
 
-**Rozhodnuto uživatelem:** předvyplňuje se **jen to, co je doloženo
-referencemi**. Scoutův odhad se ukáže vedle prázdného pole jako text
+**Rozhodnuto uživatelem:** u glosářových polí se předvyplňuje **jen to, co je
+doloženo referencemi**. Scoutův odhad se ukáže vedle prázdného pole jako text
 s tlačítkem „použít návrh" - přijetí je tak jeden vědomý úkon místo sta třiceti
 nevědomých. Podrobnosti v sekci Review UI.
 
@@ -260,6 +262,22 @@ validace by znemožnila uložit cokoli.
 | `not_attested` | stupeň 1 | model navrhl, tvar v tomto tvaru nedoložen nebo souvýskyt nesedí | **ne** | návrh vedle pole, označený jako slabý signál |
 | `unresolved` | - | model nenavrhl nic, nebo povrch pod 3 znaky | ne | prázdné |
 
+**Precedence klasifikace.** Nález má jednu třídu, ale drží důkazy z obou
+stupňů. Bez explicitního pořadí by `evidence_only` nikdy nepřežilo úplný běh,
+protože stupeň 1 klasifikaci přepíše - a přitom ji formulář i testy berou jako
+konečnou. Pořadí:
+
+1. primární povrch doložen včetně shody velikosti písmen a nad prahy → `confirmed`
+2. primární povrch doložen → `weak`
+3. model vrátil návrh → `proposed` / `not_attested` podle souvýskytu
+4. existuje důkaz ze stupně 0 (jen alias, nebo obecné slovo) → `evidence_only`
+5. jinak → `unresolved`
+
+Důkazy ze stupně 0 (`hits`, `books`, `per_form`, `matched_en`) se **drží vždy**,
+bez ohledu na výslednou třídu; stupeň 1 je nepřepisuje, jen přidává vlastní.
+`evidence_only` je tedy konečná třída pro položku, kde stupeň 0 něco našel
+a model vrátil `null`.
+
 Prahy jsou **počáteční odhady bez měření**; první běh je má potvrdit nebo
 posunout. Práh rozhoduje jen o rozdílu `confirmed` / `weak`.
 
@@ -343,8 +361,10 @@ class Corpus:
   **když termín neznáš, vrať null - nehádej**".
 - `propose(items, client, *, model, max_tokens) -> dict[str, str | None]` -
   vstup `[{id, term_en, kind, note}]`, výstup mapa `id -> cz | None`.
-- **Identita je `id = "{section}/{normalize_key(klíč)}"`**; stejné jméno může
-  být v `places` i `terms`.
+- **Identita je `id = "{section}/{normalize_key(klíč)}"`**. Sekce je v klíči
+  kvůli stabilitě a čitelnosti, **ne** proto, že by homonyma napříč sekcemi byla
+  povolená - krok 0 je zakazuje (postpodmínka 5), protože glosář má identitu
+  globální.
 - **Obálka odpovědi je objekt:** `{"proposals": [{"id": ..., "cz": ...}]}`.
   (Ne proto, že by `extract_json` seznam neuměl - ověřeno, `json.loads` vrátí
   i top-level seznam. Objekt je zvolený proto, že regexový fallback při
@@ -630,10 +650,13 @@ skončí `FatalRunError`.
    `ValueError`**, explicitní `null` → `unresolved`.
 7. **Atomické selhání:** selhaná dávka → předchozí `reference.json`
    **nedotčený**, exit ≠ 0, souhrn vypíše co selhalo.
-8. **Normalizace draftu (krok 0):** po ní každý `must_decide.scope_key` ukazuje
-   právě na jednu položku ve své sekci; žádný vztah nemá lomítko ve jméně;
-   žádné kanonické jméno není aliasem jiné položky; žádná položka není výčet.
-   Test běží proti **skutečnému** normalizovanému draftu.
+8. **Normalizace draftu (krok 0):** test vynucuje **všech šest postpodmínek**
+   proti **skutečnému** normalizovanému draftu - (1) žádný výčet ani poznámka
+   v závorce, (2) žádné kanonické jméno není aliasem jiné položky,
+   (3) každý `must_decide.scope_key` ukazuje právě na jednu položku ve své
+   sekci, (4) oba konce každého vztahu jsou kanonická jména a zkrácené dvojice
+   jsou sloučené, (5) žádné homonymum napříč sekcemi, (6) žádný
+   neidentifikující alias.
 9. **Zachování `note`:** poznámka od scouta přežije cestu
    `draft` → `GET` → `POST` → `guide.json` → `glossary.seed_from_guide`
    a skončí v glosářovém řádku.
@@ -655,7 +678,8 @@ skončí `FatalRunError`.
 13. **End-to-end:** `reference.json` → `GET /api/guide` → POST → `guide.json` →
     `glossary.seed_from_guide`. Musí prokázat, že metadata přežijí slití, že se
     `evidence_only`/`proposed`/`not_attested` **nemůže** dostat do glosáře bez
-    ručního vypsání, že postava bez doložení neprojde bez aktivní volby
+    **výslovného přijetí člověkem** (tlačítko „použít návrh") nebo ručního
+    vypsání, že postava bez doložení neprojde bez aktivní volby
     `render`, a že `guide.json` po POSTu neobsahuje blok `reference`.
 
 ## Otevřené otázky k ověření prvním během

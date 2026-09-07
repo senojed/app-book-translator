@@ -443,3 +443,24 @@ na primární povrch, ale definice predikátu souvýskytu o deset řádků výš
 říkala "anglický povrch (nebo alias)". Rozdíl mění klasifikaci proposed.
 Sjednoceno, opravena i signatura (surface místo surfaces), doplněn test.
 
+## Kolo 18 — 2026-09-07 (sonda na protimluvy)
+
+- Codex: `round-18-codex.md` — VERDICT: CHANGES_NEEDED (5 IMPORTANT)
+- Claude: `round-18-claude.md` — VERDICT: CONSENSUS
+
+Kolo cíleně hledalo vzorec, který měly poslední tři nálezy společný: pravidlo
+změněné na jednom místě, staré znění přežívající jinde. Našlo pět protimluvů:
+
+1. Krok 0 zakazuje homonyma napříč sekcemi, ale sekce o identitě lexikografa
+   je dál odůvodňovala tím, že "stejné jméno může být v places i terms".
+2. Spec tvrdil, že test vynucuje všech šest postpodmínek normalizace, ale
+   vyjmenovával čtyři.
+3. Úvod tvrdil, že se nepředvyplňuje žádný návrh; rozsah v Review UI vztahy
+   a styl z pravidla vyjímá. Úvod nově mluví o glosářových polích.
+4. NEJOSTŘEJŠÍ: evidence_only by nikdy nepřežilo úplný běh, protože stupeň 1
+   klasifikaci přepíše — a přitom ji formulář i testy berou jako konečnou.
+   Doplněna precedence klasifikace (pět pravidel) a řečeno, že důkazy ze
+   stupně 0 se drží vždy.
+5. End-to-end test žádal, aby se hodnota nedostala do glosáře "bez ručního
+   vypsání", ale tlačítko "použít návrh" ji tam dostane bez psaní.
+
