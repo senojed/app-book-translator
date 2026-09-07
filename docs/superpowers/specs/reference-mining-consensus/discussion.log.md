@@ -194,3 +194,30 @@ latentní chyba stávajícího kódu, kterou by rozdělené položky spustily.
 
 Opraveno i to, že freshness nesmí potlačit lidská rozhodnutí z guide.json.
 
+## Kolo 8 — 2026-09-07
+
+- Codex: `round-8-codex.md` — VERDICT: CHANGES_NEEDED (6 BLOCKING, 1 IMPORTANT)
+- Claude: `round-8-claude.md` — VERDICT: CHANGES_NEEDED (1 vlastní BLOCKING)
+
+Pět z šesti Codexových nálezů nebyly nové chyby v návrhu, ale ZBYTKY PO NEÚPLNĚ
+PROVEDENÝCH OPRAVÁCH z kol 6 a 7: zrušený prefixový algoritmus zůstal na pěti
+místech, `compound` chyběl ve Finding i v klasifikační tabulce, tok pro složené
+položky si protiřečil ve třech sekcích, klasifikační tabulka odporovala pravidlu
+o alias-only. Verifikace jednotlivých náhrad (zavedená v kole 7) je nutná, ale
+nestačí — je třeba kontrolovat i to, že po opravě nikde nezůstalo staré tvrzení.
+Spec proto KONSOLIDOVÁN CELÝ a doplněn verifikační seznam osmi kontrol.
+
+Věcné nálezy kola:
+- Alias guard z kola 7 by zahodil ručně vytvořenou položku: `Billy` už alias
+  `Billy Borden` je, takže "přidání k aliasům" je no-op a nový řádek nevznikne.
+  Nově je kolize povrchu s cizím aliasem CHYBOU VALIDACE, kterou řeší člověk.
+- `--dir` override by `review` neznal (výchozí REFERENCE_DIR=""), takže by
+  čerstvou těžbu označil za zastaralou. reference.json proto nese `source_root`
+  a UI staví otisk z něj; odpadá protahování reference_dir třemi vrstvami.
+- Ověřeno v draftu, že must_decide opravdu obsahuje složené klíče
+  (naagloshii/skinwalker, Shagnasty/skinwalker) — POST je musí rozbalit PŘED
+  apply_must_decide a validace odmítnout zbylý klíč se "/".
+- Předvyplnění se nově řídí příznakem `primary_attested`, ne třídou.
+- Matcher dostal měřitelná kritéria: eval fixture >=40 anotovaných dvojic,
+  100 % na negativní množině, >=90 % na pozitivní.
+
