@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 22 oponentury
+Stav: po kole 23 oponentury - KONSENSUS
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -120,8 +120,9 @@ Prompt scouta se zároveň opravuje (jedna položka = jeden povrch, synonyma do
      postav (viz podmínka 4)
    - `style` → **vyjmuto**. Styl není kolekce klíčovaných položek;
      `apply_must_decide` odpověď přidává do `rules`, takže klíč na nic ukazovat
-     nemusí a podmínka by u něj byla nesplnitelná. V draftu jsou dvě takové
-     otázky (`nicknames`, `Binder_dialect`).
+     nemusí a podmínka by u něj byla nesplnitelná. V draftu jsou čtyři takové
+     otázky (`nicknames`, `Binder_dialect`, `narrative_voice` a jedna
+     s víceslovným klíčem).
 4. oba konce každého vztahu jsou **kanonická jména** existujících postav;
    dvojice lišící se jen zkráceným tvarem (`Harry|Lara` vs `Harry|Lara Raith`)
    se sloučí a vztahové `scope_key` se přemapují

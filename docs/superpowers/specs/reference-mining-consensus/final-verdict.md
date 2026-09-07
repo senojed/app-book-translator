@@ -1,53 +1,56 @@
 # Plan-consensus — finální verdikt
 
-**Výsledek: MAX_ROUNDS** (10 z 10 kol vyčerpáno)
+**Výsledek: CONSENSUS** (kolo 23 z 23)
 
-## Proč ne CONSENSUS
+Oba kritici vyhlásili `CONSENSUS` ve stejném kole. Nedořešené ani sporné body
+žádné.
 
-Shoda vyžaduje `CONSENSUS` od obou kritiků ve stejném kole. V kole 10 vyhlásil
-Codex `CONSENSUS` bez nálezů, ale Claude při inventuře rozhodnutí proti logu
-našel jeden důležitý nedostatek (viz níže), takže za sebe hlásí `CHANGES_NEEDED`.
+## Průběh
 
-## Nedořešené body
+| Kola | Formát | Charakter nálezů |
+|---|---|---|
+| 1-10 | standardní křížová kritika | věcné chyby návrhu; skončilo MAX_ROUNDS s 0 nedořešenými |
+| 11 | **čerstvé oči** (bez historie, s otázkou na proporce) | 3 blok. + 13 důl. + 5 o překombinovanosti; spec 619 → 484 řádků |
+| 12 | **zkouška proveditelnosti** (psát z toho plán, vést seznam dohadů) | invariant byl v rozporu s chováním existujícího kódu |
+| 13-17 | standardní | vady v datech draftu, postupně 4 → 7 → 5 → 1 → 1 |
+| 18 | **sonda na protimluvy** | 5 protimluvů |
+| 19-21 | ověření předchozí opravy | každé kolo našlo defekt zavedený opravou z předchozího |
+| 22-23 | standardní | 1 → 0; shoda |
 
-**Žádné.** Jediný nález kola 10 byl v témže kole opraven a ověřen:
+## Co smyčka změnila
 
-- Konsolidační přepis z kola 8 zrušil sekci „Stupně řešení" a s ní pravidlo, že
-  stupeň 1 dostává jen povrchy, které stupeň 0 nedoložil (a odhad ceny). Sekce
-  obnovena, ověřeno třemi kontrolami.
+**Zjednodušení.** Kolo 11 zrušilo tři podsystémy (editor složených položek,
+per-položkovou obnovu po selhání, morfologický matcher) a spec zkrátilo
+o pětinu. Příčinou složitosti byla vadná data draftu, ne obtížnost úkolu -
+levnější bylo přidat jednorázovou normalizaci než stavět aparát kolem vady.
 
-## Sporné body
+**Dvě chyby, které by prošly do kódu.** Invariant specu byl v rozporu s tím, co
+formulář dělá už dnes (`guide.py:92,111` předvyplňují modelové odhady).
+A obecné slovo `stole` se předvyplňovalo a zároveň nedostávalo do stupně 1 -
+nejhorší možná kombinace.
 
-**Žádné.** Za celou smyčku vznikl jeden spor (kolo 5: předvyplnění hodnoty
-u nálezu doloženého jen aliasem). Claude nejprve Codexův plošný zákaz odmítl
-a nahradil ho užším pravidlem, v kole 6 svou námitku po silnějším protiargumentu
-stáhl a přijal původní Codexovo řešení.
+**Tři neúspěšné pokusy napsat český matcher od stolu**, všechny vyvrácené
+měřením na skutečném korpusu. Spec u něj proto nepředepisuje algoritmus, ale
+přejímací kritéria s číselným prahem.
 
-## Statistika
+## Poučení k procesu
 
-| Kolo | Codex | Claude | Opraveno |
-|---|---|---|---|
-| 1 | CHANGES_NEEDED (4B, 9I) | CHANGES_NEEDED | 17 |
-| 2 | CHANGES_NEEDED (3B, 7I) | CHANGES_NEEDED | 11 |
-| 3 | CHANGES_NEEDED (4B, 6I) | CHANGES_NEEDED | 12 |
-| 4 | CHANGES_NEEDED (3B, 7I) | CHANGES_NEEDED | 11 |
-| 5 | CHANGES_NEEDED (2B, 2I) | CHANGES_NEEDED | 5 |
-| 6 | CHANGES_NEEDED (2B, 2I) | CHANGES_NEEDED | 6 |
-| 7 | CHANGES_NEEDED (4B, 2I) | CHANGES_NEEDED | 9 |
-| 8 | CHANGES_NEEDED (6B, 1I) | CHANGES_NEEDED | 7 |
-| 9 | CHANGES_NEEDED (2B, 2I) | CHANGES_NEEDED | 4 |
-| 10 | **CONSENSUS** | CHANGES_NEEDED | 1 |
+- **Změna formátu kola vynesla víc než opakování téhož.** Kola 11, 12 a 18
+  (čerstvé oči / zkouška proveditelnosti / sonda na protimluvy) našla dohromady
+  víc než šest standardních kol kolem nich.
+- **Oprava je nejrizikovější operace smyčky.** Kola 19-21 našla pokaždé defekt
+  zavedený opravou z předchozího kola. Od kola 7 se proto každá změna specu
+  ověřuje grepem, od kola 9 se dělá inventura proti logu rozhodnutí, a od kola
+  19 každé kolo nejdřív kontroluje předchozí opravu.
+- **Dvakrát se ukázalo, že ohlášená oprava se do dokumentu vůbec nezapsala**
+  (textová náhrada neseděla na vzor změněný dřívějším kolem).
+- **Konsolidační přepis ztratil tři dříve přijatá rozhodnutí.** Odhalila to až
+  cílená inventura proti logu, ne čtení dokumentu.
 
-Celkem 83 přijatých oprav, 1 spor (vyřešen), 0 nedořešených bodů.
+## Otevřené otázky - patří měření, ne oponentuře
 
-## Poznámka k průběhu
+- prahy `REFERENCE_MIN_HITS` / `MIN_BOOKS` pro `confirmed`
+- `REFERENCE_COOCCUR_RATIO` pro souvýskyt
+- jestli je přesná shoda ve stupni 1 příliš přísná
 
-Kola 7-9 z velké části opravovala nikoli návrh, ale **neúplně provedené opravy
-z předchozích kol**. Dvakrát se ukázalo, že ohlášená oprava se do dokumentu
-vůbec nezapsala (textová náhrada neseděla na vzor), a konsolidační přepis
-v kole 8 ztratil tři dříve přijatá rozhodnutí. Od kola 7 se proto každá změna
-verifikuje grepem a od kola 9 se navíc dělá inventura proti logu rozhodnutí.
-
-Tři pokusy specifikovat český matcher od stolu selhaly a všechny tři vyvrátilo
-měření na skutečném korpusu. Spec proto u téhle jediné věci nepředepisuje
-algoritmus, ale přejímací kritéria s číselným prahem.
+Všechny tři jsou levně změnitelné v `config.py` a první běh je má rozhodnout.

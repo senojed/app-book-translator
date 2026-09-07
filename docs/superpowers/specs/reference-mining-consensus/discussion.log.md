@@ -526,3 +526,18 @@ klíčovaných položek, jeho odpověď jde do rules. Podmínka rozdělena podle
 otázky (name/place/term ukazují na položku, relationship má tvar a|b
 s kanonickými konci, style vyjmutý).
 
+## Kolo 23 — 2026-09-07 (finální)
+
+- Codex: `round-23-codex.md` — VERDICT: **CONSENSUS** (jen 1 NIT)
+- Claude: `round-23-claude.md` — VERDICT: **CONSENSUS**
+
+SHODA DOSAŽENA. Oba kritici vyhlásili CONSENSUS ve stejném kole.
+
+Codexova jediná drobnost (spec uváděl dvě otázky druhu style, draft jich má
+čtyři) ověřena a opravena; na implementaci neměla dopad, protože postpodmínka
+je vyjímá bez ohledu na počet.
+
+Claude provedl závěrečnou inventuru patnácti nosných rozhodnutí proti textu —
+všechna přítomná. Spec 738 řádků, korektní UTF-8, bez zbytků po zrušených
+podsystémech.
+
