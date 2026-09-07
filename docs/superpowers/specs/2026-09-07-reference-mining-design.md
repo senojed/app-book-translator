@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 16 oponentury
+Stav: po kole 17 oponentury
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -211,8 +211,8 @@ u `práh` 54 tvarů včetně `práce` a `právo`; varianta s koncovkami propadla
 `plášť`/`pláště`). `not_attested` proto znamená **„v tomto přesném tvaru
 nedoloženo"** a je to výslovně **slabý** signál.
 
-**Predikát souvýskytu.** `E` = spárované díly, kde je anglický povrch (nebo
-alias) na **EN** straně; `C` = díly, kde je navržený český tvar na CZ straně.
+**Predikát souvýskytu.** `E` = spárované díly, kde je **primární** anglický
+povrch na **EN** straně (aliasy se do `E` nezapočítávají, viz níže); `C` = díly, kde je navržený český tvar na CZ straně.
 
 ```
 proposed  <=>  |E| > 0  a  |E ∩ C| >= max(1, ceil(REFERENCE_COOCCUR_RATIO * |E|))
@@ -329,7 +329,8 @@ class Corpus:
   `ValueError`.
 - `count_en_surface(corpus, surface, side="cz") -> Evidence`
 - `count_cz_form(corpus, form) -> Evidence` - přesná shoda celého slova
-- `books_with_en(corpus, surfaces) -> set[int]` - viz rozhodnutí 4
+- `books_with_en(corpus, surface) -> set[int]` - **jeden primární povrch**,
+  ne seznam; viz rozhodnutí 4
 - `build_manifest(root) -> dict` - `{relativní cesta: [velikost, st_mtime_ns]}`,
   jen `os.stat`, EPUBy se neparsují. `st_mtime_ns` (ne desetinné `st_mtime`)
   kvůli stabilitě porovnání napříč souborovými systémy.
@@ -619,7 +620,8 @@ skončí `FatalRunError`.
    `Bílé radě` (a je to v pořádku, `not_attested` je slabý signál);
    `Bílá rada` nenajde `Bída rana`.
 4. **Souvýskyt:** hraniční testy (přesně na poměru, těsně pod, prázdné `E`);
-   `books_with_en` používá EN stranu bez pravidla o začátku věty.
+   `books_with_en` používá EN stranu bez pravidla o začátku věty a **aliasy
+   `E` neovlivňují** - položka s aliasem `sir` musí dát stejné `E` jako bez něj.
 5. **Korpus:** párování dílů, odmítnutí duplicitního čísla, **vyřazení celého
    dílu při selhání jedné strany** a kontrola minima až potom, cache
    round-trip a invalidace při změně velikosti/mtime/kořene.

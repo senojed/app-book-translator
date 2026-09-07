@@ -433,3 +433,13 @@ vyhlašuje CONSENSUS. Zbývající nejistoty (prahy, poměr souvýskytu, přísn
 přesné shody) patří měření při prvním běhu, ne oponentuře, a všechny jsou
 levně změnitelné v config.py.
 
+## Kolo 17 — 2026-09-07
+
+- Codex: `round-17-codex.md` — VERDICT: CHANGES_NEEDED (1 IMPORTANT)
+- Claude: `round-17-claude.md` — VERDICT: CONSENSUS
+
+Codexův jediný nález byl zbytek po opravě z kola 15: změnil jsem books_with_en
+na primární povrch, ale definice predikátu souvýskytu o deset řádků výš dál
+říkala "anglický povrch (nebo alias)". Rozdíl mění klasifikaci proposed.
+Sjednoceno, opravena i signatura (surface místo surfaces), doplněn test.
+
