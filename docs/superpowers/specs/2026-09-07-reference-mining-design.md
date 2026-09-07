@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 15 oponentury
+Stav: po kole 16 oponentury
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -506,8 +506,11 @@ a `llm_calls` (přes `PipelineLLMClient`). Tabulek `chapters`, `glossary`,
 - **před uložením se odstraní všechna průběžná metadata, ne jen bloky
   `reference`:** `provenance`, `scout_suggestion`, `lexicographer_suggestion`
   a příznak `relationships_reviewed`. Ukládá se **allowlist**: u postav
-  `name_en`, `aliases`, `render`, `cz`; u míst a termínů `name_en`/`term_en`,
-  `aliases`, `cz`; u vztahů `a`, `b`, `address`; plus `style` a `rules`. Cokoli jiného se
+  `name_en`, `aliases`, `render`, `cz`, `note`; u míst a termínů
+  `name_en`/`term_en`, `aliases`, `cz`, `note`; u vztahů `a`, `b`, `address`;
+  plus `style` a `rules`. `note` nese kontext od scouta a **`_seed_one` ho
+  ukládá do glosáře** (`glossary.py:139`) - vynechat ho z allowlistu by ten
+  kontext ztratilo. Cokoli jiného se
   zahodí. Dnes `server.py:129` ukládá celý payload, takže by v `guide.json`
   zůstala i pomocná pole formuláře.
 - **zaškrtnutí „vztahy zkontrolovány"** jede v payloadu jako
@@ -629,7 +632,10 @@ skončí `FatalRunError`.
    právě na jednu položku ve své sekci; žádný vztah nemá lomítko ve jméně;
    žádné kanonické jméno není aliasem jiné položky; žádná položka není výčet.
    Test běží proti **skutečnému** normalizovanému draftu.
-9. **Chování polí:** rozsah pravidla (vztahy a styl se předvyplňují, sekce
+9. **Zachování `note`:** poznámka od scouta přežije cestu
+   `draft` → `GET` → `POST` → `guide.json` → `glossary.seed_from_guide`
+   a skončí v glosářovém řádku.
+10. **Chování polí:** rozsah pravidla (vztahy a styl se předvyplňují, sekce
    vztahů vyžaduje zaškrtnutí „zkontrolováno"; vztahové `must_decide` mají
    prázdnou volbu); `provenance` a oba návrhy odděleně v payloadu z `GET`;
    „přijmout všechny" nepřepíše ručně vyplněné ani doložené pole a „zpět" vrátí
@@ -638,13 +644,13 @@ skončí `FatalRunError`.
    nevyplní, „použít návrh" ano a „zpět" ho zase vyprázdní; „přijmout všechny"
    je vratné; **testuje se serializovaný payload**, ne vzhled - nepoužitý návrh
    se do payloadu nesmí dostat.
-10. **Slití:** přednost `guide` > `reference` > `draft`; číselný důkaz se vynechá
+11. **Slití:** přednost `guide` > `reference` > `draft`; číselný důkaz se vynechá
    při neshodě `cz`/`matched_cz`; `fresh == false` → nepředvyplní se nic
    **z reference**, ale lidská rozhodnutí zůstanou; nedostupný `source_root` →
    `fresh` nepravdivý; poškozený `reference.json` UI neshodí.
-11. **Glosář:** `seed_from_guide` vrací seznam konfliktů; řádek nalezený jen
+12. **Glosář:** `seed_from_guide` vrací seznam konfliktů; řádek nalezený jen
    přes alias se nepřepíše, liší-li se `canonical_en`.
-12. **End-to-end:** `reference.json` → `GET /api/guide` → POST → `guide.json` →
+13. **End-to-end:** `reference.json` → `GET /api/guide` → POST → `guide.json` →
     `glossary.seed_from_guide`. Musí prokázat, že metadata přežijí slití, že se
     `evidence_only`/`proposed`/`not_attested` **nemůže** dostat do glosáře bez
     ručního vypsání, že postava bez doložení neprojde bez aktivní volby

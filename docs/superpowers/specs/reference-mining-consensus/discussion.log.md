@@ -416,3 +416,20 @@ normalizace proběhla dobře. Aliasy míst a termínů doplněny do merge i allo
 Vedlejší nález: do specu se dostal skutečný NUL bajt (neescapovaný oddělovač
 dokumentů v textové náhradě přes shell) a soubor se stal binárním. Opraveno.
 
+## Kolo 16 — 2026-09-07
+
+- Codex: `round-16-codex.md` — VERDICT: CHANGES_NEEDED (1 IMPORTANT)
+- Claude: `round-16-claude.md` — VERDICT: **CONSENSUS**
+
+Codexův jediný nález: POST allowlist zahazoval `note`. Ověřeno, že
+merge_draft_and_guide poznámku emituje (guide.py:94,112) a _seed_one ji ukládá
+do glosářového řádku (glossary.py:139), takže by se kontext od scouta při
+uložení ztratil. Doplněno do allowlistu a přidán test na zachování napříč
+celou cestou draft → GET → POST → guide.json → glosář.
+
+Claude prošel spec vlastní inventurou proti logu rozhodnutí i proti kódu a nenašel
+nic, co by způsobilo špatné chování, ztrátu dat nebo zastavilo implementaci —
+vyhlašuje CONSENSUS. Zbývající nejistoty (prahy, poměr souvýskytu, přísnost
+přesné shody) patří měření při prvním běhu, ne oponentuře, a všechny jsou
+levně změnitelné v config.py.
+
