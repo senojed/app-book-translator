@@ -1,7 +1,7 @@
 # Těžba terminologie z profesionálních překladů - design
 
 Datum: 2026-09-07
-Stav: po kole 9 oponentury (Codex + Claude)
+Stav: po kole 10 oponentury (Codex + Claude), MAX_ROUNDS
 Navazuje na: `2026-09-06-book-translator-design.md`
 
 ## Kontext a cíl
@@ -49,6 +49,24 @@ s dílem jako s jedním textem.
 - Automatické rozdělování složených položek (viz rozhodnutí 5)
 - Těžba stylu, vypravěčského hlasu nebo vztahů z referencí
 - Použití referencí za běhu `run` (překladatel dostává glosář, ne korpus)
+
+## Stupně řešení
+
+Pouštějí se v pořadí a **každý pracuje jen s tím, co předchozí nevyřešil**:
+
+| Stupeň | Co dělá | Cena |
+|---|---|---|
+| 0 | přesné hledání anglického povrchu v CZ textu (kontrakt A) | zdarma, bez API |
+| 1 | návrh modelem + ověření v korpusu (kontrakt B) | ~$0.10-0.20, počáteční odhad, neměřeno |
+| 2 | poziční zarovnání textů | nestaví se, viz Mimo rozsah |
+
+Do stupně 1 tedy jde jen množina povrchů, které stupeň 0 nedoložil, mínus
+položky třídy `compound` (ty se přeskakují úplně). Posílat modelu i to, co je
+už deterministicky vyřešené, by stálo peníze a nic nepřineslo.
+
+Stupeň 2 se nestaví, ale nechává se pro něj čisté místo: `resolve()` bere
+seznam nevyřešených povrchů a vrací nálezy, takže další stupeň je další funkce
+se stejným tvarem vstupu i výstupu.
 
 ## Zásadní rozhodnutí
 

@@ -245,3 +245,17 @@ rozhodnutí z logu. Ukázalo se, že ztratil dvě a jedno rozbil:
 Poučení: konsolidační přepis je nejrizikovější operace celé smyčky a patří k němu
 kontrola proti logu rozhodnutí, ne jen kontrola vnitřní soudržnosti.
 
+## Kolo 10 — 2026-09-07 (finální)
+
+- Codex: `round-10-codex.md` — VERDICT: **CONSENSUS** (bez nálezů)
+- Claude: `round-10-claude.md` — VERDICT: CHANGES_NEEDED (1 vlastní IMPORTANT)
+
+Claude při inventuře všech 22 rozhodnutí proti specu našel třetí ztrátu po
+konsolidačním přepisu z kola 8, kterou nezachytilo ani cílené kolo 9: zrušená
+sekce "Stupně řešení" obsahovala pravidlo, že stupeň 1 dostává jen povrchy
+nedoložené stupněm 0, a odhad ceny. Bez toho by implementátor musel hádat,
+jestli se modelu posílá všech 132 povrchů. Obnoveno a ověřeno.
+
+VÝSLEDEK: MAX_ROUNDS. Shoda vyžaduje CONSENSUS od obou ve stejném kole; Codex
+hodnotil verzi před touto opravou. Nedořešené body: žádné. Sporné body: žádné.
+Viz `final-verdict.md`.
