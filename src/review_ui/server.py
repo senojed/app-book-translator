@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 
 from src import guide as guide_mod
+from src import reference_mine
 
 _STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -105,7 +106,38 @@ def _check_must_decide_answered(payload: dict) -> list:
             if not (md.get("answer") or "").strip()]
 
 
-def build_app(draft_path: str, guide_path: str, on_saved) -> FastAPI:
+_PERSIST = {
+    "characters": ("name_en", "aliases", "render", "cz", "note"),
+    "places": ("name_en", "aliases", "cz", "note"),
+    "terms": ("term_en", "aliases", "cz", "note"),
+    "relationships": ("a", "b", "address"),
+}
+
+
+def strip_transient(payload: dict) -> dict:
+    """Allowlist ukládaných polí. `guide.json` je kanonický lidský model -
+    pomocná pole formuláře (`provenance`, návrhy, blok `reference`, příznak
+    o zkontrolovaných vztazích) v něm nemají co dělat a po dalším běhu těžby
+    by zastarala."""
+    out = {}
+    for section, fields in _PERSIST.items():
+        out[section] = [{k: item[k] for k in fields if k in item}
+                        for item in (payload.get(section) or [])]
+    out["style"] = payload.get("style", "")
+    out["rules"] = payload.get("rules") or []
+    return out
+
+
+def _check_relationships_reviewed(payload: dict) -> list:
+    if not (payload.get("relationships") or []):
+        return []
+    if payload.get("relationships_reviewed") is True:
+        return []
+    return ["Sekce vztahů: potvrď zaškrtnutím, že jsi tykání/vykání zkontroloval."]
+
+
+def build_app(draft_path: str, guide_path: str, on_saved, *,
+              reference_path: str | None = None) -> FastAPI:
     app = FastAPI(title="Book translator - review návodu")
 
     @app.get("/")
@@ -114,27 +146,34 @@ def build_app(draft_path: str, guide_path: str, on_saved) -> FastAPI:
 
     @app.get("/api/guide")
     def get_guide():
-        return guide_mod.merge_draft_and_guide(guide_mod.load_draft(draft_path),
-                                               guide_mod.load_guide(guide_path))
+        import config
+        reference = (reference_mine.load_reference(reference_path)
+                     if reference_path else None)
+        return guide_mod.merge_sources(guide_mod.load_draft(draft_path),
+                                       guide_mod.load_guide(guide_path),
+                                       reference, cfg=config)
 
     @app.post("/api/guide")
     def post_guide(payload: dict):
+        # Pořadí je závazné: kontrola nezodpovězených MUSÍ být před
+        # apply_must_decide, které prázdné odpovědi přeskočí a seznam vymaže.
         errs = _check_must_decide_answered(payload)
         if errs:
             return JSONResponse({"ok": False, "errors": errs}, status_code=422)
         payload = apply_must_decide(payload)
-        errs = validate(payload)
+        errs = validate(payload) + _check_relationships_reviewed(payload)
         if errs:
             return JSONResponse({"ok": False, "errors": errs}, status_code=422)
-        guide_mod.save_guide(guide_path, payload)
+        guide_mod.save_guide(guide_path, strip_transient(payload))
         on_saved()
         return {"ok": True}
 
     return app
 
 
-def run_review_server(draft_path: str, guide_path: str, *, host: str = "127.0.0.1",
-                      port: int = 8765) -> int:
+def run_review_server(draft_path: str, guide_path: str, *,
+                      reference_path: str | None = None,
+                      host: str = "127.0.0.1", port: int = 8765) -> int:
     """Vrací 0 jen když člověk návod skutečně uložil."""
     import uvicorn
 
@@ -147,7 +186,7 @@ def run_review_server(draft_path: str, guide_path: str, *, host: str = "127.0.0.
         if srv is not None:
             srv.should_exit = True     # uložením práce končí
 
-    app = build_app(draft_path, guide_path, on_saved)
+    app = build_app(draft_path, guide_path, on_saved, reference_path=reference_path)
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
     server_holder["server"] = server
 
