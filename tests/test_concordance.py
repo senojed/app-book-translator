@@ -70,3 +70,29 @@ def test_check_drift_no_finding_for_simple_inflection():
 def test_form_key_collapses_simple_inflection_not_different_stems():
     assert C.form_key("Bílá radě") == C.form_key("Bílá rada")
     assert C.form_key("Rada bílých") != C.form_key("Bílá rada")
+
+
+def test_alias_of_kept_name_is_not_inconsistency():
+    """Jméno s render='keep' (cz == canonical_en doslova) - zkrácený tvar
+    z aliasů ('Morgan' u 'Donald Morgan') je v přirozené próze běžný po prvním
+    uvedení. Bez tohohle by KAŽDÝ výskyt zkráceného jména hlásil critical
+    inconsistency, přestože jde o stejné jméno, jen zkrácené (pilot nález)."""
+    g = [{"term_id": "term_morgan", "canonical_en": "Donald Morgan",
+          "aliases": ["Morgan", "Warden Morgan"], "cz": "Donald Morgan",
+          "accepted_alt": [], "status": "seeded", "type": "name"}]
+    f = C.check_chapter("Donald Morgan arrived. Morgan left.",
+                        "Donald Morgan dorazil. Morgan odešel.", g,
+                        [{"term_id": "term_morgan", "cz_as_used": "Morgan"}])
+    assert not [x for x in f if x["type"] == "inconsistency"]
+
+
+def test_alias_of_translated_name_still_flags_inconsistency():
+    """Alias smí projít jen u NEPŘELOŽENÉHO jména (cz == canonical_en) - u
+    přeloženého jména je anglický alias pořád jen anglický tvar, ne platný
+    český ekvivalent, a nesmí tiše obejít kontrolu."""
+    g = [{"term_id": "term_morgan", "canonical_en": "Donald Morgan",
+          "aliases": ["Morgan"], "cz": "Donald Moták",
+          "accepted_alt": [], "status": "seeded", "type": "name"}]
+    f = C.check_chapter("Donald Morgan arrived.", "Morgan dorazil.", g,
+                        [{"term_id": "term_morgan", "cz_as_used": "Morgan"}])
+    assert [x for x in f if x["type"] == "inconsistency"]

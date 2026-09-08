@@ -105,6 +105,15 @@ def examined_terms(en_text: str, glossary: list[dict],
 
 def _allowed_keys(term: dict) -> set:
     forms = [term.get("cz", "")] + list(term.get("accepted_alt") or [])
+    # Alias je platný český tvar JEN pokud se jméno vůbec nepřekládá (cz ==
+    # canonical_en doslova, typicky render="keep") - v próze je zkrácené
+    # jméno po prvním uvedení běžné ("Donald Morgan" → dál jen "Morgan").
+    # U přeloženého jména/termínu by anglický alias tiše obešel kontrolu -
+    # proto se přidává jen v týhle podmínce, ne vždy.
+    canonical = (term.get("canonical_en") or "").strip().lower()
+    cz = (term.get("cz") or "").strip().lower()
+    if cz and cz == canonical:
+        forms += list(term.get("aliases") or [])
     return {form_key(f) for f in forms if f}
 
 
