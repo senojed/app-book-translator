@@ -58,6 +58,365 @@ function section(title, node) {
   return wrap;
 }
 
+// Stav rozeditovaného pole se ukládá NA POLOŽKU (item._cz*), ne do closure
+// proměnných DOM prvku - `render()` staví celý strom znovu při KAŽDÉ akci
+// (přijmout všechny, přidat vztah, undo), takže closure stav by se ztratil
+// při libovolné jiné akci uprostřed rozeditovávání jednoho pole. Vlastnosti
+// s podtržítkem server nezná (`strip_transient` je při ukládání zahodí,
+// viz Task 11) - jsou to jen pomocná data formuláře.
+function fieldProvenance(item, field) {
+  const key = "_" + field + "Provenance";
+  return item[key] !== undefined ? item[key] : item.provenance;
+}
+
+// Textové pole (místa, termíny, a - s omezenou sadou návrhů - český tvar
+// jména postavy). Zásada: odhad se nepředvyplňuje, důkaz ano, a každá akce
+// je vratná. `suggestionKeys` omezuje, které návrhy se nabízejí - u postav
+// `scout_suggestion` nese "keep"/"translate" (rozhoduje o něm renderField,
+// ne tohle pole), takže by jako text vsazený do jména nedávalo smysl.
+function valueField(item, onChange, suggestionKeys) {
+  suggestionKeys = suggestionKeys || ["scout_suggestion", "lexicographer_suggestion"];
+  const wrap = el("div");
+  const ref = item.reference || {};
+  // Zda pole VŮBEC MŮŽE mít doloženou hodnotu (třída + čerstvost), nezávisle
+  // na tom, jestli je zrovna odemčené - odemčení nesmí tuhle možnost zrušit.
+  const canBeReference = ref.fresh &&
+    (ref.classification === "confirmed" || ref.classification === "weak") && ref.matched_cz;
+  // Provenience `cz` konkrétně (`fieldProvenance`, ne sdílené `item.provenance`
+  // - postava má nezávisle editovatelné `render`, viz renderField) se mění
+  // AŽ skutečnou editací (oninput), ne odemčením - to je ten rozdíl.
+  const stillReference = fieldProvenance(item, "cz") === "reference";
+  const unlocked = !!item._czUnlocked;         // durable - přežije libovolný render()
+  const locked = canBeReference && stillReference && !unlocked;
+  // Tlačítko "vrátit zpět" musí zůstat dosažitelné, i když provenience mezi
+  // tím přepnula na "human" skutečnou editací - jinak by po odemčení +
+  // jedné úpravě zmizelo navždy. `unlocked` samo o sobě stačí: nastavuje se
+  // při odemčení a NIKDY se nesmaže jinak než kliknutím na "vrátit zpět".
+  const showLockControls = canBeReference && (stillReference || unlocked);
+
+  const input = el("input", { type: "text", value: item.cz || "" });
+  input.readOnly = locked;                 // doložené je zamčené
+  // Za psaní se nevolá render() (ztratil by se kurzor/focus) - `onblur`
+  // po dopsání přepočítá vše, co se řídí render()em (důkaz, varování kolizí,
+  // sbalení potvrzených). Klikací akce (odemčení, zpět, návrh) render()
+  // volají rovnou, protože o žádný kurzor mid-akce nejde.
+  input.oninput = e => {
+    item._czBefore = e.target.value;
+    item._czProvenance = "human";     // TEĎ, ne při pouhém odemčení
+    item._czActiveKey = null;         // ruční zásah ruší stav "návrh je aplikovaný"
+    onChange(e.target.value);
+  };
+  // setTimeout(0), NE přímé volání: blur na inputu vznikne i tehdy, když
+  // uživatel kliká na SOUSEDNÍ tlačítko (posun focusu vyvolá blur DŘÍV, než
+  // prohlížeč dokončí sekvenci mousedown→mouseup→click na tom tlačítku).
+  // Synchronní render() by tlačítko smazal z DOM uprostřed týhle sekvence
+  // a klik by se ztratil - odloženo o jeden tick, aby click stihl proběhnout
+  // na PŮVODNÍM tlačítku dřív, než se cokoli přestaví.
+  input.onblur = () => setTimeout(() => render(), 0);
+  wrap.appendChild(input);
+
+  // Číselný důkaz se ukazuje NEZÁVISLE na zamčení - i ručně vyplněná hodnota,
+  // která náhodou vyjde stejně jako matched_cz, ho smí ukázat (spec: vazba
+  // důkazu je na SHODU HODNOTY, ne na to, kdo hodnotu vyplnil). "hits" in ref
+  // navíc respektuje, že server evidenci vynechal, pokud se PŘI NAČTENÍ
+  // zobrazovaná hodnota s matched_cz neshodovala. Protože klikací akce níž
+  // vždy volají render(), tahle podmínka se přepočítá při KAŽDÉ změně
+  // hodnoty přes tlačítko - jen psaní čeká na onblur.
+  if (canBeReference && "hits" in ref && item.cz === ref.matched_cz) {
+    const evidence = ref.hits
+      ? `${ref.hits}× v dílech ${(ref.books || []).join(", ")}`
+      : "doloženo referencemi";
+    wrap.appendChild(el("p", { class: "note" }, [evidence]));
+  }
+
+  if (showLockControls) {
+    const unlock = el("button", { type: "button" }, ["změnit předvyplněné"]);
+    const revert = el("button", { type: "button" }, ["vrátit zpět předvyplněné"]);
+    unlock.hidden = unlocked;
+    revert.hidden = !unlocked;
+    unlock.onclick = () => { item._czUnlocked = true; render(); };
+    revert.onclick = () => {
+      item._czUnlocked = false; item._czProvenance = "reference";
+      // Vyčistit i stav "návrh je aplikovaný" - jinak by po dalším odemčení
+      // tlačítko návrhu zůstalo ukazovat "zpět" ze STARÉHO cyklu (odemčení →
+      // použij → revert → odemkni znovu), přestože v tomhle novém cyklu nic
+      // aplikováno nebylo.
+      item._czActiveKey = null;
+      onChange(ref.matched_cz);
+      render();
+    };
+    wrap.appendChild(unlock); wrap.appendChild(revert);
+  }
+
+  // `evidence_only` nikdy nepředvyplňuje (cz je prázdné), ale je to jediná
+  // třída, jejímž obsahem JE jen důkaz - bez zvláštního zobrazení by ho
+  // formulář nikdy neukázal (spec: „důkaz zobrazen“ u evidence_only platí
+  // bez ohledu na předvyplnění).
+  if (ref.fresh && ref.classification === "evidence_only") {
+    const forms = (ref.matched_forms || []).join(", ") || item.surface || "";
+    wrap.appendChild(el("p", { class: "note" }, [
+      `nalezeno (nedokládá ponechání): ${ref.hits || 0}× v dílech ` +
+      `${(ref.books || []).join(", ")} (tvar: ${forms})`]));
+  }
+
+  // Návrhy se nikdy nedávají rovnou do editovatelného pole - po přepsání by
+  // zmizely a nešlo by porovnat, co navrhl model a co říká referenční překlad.
+  // Renderují se i při zamčeném poli (jen je odemčení zpřístupní přes
+  // render() vyvolaný "změnit předvyplněné") - jinak by po odemčení nebylo
+  // jak scoutův/lexikografův návrh použít, dokud nenastane jiná náhodná akce.
+  suggestionKeys.forEach(key => {
+    const label = key === "scout_suggestion" ? "návrh scouta" : "návrh z referencí (nedoloženo)";
+    const suggestion = item[key];
+    if (!suggestion) return;
+    const row = el("p", { class: "note" }, [`${label}: ${suggestion}  `]);
+    const active = item._czActiveKey === key;
+    const use = el("button", { type: "button" }, [active ? "zpět" : "použít návrh"]);
+    use.disabled = locked || (!!item._czActiveKey && !active);
+    use.onclick = () => {
+      if (use.textContent === "použít návrh") {
+        // Dva návrhy najednou by sdílely jedno `_czBefore` a rozbily by
+        // "zpět" u toho druhého - dokud je jeden aktivní, ostatní zamčené.
+        if (item._czActiveKey && item._czActiveKey !== key) return;
+        item._czBefore = item.cz || "";         // ulož, co tam bylo PŘED použitím
+        item._czActiveKey = key;
+        onChange(suggestion);
+      } else {
+        onChange(item._czBefore || "");
+        item._czActiveKey = null;
+      }
+      render();
+    };
+    row.appendChild(use);
+    wrap.appendChild(row);
+  });
+  return wrap;
+}
+
+// Roletka "ponechat/přeložit" u postav - stejná zásada jako valueField, ale
+// pracuje s polem `render`, ne `cz`, a scoutův návrh je hodnota roletky
+// ("keep"/"translate"), ne volný text.
+function renderField(item, onChange) {
+  const wrap = el("div");
+  const ref = item.reference || {};
+  // Stejná zásada jako valueField: "může být doloženo" je nezávislé na
+  // odemčení A na AKTUÁLNÍ hodnotě `item.render` - ta se mění editací
+  // (výběr prázdné volby ji vynuluje na ""), a `canBeReference` by na tom
+  // nesměl viset, jinak by "vrátit zpět" po zvolení "-- vyber --" zmizelo
+  // (round-7 nález). Stačí třída + čerstvost: `_merge_section` u postavy
+  // s confirmed/weak nálezem VŽDY nastaví `ref_render = "keep"`, takže tahle
+  // dvojice sama o sobě znamená "reference by tu měla keep". `render`-backed
+  // hodnota je vždy doslova "keep" (guide.py, ref_render) a evidence se váže
+  // na SHODU aktuální hodnoty s "keep" - po přepnutí na "translate" musí
+  // zmizet i bez editace (jen odemčením a výběrem jiné volby).
+  const canBeReference = ref.fresh &&
+    (ref.classification === "confirmed" || ref.classification === "weak");
+  const stillReference = fieldProvenance(item, "render") === "reference";
+  const unlocked = !!item._renderUnlocked;
+  const locked = canBeReference && stillReference && !unlocked;
+  const showLockControls = canBeReference && (stillReference || unlocked);
+
+  const sel = select([["", "-- vyber --"], ["keep", "ponechat"], ["translate", "přeložit"]],
+                     item.render || "");
+  sel.disabled = locked;
+  // Select je diskrétní volba (ne průběžné psaní) - render() při každé
+  // změně nevadí, na rozdíl od valueField tu není potřeba čekat na blur.
+  sel.onchange = e => {
+    item._renderBefore = e.target.value;
+    item._renderProvenance = "human";   // TEĎ, ne při pouhém odemčení
+    item._renderActive = false;
+    onChange(e.target.value);
+    render();
+  };
+  wrap.appendChild(sel);
+
+  if (canBeReference && "hits" in ref && item.render === "keep") {
+    const evidence = ref.hits
+      ? `${ref.hits}× v dílech ${(ref.books || []).join(", ")}`
+      : "doloženo referencemi";
+    wrap.appendChild(el("p", { class: "note" }, [evidence]));
+  }
+
+  if (showLockControls) {
+    const unlock = el("button", { type: "button" }, ["změnit předvyplněné"]);
+    const revert = el("button", { type: "button" }, ["vrátit zpět předvyplněné"]);
+    unlock.hidden = unlocked;
+    revert.hidden = !unlocked;
+    unlock.onclick = () => { item._renderUnlocked = true; render(); };
+    revert.onclick = () => {
+      item._renderUnlocked = false; item._renderProvenance = "reference";
+      // Stejný důvod jako u valueField - jinak by tlačítko scoutova návrhu
+      // po dalším odemčení ukazovalo "zpět" ze starého cyklu.
+      item._renderActive = false;
+      onChange("keep");
+      render();
+    };
+    wrap.appendChild(unlock); wrap.appendChild(revert);
+  }
+
+  if (item.scout_suggestion) {
+    const row = el("p", { class: "note" }, [`návrh scouta: ${item.scout_suggestion}  `]);
+    const use = el("button", { type: "button" }, [item._renderActive ? "zpět" : "použít návrh"]);
+    use.disabled = locked;
+    use.onclick = () => {
+      if (use.textContent === "použít návrh") {
+        item._renderBefore = item.render || "";
+        item._renderActive = true;
+        onChange(item.scout_suggestion);
+      } else {
+        item._renderActive = false;
+        onChange(item._renderBefore || "");
+      }
+      render();
+    };
+    row.appendChild(use);
+    wrap.appendChild(row);
+  }
+  return wrap;
+}
+
+// "přijmout všechny scoutovy návrhy" - jedno vědomé rozhodnutí místo desítek
+// nevědomých. Nepřepíše ručně vyplněná ani doložená (provenance="reference")
+// pole. U postav zapisuje do `render`, u míst/termínů do `cz`. Vrací seznam
+// SKUTEČNĚ změněných polí (ne jen počet), aby šlo vrátit zpět přesně JEN je -
+// jinak by hromadná akce porušila zásadu, že se původní hodnota neztratí.
+//
+// "Zpět" u dávky se řídí ŽIVOU shodou hodnoty s `applied` (viz
+// `pendingAcceptAllChanges`), ne odstraněním záznamu při první odchylce.
+// Vědomé rozhodnutí, ne přehlédnutí: čistě "smaž záznam při jakékoli další
+// úpravě" (dřívější verze) je jednosměrné - scénář "hromadně přijmout →
+// použít individuální návrh na tomtéž poli → vrátit TEN návrh zpět (pole se
+// tím vrátí přesně na hromadně přijatou hodnotu) → vrátit zpět celou dávku"
+// by ztratil možnost vrátit dávku už ve druhém kroku, přestože se pole ve
+// třetím kroku samo vrátilo tam, kde dávka skončila. Živá shoda tohle umí;
+// cenou je, že nezávislá ruční hodnota, která by SHODOU OKOLNOSTÍ vyšla
+// stejně jako návrh, by se dávkovým "zpět" taky vrátila na `before` - to je
+// vědomě přijatý, výrazně méně pravděpodobný kompromis oproti ztrátě
+// funkčního "zpět" v běžném use-then-revert cyklu popsaném výše.
+let lastAcceptAllChanges = null;
+
+function pendingAcceptAllChanges() {
+  return (lastAcceptAllChanges || []).filter(
+    c => data[c.section][c.i][c.field] === c.applied);
+}
+
+function acceptAllScoutSuggestions() {
+  const changes = [];
+  (data.characters || []).forEach((c, i) => {
+    if (fieldProvenance(c, "render") === "reference" || c.render || !c.scout_suggestion) return;
+    changes.push({ section: "characters", i, field: "render",
+                  before: c.render || "", applied: c.scout_suggestion });
+    data.characters[i].render = c.scout_suggestion;
+    data.characters[i]._renderProvenance = "human";
+  });
+  ["places", "terms"].forEach(sec => {
+    (data[sec] || []).forEach((item, i) => {
+      if (fieldProvenance(item, "cz") === "reference" || (item.cz || "").trim()
+          || !item.scout_suggestion) return;
+      changes.push({ section: sec, i, field: "cz",
+                    before: item.cz || "", applied: item.scout_suggestion });
+      data[sec][i].cz = item.scout_suggestion;
+      data[sec][i]._czProvenance = "human";
+    });
+  });
+  lastAcceptAllChanges = changes;
+  return changes.length;
+}
+
+function undoAcceptAllScoutSuggestions() {
+  // Vrátí jen pole, která pořád drží hodnotu, kterou dávka nastavila - viz
+  // pendingAcceptAllChanges().
+  pendingAcceptAllChanges().forEach(c => {
+    const item = data[c.section][c.i];
+    item[c.field] = c.before;
+    // Bulk-undo mění hodnotu MIMO cestu tlačítka jednotlivého návrhu - jeho
+    // stav ("zpět" aktivní, `_*Before` k čemu se vracet) by jinak dál
+    // ukazoval na hodnotu, kterou bulk-undo právě zrušil. Bez vyčištění by
+    // klik na zdánlivě nevinné "zpět" u návrhu tiše obnovil to, co uživatel
+    // právě vrátil zpět dávkou (viz Task 12 checklist krok 5).
+    if (c.field === "cz") item._czActiveKey = null;
+    else if (c.field === "render") item._renderActive = false;
+  });
+  lastAcceptAllChanges = null;
+}
+
+// Textový popisek vedle pole - odlišuje nečerstvý nález (žádné číslo z něj
+// nesmí vypadat jako aktuální důkaz) a `not_attested` (slabý signál, ne
+// vyvrácení - "model se plete" by bylo silnější tvrzení, než na jaké má
+// stupeň 1 nárok).
+function classificationNote(item) {
+  const ref = item.reference;
+  if (!ref) return null;                    // žádný nález vůbec
+  // Nečerstvý blok nese JEN {fresh: false}, žádné `classification` - proto
+  // `ref.fresh === false` (přítomnost bloku, ale neaktuální) MUSÍ být PRVNÍ
+  // kontrola. Kdyby byla druhá za "chybí classification", vrátila by null
+  // dřív, než se vůbec podívá na fresh, a stale poznámka by se nezobrazila.
+  if (ref.fresh === false) return "nález z jiného běhu (zastaralé - spusť `reference` znovu)";
+  if (!ref.classification) return null;
+  if (ref.classification === "not_attested")
+    return "model navrhl, ale v tomto přesném tvaru nedoloženo (slabý signál, ne vyvrácení)";
+  return null;
+}
+
+// NFC normalizace jako textnorm.normalize_key na backendu (bez plného
+// ekvivalentu Python casefold() - toLowerCase() stačí pro účel varování,
+// které je jen upozornění, ne blokující kontrola).
+function normKey(s) { return (s || "").normalize("NFC").trim().toLowerCase(); }
+
+// Živá obdoba kontroly v glossary._seed_one nad obsahem FORMULÁŘE (ne DB):
+// varuje, koliduje-li povrch jedné položky s aliasem jiné. Varování, ne
+// chyba - o tom, jde-li o tutéž entitu, rozhoduje člověk.
+function aliasCollisionWarnings() {
+  const NAME_KEY = { characters: "name_en", places: "name_en", terms: "term_en" };
+  // Pole vlastníků na klíč, ne jeden - poslední zápis by jinak přepsal
+  // dřívějšího. Kdyby "Foo" mělo samo sebe jako alias (autorská nepřesnost)
+  // a "Bar" mělo alias "Foo" taky, přepsání by skrylo kolizi s "Bar" za
+  // sebeodkaz "Foo" na sebe sama.
+  const owners = {};
+  ["characters", "places", "terms"].forEach(sec => {
+    (data[sec] || []).forEach(item => {
+      (item.aliases || []).forEach(a => {
+        const key = normKey(a);
+        if (!key) return;
+        (owners[key] = owners[key] || []).push(`${sec}/${item[NAME_KEY[sec]]}`);
+      });
+    });
+  });
+  const warnings = {};
+  ["characters", "places", "terms"].forEach(sec => {
+    (data[sec] || []).forEach((item, i) => {
+      const name = item[NAME_KEY[sec]] || "";
+      const self = `${sec}/${name}`;
+      const others = [...new Set(owners[normKey(name)] || [])].filter(o => o !== self);
+      if (others.length) {
+        warnings[`${sec}/${i}`] =
+          `povrch je zároveň alias položky ${others.join(", ")} - stejná entita, nebo jiná?`;
+      }
+    });
+  });
+  return warnings;
+}
+
+// Tabulka rozdělená na "potvrzeno referencemi" (sbalené, s počtem) a zbytek -
+// `weak` zůstává rozbalené s důkazem (o to se stará valueField/renderField
+// samo), jen `confirmed` má vlastní důvod být schovaný: je jich nejvíc a
+// nepotřebují kontrolu stejně nutně jako to, co doložené není.
+function splitConfirmed(items) {
+  const confirmed = [], rest = [];
+  items.forEach((item, i) => {
+    const ref = item.reference || {};
+    (ref.fresh && ref.classification === "confirmed" ? confirmed : rest).push([item, i]);
+  });
+  return { confirmed, rest };
+}
+
+function buildRowsInto(table, pairs, warnings, sec, rowBuilder) {
+  pairs.forEach(([item, i]) => {
+    const note = [item.note, classificationNote(item), warnings[`${sec}/${i}`]]
+      .filter(Boolean).join(" - ");
+    table.appendChild(rowBuilder(item, i, note));
+  });
+}
+
 function render() {
   const app = document.getElementById("app");
   app.innerHTML = "";
@@ -76,21 +435,14 @@ function render() {
       box.appendChild(el("p", {}, [`${md.kind}: ${md.question} (${md.scope_key || ""})`]));
 
       if (md.kind === "relationship") {
-        // Volný text by server odmítl - address smí být jen tyka/vyka.
-        const pre = (md.default || "").toLowerCase();
-        if (!md.answer) {
-          data.must_decide[i].answer =
-            pre.includes("tyka") || pre.includes("tyká") ? "tyka"
-            : pre.includes("vyka") || pre.includes("vyká") ? "vyka" : "";
-        }
+        // Roletka začíná PRÁZDNÁ ("-- vyber --") - scoutův návrh se ukazuje
+        // jen jako text pod ní (viz `if (md.default)` níž), nepředvyplňuje se.
+        // Dřívější verze sem tiše kopírovala md.default, což spec zakazuje.
         const sel = select([["", "-- vyber --"], ["tyka", "tykají si"], ["vyka", "vykají si"]],
-                           data.must_decide[i].answer);
+                           md.answer || "");
         sel.onchange = e => data.must_decide[i].answer = e.target.value;
         box.appendChild(sel);
       } else {
-        // Schválně NEpředvyplňujeme scoutovým návrhem: u termínů a jmen se
-        // odpověď zapíše do glosáře jako český tvar, a návrhy jsou často věty
-        // ("použít pouze Listens-to-Wind"). Odkliknutím by ses zanesl nesmysl.
         const inp = el("input", { type: "text", value: md.answer || "" });
         inp.oninput = e => data.must_decide[i].answer = e.target.value;
         box.appendChild(inp);
@@ -104,35 +456,103 @@ function render() {
     app.appendChild(box);
   }
 
-  const chars = el("table");
-  chars.appendChild(el("tr", {}, [el("th", {}, ["Jméno"]), el("th", {}, ["Aliasy"]),
-    el("th", {}, ["Co s ním"]), el("th", {}, ["Česky"]), el("th", {}, ["Poznámka"])]));
-  (data.characters || []).forEach((c, i) => {
-    const sel = select([["keep", "ponechat"], ["translate", "přeložit"]], c.render || "keep");
-    sel.onchange = e => data.characters[i].render = e.target.value;
-    const cz = el("input", { type: "text", value: c.cz || "" });
-    cz.oninput = e => data.characters[i].cz = e.target.value;
+  // Živý přepočet HNED na začátku render()u - má-li dávka nula polí, která
+  // ještě drží svou hodnotu (uživatel je všechna mezitím jinak změnil),
+  // není co vracet a nesmí to blokovat další "přijmout všechny" navždy.
+  if (lastAcceptAllChanges && !pendingAcceptAllChanges().length) lastAcceptAllChanges = null;
+
+  const acceptAll = el("button", { type: "button" }, ["přijmout všechny scoutovy návrhy"]);
+  // Dokud čeká nevyřízené "zpět" z předchozího přijetí, další spuštění je
+  // zakázané - jinak by druhé kliknutí přepsalo lastAcceptAllChanges a první
+  // dávku by nešlo vrátit.
+  acceptAll.disabled = !!lastAcceptAllChanges;
+  acceptAll.onclick = () => {
+    const n = acceptAllScoutSuggestions();
+    render();
+    document.getElementById("errors").textContent = n
+      ? `Přijato ${n} návrhů - zkontroluj a ulož.` : "Nic k přijetí (vše doložené, ruční, nebo bez návrhu).";
+  };
+  app.appendChild(acceptAll);
+  // "Zpět" u hromadné akce vrátí jen pole, která PORÁD drží hodnotu, kterou
+  // dávka nastavila (viz pendingAcceptAllChanges) - počet v popisku i
+  // viditelnost tlačítka se řídí týmž živým výpočtem, ne původní velikostí
+  // dávky, jinak by popisek lhal o tom, co "zpět" doopravdy vrátí.
+  const pending = pendingAcceptAllChanges();
+  if (pending.length) {
+    const undoAll = el("button", { type: "button" },
+      [`vrátit zpět přijetí (${pending.length})`]);
+    undoAll.onclick = () => { undoAcceptAllScoutSuggestions(); render(); };
+    app.appendChild(undoAll);
+  }
+
+  const warnings = aliasCollisionWarnings();
+
+  function charRow(c, i, note) {
+    const renderCell = renderField(c, v => {
+      data.characters[i].render = v;
+    });
+    // U postavy je scout_suggestion "keep"/"translate" (řeší renderField
+    // výše), ne text pro jméno - proto jen lexicographer_suggestion.
+    const cz = valueField(c, v => {
+      data.characters[i].cz = v;
+    }, ["lexicographer_suggestion"]);
     const al = el("input", { type: "text", value: (c.aliases || []).join(", ") });
     al.oninput = e => data.characters[i].aliases =
       e.target.value.split(",").map(s => s.trim()).filter(Boolean);
-    chars.appendChild(el("tr", {}, [el("td", {}, [c.name_en]), el("td", {}, [al]),
-      el("td", {}, [sel]), el("td", {}, [cz]),
-      el("td", { class: "note" }, [c.note || ""])]));
-  });
-  app.appendChild(section("Postavy", chars));
+    // aliasCollisionWarnings() se počítá jen jednou na začátku render() -
+    // živě po každém stisku klávesy by to rušilo psaní (kurzor, focus), na
+    // konci editace (blur) se ale musí přepočítat, jinak by nová kolize
+    // vzniklá právě touhle úpravou nebyla vidět před uložením. setTimeout(0)
+    // ze stejného důvodu jako u valueField - blur při kliknutí na sousední
+    // tlačítko nesmí smazat cíl kliknutí z DOM dřív, než klik doběhne.
+    al.onblur = () => setTimeout(() => render(), 0);
+    return el("tr", {}, [el("td", {}, [c.name_en]), el("td", {}, [al]),
+      el("td", {}, [renderCell]), el("td", {}, [cz]), el("td", { class: "note" }, [note])]);
+  }
+
+  function charHeader() {
+    return el("tr", {}, [el("th", {}, ["Jméno"]), el("th", {}, ["Aliasy"]),
+      el("th", {}, ["Co s ním"]), el("th", {}, ["Česky"]), el("th", {}, ["Poznámka"])]);
+  }
+
+  const { confirmed: charsConfirmed, rest: charsRest } = splitConfirmed(data.characters || []);
+  if (charsConfirmed.length) {
+    const t = el("table"); t.appendChild(charHeader());
+    buildRowsInto(t, charsConfirmed, warnings, "characters", charRow);
+    const details = el("details", {}, []);
+    details.appendChild(el("summary", {}, [`Potvrzeno referencemi (${charsConfirmed.length})`]));
+    details.appendChild(t);
+    app.appendChild(section("Postavy", details));
+  }
+  const charsRestTable = el("table"); charsRestTable.appendChild(charHeader());
+  buildRowsInto(charsRestTable, charsRest, warnings, "characters", charRow);
+  app.appendChild(section(charsConfirmed.length ? "Postavy (ke kontrole)" : "Postavy", charsRestTable));
 
   [["places", "name_en", "Místa"], ["terms", "term_en", "Termíny"]].forEach(
     ([key, nameKey, title]) => {
-      const t = el("table");
-      t.appendChild(el("tr", {}, [el("th", {}, ["Originál"]), el("th", {}, ["Česky"]),
-        el("th", {}, ["Poznámka"])]));
-      (data[key] || []).forEach((item, i) => {
-        const cz = el("input", { type: "text", value: item.cz || "" });
-        cz.oninput = e => data[key][i].cz = e.target.value;
-        t.appendChild(el("tr", {}, [el("td", {}, [item[nameKey]]), el("td", {}, [cz]),
-          el("td", { class: "note" }, [item.note || ""])]));
-      });
-      app.appendChild(section(title, t));
+      function row(item, i, note) {
+        const cz = valueField(item, v => {
+          data[key][i].cz = v;
+        });
+        return el("tr", {}, [el("td", {}, [item[nameKey]]), el("td", {}, [cz]),
+          el("td", { class: "note" }, [note])]);
+      }
+      function header() {
+        return el("tr", {}, [el("th", {}, ["Originál"]), el("th", {}, ["Česky"]),
+          el("th", {}, ["Poznámka"])]);
+      }
+      const { confirmed, rest } = splitConfirmed(data[key] || []);
+      if (confirmed.length) {
+        const t = el("table"); t.appendChild(header());
+        buildRowsInto(t, confirmed, warnings, key, row);
+        const details = el("details", {}, []);
+        details.appendChild(el("summary", {}, [`Potvrzeno referencemi (${confirmed.length})`]));
+        details.appendChild(t);
+        app.appendChild(section(title, details));
+      }
+      const restTable = el("table"); restTable.appendChild(header());
+      buildRowsInto(restTable, rest, warnings, key, row);
+      app.appendChild(section(confirmed.length ? `${title} (ke kontrole)` : title, restTable));
     });
 
   const rels = el("table");
@@ -145,12 +565,29 @@ function render() {
     rels.appendChild(el("tr", {}, [el("td", {}, [r.a]), el("td", {}, [r.b]),
       el("td", {}, [sel])]));
   });
-  const add = el("button", {}, ["Přidej dvojici"]);
+  const add = el("button", { type: "button" }, ["Přidej dvojici"]);
   add.onclick = () => {
     const a = prompt("Jméno A"); const b = prompt("Jméno B");
-    if (a && b) { data.relationships.push({ a, b, address: "vyka" }); render(); }
+    if (a && b) {
+      data.relationships.push({ a, b, address: "vyka" });
+      // Nová dvojice se přidává s výchozím "vyka", ale nikdo ho nezkontroloval -
+      // ponechané zaškrtnutí by ho tiše prohlásilo za zkontrolované, ačkoli
+      // je to jen defaultní hodnota. Zaškrtnutí se týká VŠECH dvojic, takže
+      // přidáním nové musí padnout.
+      data.relationships_reviewed = false;
+      render();
+    }
   };
   const relWrap = el("div"); relWrap.appendChild(rels); relWrap.appendChild(add);
+  // Potvrzení, že tykání/vykání bylo zkontrolováno - server ho vyžaduje,
+  // jakmile sekce vztahů není prázdná (viz _check_relationships_reviewed).
+  const reviewedLabel = el("label", {}, []);
+  const reviewedBox = el("input", { type: "checkbox" });
+  reviewedBox.checked = !!data.relationships_reviewed;
+  reviewedBox.onchange = e => data.relationships_reviewed = e.target.checked;
+  reviewedLabel.appendChild(reviewedBox);
+  reviewedLabel.appendChild(document.createTextNode(" zkontroloval/a jsem tykání/vykání u všech dvojic"));
+  relWrap.appendChild(el("p", {}, [reviewedLabel]));
   app.appendChild(section("Vztahy (tykání/vykání)", relWrap));
 
   const style = el("textarea", {}, [data.style || ""]);
@@ -159,7 +596,11 @@ function render() {
   app.appendChild(section("Styl", style));
 }
 
-fetch("/api/guide").then(r => r.json()).then(d => { data = d; render(); });
+fetch("/api/guide").then(r => r.json()).then(d => {
+  data = d;
+  if (data.relationships_reviewed === undefined) data.relationships_reviewed = false;
+  render();
+});
 
 document.getElementById("save").onclick = () => {
   document.getElementById("errors").textContent = "";
