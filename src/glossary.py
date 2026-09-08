@@ -11,7 +11,7 @@ z `term_mentions` držely.
 import json
 import re
 
-from src import state
+from src import state, textnorm
 
 
 def slugify(text: str) -> str:
@@ -121,16 +121,32 @@ def add_accepted_alt(db_path: str, term_id: str, cz_form: str) -> None:
 
 
 def _seed_one(conn, canonical_en: str, cz: str, type_: str,
-              aliases: list, note: str) -> None:
-    """Jeden řádek návodu → glosář. Párování podle povrchu, approved chráněný."""
-    existing = None
-    needle = canonical_en.strip().lower()
-    for r in conn.execute("SELECT term_id,canonical_en,aliases,status FROM glossary").fetchall():
-        surfaces = [(r["canonical_en"] or "").strip().lower()]
-        surfaces += [(a or "").strip().lower() for a in json.loads(r["aliases"] or "[]")]
-        if needle in surfaces:
-            existing = r
+              aliases: list, note: str):
+    """Vrací dict konfliktu, nebo None. Řádek nalezený JEN přes alias se
+    nepřepíše, liší-li se příchozí canonical_en - jinak by seed položky `Billy`
+    přepsal kanonický tvar řádku `Billy Borden`, který ji má mezi aliasy."""
+    existing, matched_by_canonical = None, False
+    # textnorm.normalize_key (NFC + casefold), ne .strip().lower() - identita
+    # v celém plánu (Task 9 merge, Task 4 hledání) stojí na normalize_key;
+    # `.lower()` samotné nesloučí kanonicky stejný, ale jinak zapsaný Unicode
+    # text (NFC vs. NFD), takže by guard vyrobil duplicitní řádek místo toho,
+    # aby kolizi odhalil.
+    needle = textnorm.normalize_key(canonical_en)
+    rows = conn.execute("SELECT term_id,canonical_en,aliases,status FROM glossary").fetchall()
+    # Dva průchody schválně: kanonická shoda má vždy přednost před aliasovou,
+    # bez ohledu na pořadí řádků v tabulce. Jeden průchod s `break` na první
+    # shodě by mohl narazit na aliasovou shodu dřív, než na kanonickou o pár
+    # řádků dál, a nesprávně tvrdit "nalezeno jen přes alias".
+    for r in rows:
+        if textnorm.normalize_key(r["canonical_en"] or "") == needle:
+            existing, matched_by_canonical = r, True
             break
+    if existing is None:
+        for r in rows:
+            if needle in [textnorm.normalize_key(a or "")
+                          for a in json.loads(r["aliases"] or "[]")]:
+                existing = r
+                break
 
     if existing is None:
         tid = _free_term_id(conn, "term_" + slugify(canonical_en))
@@ -138,7 +154,13 @@ def _seed_one(conn, canonical_en: str, cz: str, type_: str,
             "INSERT INTO glossary (term_id,canonical_en,aliases,cz,accepted_alt,"
             "note,type,status) VALUES (?,?,?,?,'[]',?,?,'seeded')",
             (tid, canonical_en, json.dumps(aliases, ensure_ascii=False), cz, note, type_))
-        return
+        return None
+
+    if not matched_by_canonical and \
+            textnorm.normalize_key(existing["canonical_en"] or "") != needle:
+        return {"incoming": canonical_en,
+                "existing_term_id": existing["term_id"],
+                "existing_canonical": existing["canonical_en"]}
 
     merged = json.loads(existing["aliases"] or "[]")
     for a in aliases:
@@ -148,36 +170,46 @@ def _seed_one(conn, canonical_en: str, cz: str, type_: str,
         # Lidské rozhodnutí přes `answer` vyhrává - měníme jen aliasy.
         conn.execute("UPDATE glossary SET aliases=? WHERE term_id=?",
                      (json.dumps(merged, ensure_ascii=False), existing["term_id"]))
-        return
+        return None
     conn.execute(
         "UPDATE glossary SET canonical_en=?, aliases=?, cz=?, note=?, type=?, "
         "status='seeded', updated_at=CURRENT_TIMESTAMP WHERE term_id=?",
         (canonical_en, json.dumps(merged, ensure_ascii=False), cz, note, type_,
          existing["term_id"]))
+    return None
 
 
-def seed_from_guide(db_path: str, guide: dict) -> None:
-    """Naseeduje glosář z potvrzeného návodu. Idempotentní, approved nepřepisuje."""
+def seed_from_guide(db_path: str, guide: dict) -> list:
+    """Naseeduje glosář z potvrzeného návodu. Vrací seznam konfliktů, které
+    CLI vypíše - nic se přitom nepřepíše."""
+    conflicts = []
     with state.connect(db_path) as conn:
         for ch in guide.get("characters", []) or []:
             name = ch.get("name_en") or ""
             if not name:
                 continue
             cz = name if ch.get("render", "keep") == "keep" else (ch.get("cz") or name)
-            _seed_one(conn, name, cz, "name", list(ch.get("aliases") or []),
-                      ch.get("note") or "")
+            c = _seed_one(conn, name, cz, "name", list(ch.get("aliases") or []),
+                          ch.get("note") or "")
+            if c:
+                conflicts.append(c)
         for pl in guide.get("places", []) or []:
             name = pl.get("name_en") or ""
             if not name:
                 continue
-            _seed_one(conn, name, pl.get("cz") or name, "place",
-                      list(pl.get("aliases") or []), pl.get("note") or "")
+            c = _seed_one(conn, name, pl.get("cz") or name, "place",
+                          list(pl.get("aliases") or []), pl.get("note") or "")
+            if c:
+                conflicts.append(c)
         for t in guide.get("terms", []) or []:
             name = t.get("term_en") or ""
             if not name:
                 continue
-            _seed_one(conn, name, t.get("cz") or name, "term",
-                      list(t.get("aliases") or []), t.get("note") or "")
+            c = _seed_one(conn, name, t.get("cz") or name, "term",
+                          list(t.get("aliases") or []), t.get("note") or "")
+            if c:
+                conflicts.append(c)
+    return conflicts
 
 
 def as_prompt_block(db_path: str) -> str:
