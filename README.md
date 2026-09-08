@@ -21,6 +21,8 @@ Python 3.11+.
 ```bash
 python main.py init kniha.epub    # kniha → kapitoly do DB (status pending)
 python main.py scan               # scout projede knihu → data/guide.draft.json
+python tools/check_draft.py                   # zkontroluj draft (report-only)
+python main.py reference --dir "<cesta k referencím>"   # vytěž terminologii
 python main.py review             # web UI: potvrdíš/upravíš návod → data/guide.json
 python main.py run                # překladová smyčka přes kapitoly
 python main.py questions          # otázky nadhozené během běhu
@@ -36,6 +38,19 @@ Užitečné varianty:
 - `run --retry-flagged [IDX...]` - vrátí označené kapitoly do fronty (vynuluje kola revize)
 - `export --only-done` - jen čisté kapitoly (vynechané stejně vypíše na stdout)
 - `answer 7 "Bílá rada | Bílé rady"` - první tvar je kanonický, další jsou schválené alternativy
+
+## Terminologie z předchozích dílů
+
+Máš-li předchozí díly série v EN i CZ, `reference` z nich vytěží zavedené
+překlady. Složka musí mít podsložky `EN/` a `CZ/` a soubory číslované dílem.
+
+Nejdřív `tools/check_draft.py` - vypíše, co je ve scoutově draftu rozbité
+(výčty místo jednoho termínu, duplicitní entity, otázky odkazující nikam).
+Nic nemění; opravíš to ručně v `data/guide.draft.json`.
+
+Ve formuláři pak: **předvyplněné je jen to, co je doložené** v profesionálním
+překladu, a vedle stojí důkaz („112× v 8 dílech"). Odhady modelu čekají vedle
+prázdného pole na tlačítko „použít návrh".
 
 ## Stavy kapitol
 

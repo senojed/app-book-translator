@@ -5,6 +5,20 @@
       Zapsat aktuální hodnoty do `config.py` (MODEL_*, PRICE_*_PER_MTOK, MAX_TOKENS_*).
 - [ ] `python main.py init <kniha.epub>` - sedí počet kapitol?
 - [ ] `python main.py scan` - vejde se do 1 volání, nebo hlásí truncated → `scan --chunked`?
+
+## Těžba z referencí
+
+- [ ] `python tools/check_draft.py` - kolik vad? Oprav je v `guide.draft.json`.
+- [ ] `python main.py reference --dir <cesta>` - kolik `confirmed` / `weak` /
+      `evidence_only` / `proposed` / `not_attested` / `unresolved`?
+- [ ] Vysoký počet `not_attested` může znamenat, že přesná shoda je moc přísná
+      a skloňování by se tolerovat mělo. **To je hlavní věc, kterou má první běh
+      změřit.**
+- [ ] Sedí prahy `REFERENCE_MIN_HITS` / `REFERENCE_MIN_BOOKS`, nebo je většina nálezů
+      těsně pod nimi?
+- [ ] Kolik návrhů prošlo výskytem, ale spadlo na souvýskytu?
+- [ ] Namátkou zkontroluj pět `confirmed` položek - je důkaz opravdu důkaz?
+
 - [ ] `python main.py review` - dá se návod pohodlně projít? Ulož.
 - [ ] Zúžit `chapters` v DB na 2-3 (ručně `DELETE FROM chapters WHERE idx > 3`).
 - [ ] `python main.py run` - projde? Kolik `guess` otázek / `candidate` termínů na kapitolu?
