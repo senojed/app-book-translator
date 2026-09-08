@@ -181,3 +181,103 @@ def load_cache(path: str, root: str):
     if manifest != current_manifest:
         return None
     return Corpus(cz=cz_out, en=en_out, manifest=manifest, source_root=data["source_root"])
+
+
+_SENTENCE_END = ".!?…"
+
+
+@dataclass
+class Evidence:
+    hits: int = 0
+    books: list = field(default_factory=list)
+    per_form: dict = field(default_factory=dict)
+    matched_forms: list = field(default_factory=list)
+    confirm_eligible: bool = False
+
+
+def _word_pattern(surface: str, ignore_case: bool):
+    """Hranice slova přes lookaround, ne \\b - aby pomlčka a apostrof uvnitř
+    povrchu zůstaly součástí dotazu (`Listens-to-Wind`, `Za-Lord`)."""
+    flags = re.UNICODE | (re.IGNORECASE if ignore_case else 0)
+    return re.compile(r"(?<!\w)" + re.escape(surface) + r"(?!\w)", flags)
+
+
+def _at_sentence_start(text: str, pos: int) -> bool:
+    """Začátek věty = pozice 0, první nebílý znak PO interpunkci následované
+    bílým znakem (`.`/`!`/`?`/`…` s mezerou za sebou), nebo znak po odděl-
+    ovači dokumentů. Bez požadavku na mezeru za interpunkcí by "x.Mab" (bez
+    mezery, typicky překlep) prošlo jako začátek věty, ačkoli gramaticky
+    začátkem není."""
+    i = pos - 1
+    saw_space = False
+    while i >= 0 and text[i].isspace():
+        saw_space = True
+        i -= 1
+    if i < 0:
+        return True
+    if text[i] == "\x00":
+        return True
+    return saw_space and text[i] in _SENTENCE_END
+
+
+def count_en_surface(corpus: Corpus, surface: str, aliases=(), side: str = "cz") -> Evidence:
+    """Hledá anglický povrch (a jeho aliasy) v textu dané strany korpusu.
+
+    Nález sám o sobě neznamená, že překladatel povrch ponechal - viz
+    `confirm_eligible`. Prahy pro `confirmed` se počítají výhradně
+    z primárního tvaru, aliasy jsou doplňkový důkaz pro člověka.
+    """
+    ev = Evidence()
+    surface = unicodedata.normalize("NFC", (surface or "").strip())
+    if not surface:
+        return ev
+    texts = corpus.cz if side == "cz" else corpus.en
+    # Korpus je uložen po NFC (viz _load_side) - dotaz musí projít stejnou
+    # normalizací, jinak by kanonicky stejný, ale jinak zapsaný text unikl.
+    forms = [surface] + [unicodedata.normalize("NFC", a.strip())
+                         for a in (aliases or []) if a and a.strip()]
+    # Vlastní jméno = první znak je VELKÉ písmeno, explicitně (ne "není malé"
+    # - jinak by povrch začínající číslicí nebo interpunkcí prošel jako
+    # "vlastní jméno", ačkoli žádné písmeno velké není).
+    lowercase_surface = not surface[:1].isupper()
+
+    spans_by_book, books_with_hit = {}, set()
+    for form in forms:
+        per = {"hits": 0, "books": [], "case_exact": False}
+        if len(form.strip()) < 3:
+            ev.per_form[form] = per          # 1-2 znaky se nehledají vůbec
+            continue
+        pattern = _word_pattern(form, ignore_case=not lowercase_surface)
+        for num, text in texts.items():
+            found = list(pattern.finditer(text))
+            if not found:
+                continue
+            per["hits"] += len(found)
+            per["books"].append(num)
+            books_with_hit.add(num)
+            spans_by_book.setdefault(num, []).extend((m.start(), m.end()) for m in found)
+            for m in found:
+                exact = m.group(0) == form
+                if exact:
+                    per["case_exact"] = True
+                if form == surface and exact and not lowercase_surface:
+                    if len(surface) >= 5 or not _at_sentence_start(text, m.start()):
+                        ev.confirm_eligible = True
+        ev.per_form[form] = per
+        if per["hits"]:
+            ev.matched_forms.append(form)
+
+    # hits = sjednocení rozsahů, ne součet: `Dresden` uvnitř `Harry Dresden`
+    # je jeden výskyt, ne dva
+    total = 0
+    for num, spans in spans_by_book.items():
+        merged = []
+        for start, end in sorted(spans):
+            if merged and start < merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        total += len(merged)
+    ev.hits = total
+    ev.books = sorted(books_with_hit)
+    return ev
