@@ -65,3 +65,20 @@ CHAPTER_SPLIT_WORD_THRESHOLD = 3500
 CROSS_REF_EVERY_N = 10
 SCOUT_CHUNK_WORD_LIMIT = 40000
 MAX_SPEND_USD = 15.0
+
+# --- těžba terminologie z profesionálních překladů ---------------------------
+
+# Kořen se složkami EN/ a CZ/. Prázdné = nutno zadat `reference --dir CESTA`.
+REFERENCE_DIR = ""
+REFERENCE_PATH = os.path.join(DATA_DIR, "reference.json")
+REFERENCE_CACHE_PATH = os.path.join(DATA_DIR, "reference_corpus.json")
+
+MODEL_LEXICOGRAPHER = "claude-sonnet-5"
+MAX_TOKENS_LEXICOGRAPHER = 4000
+REFERENCE_BATCH_SIZE = 30
+
+# Prahy jsou počáteční odhady bez měření; první běh je má potvrdit nebo posunout.
+REFERENCE_MIN_HITS = 5          # výskytů pro `confirmed`
+REFERENCE_MIN_BOOKS = 2         # dílů pro `confirmed`
+REFERENCE_MIN_CORPUS_BOOKS = 3  # pod tímhle se `confirmed` netvrdí vůbec
+REFERENCE_COOCCUR_RATIO = 0.5   # podíl dílů, kde musí sedět souvýskyt
