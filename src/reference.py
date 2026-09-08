@@ -281,3 +281,44 @@ def count_en_surface(corpus: Corpus, surface: str, aliases=(), side: str = "cz")
     ev.hits = total
     ev.books = sorted(books_with_hit)
     return ev
+
+
+def count_cz_form(corpus: Corpus, form: str) -> Evidence:
+    """Doložení navrženého českého tvaru. PŘESNÁ shoda celého slova.
+
+    Skloňování se netoleruje schválně: stupeň 1 nikdy nic nepředvyplňuje,
+    takže tolerance kupuje málo, zatímco stojí morfologii, kterou tři pokusy
+    nedokázaly napsat správně. `not_attested` proto znamená "v tomto přesném
+    tvaru nedoloženo", ne "model se plete".
+    """
+    ev = Evidence()
+    form = unicodedata.normalize("NFC", (form or "").strip())
+    if not form:
+        return ev
+    pattern = _word_pattern(form, ignore_case=True)
+    books = []
+    for num, text in corpus.cz.items():
+        n = len(pattern.findall(text))
+        if n:
+            ev.hits += n
+            books.append(num)
+    ev.books = sorted(books)
+    if ev.hits:
+        ev.matched_forms = [form]
+        ev.per_form[form] = {"hits": ev.hits, "books": ev.books, "case_exact": False}
+    return ev
+
+
+def books_with_en(corpus: Corpus, surface: str) -> set:
+    """Díly, kde je primární anglický povrch na EN straně.
+
+    Jen primární povrch, ne aliasy: alias typu `sir` nebo `kid` by `E` rozšířil
+    skoro na celý korpus a klasifikaci `proposed` znehodnotil.
+    Žádné délkové omezení ani pravidlo o začátku věty - to je ochrana proti
+    českým homonymům a v anglickém textu nedává smysl.
+    """
+    surface = unicodedata.normalize("NFC", (surface or "").strip())
+    if not surface:
+        return set()
+    pattern = _word_pattern(surface, ignore_case=True)
+    return {num for num, text in corpus.en.items() if pattern.search(text)}
