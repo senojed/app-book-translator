@@ -1,0 +1,40 @@
+## BLOCKING
+
+- **Task 2, kroky 3–5:** Plán pouze reportuje vady, ale nikdy neprovede požadovanou normalizaci skutečného `data/guide.draft.json` ani nevytvoří `data/guide.draft.pre-reference.json`. Chybí také test postpodmínek nad skutečným opraveným draftem. Přidejte explicitní datový krok: záloha, ruční oprava, následný test vyžadující nulový počet vad.
+- **Task 2, krok 3:** `find_issues()` nekontroluje „právě jednu položku“. Duplicitní kanonické názvy v jedné sekci projdou a vytvoří duplicitní `id`. Nekontroluje ani duplicitní vztahy a kanonický tvar vztahového `scope_key`; například `Murphy|Harry` projde, ale `apply_must_decide()` jej nespojí s klíčem `harry|murphy`. Přidejte kontroly násobnosti, unikátnosti vztahů a rovnosti `scope_key == guide.relationship_key(a, b)`.
+- **Task 3, krok 3 / test `test_documents_joined_with_separator_and_without_titles`:** Test proti současnému `ingest.load_book()` neprojde. `Chapter.raw_text` z EPUB obsahuje text `<h1>Ch</h1>`, protože `_load_epub()` jej extrahuje přes `soup.get_text()`. Buď nadpis explicitně odstraňte z korpusového textu, nebo opravte tvrzení a test podle specifikace.
+- **Tasky 3–5:** Specifikace vyžaduje hledání v textu normalizovaném do NFC. Implementace nenormalizuje ani korpus, ani hledané povrchy. Kanonicky ekvivalentní Unicode zápisy se proto nenajdou. Normalizujte text při načtení a všechny dotazy před sestavením regexu; přidejte regresní test s NFC/NFD.
+- **Task 4, krok 1:** `test_document_separator_counts_as_sentence_start` je chybný: oba výskyty `Bob` jsou na začátku věty/dokumentu, takže správný výsledek je `confirm_eligible == False`, ne `True`. Přepište fixture tak, aby zvlášť ověřila výskyt po `DOC_SEP` a kontrolní výskyt uprostřed věty.
+- **Task 4, krok 3:** `_at_sentence_start()` považuje za začátek věty i znak bezprostředně po tečce bez mezery (`x.Mab`). Specifikace vyžaduje interpunkci následovanou bílým znakem. Zachovejte informaci, zda se při zpětném průchodu přeskočila mezera, a testujte obě varianty.
+- **Task 7, krok 3:** Prahy `confirmed` se počítají z `ev0.hits` a `ev0.books`, což je sjednocení primárního povrchu i aliasů. Specifikace vyžaduje výhradně primární tvar. Alias tak může nesprávně zvýšit položku na `confirmed`. Použijte `ev0.per_form[item["surface"]]` pro počet výskytů i knih a přidejte regresní test.
+- **Task 8, krok 3:** `load_reference()` neimplementuje slíbenou validaci schématu. Nekontroluje typy top-level polí ani typy `id`, `hits`, `books`, `per_form`, `source`, `fingerprint` atd. Vadný soubor může projít a následně rozbít frontend. Implementujte úplnou strukturální validaci a testy chybných typů a chybějících top-level polí.
+- **Task 9, kroky 1 a 3:** `_fresh_fp()` ukládá `"corpus": None` a reference používá `source_root="/root"`, zatímco `_is_fresh()` vyžaduje neprázdný aktuální fingerprint rovný uloženému. Všechny testy očekávající čerstvou referenci proto dostanou `fresh=False`. Použijte skutečný dočasný kořen a jeho manifest/fingerprint nebo fingerprint deterministicky monkeypatchujte.
+- **Task 9, krok 3:** Nečerstvá reference stále poskytuje `lexicographer_suggestion` a `classification`. To přímo odporuje specifikaci a umožní přijmout zastaralý návrh. Při `fresh=False` potlačte všechny hodnoty, návrhy, klasifikaci i důkazy; ponechte pouze explicitní poznámku o zastaralém nálezu.
+- **Task 11, krok 4:** Existující `test_must_decide_relationship_routes_and_rejects_invalid_answer` začne selhávat. `apply_must_decide()` vytvoří vztah, následná kontrola vyžaduje `relationships_reviewed=True`, ale helper `_post()` příznak neposílá. Aktualizujte existující test a explicitně určete očekávané chování vztahové otázky.
+- **Task 12, kroky 1–4:** Frontendová implementace je neúplná a v části chybná. `valueField()` není zapojen do existujících tabulek; není vytvořen checkbox `relationships_reviewed`; vztahové `must_decide` se nadále předvyplní z `md.default`; chybí tlačítko a skutečné undo pro „přijmout všechny“; chybí řazení/sbalení `confirmed`, označení `not_attested`, stale stav a varování aliasových kolizí.
+- **Task 12, krok 3:** Hromadná akce zpracovává `characters` stejně jako termíny a zapíše `"keep"`/`"translate"` do `cz` místo do `render`. Jednotlivá postava navíc nemá akci pro přijetí návrhu `render` ani zamčení doloženého `render`. Implementujte oddělenou logiku pro `render` a `cz`.
+- **Task 12, krok 3:** „Zpět“ u návrhu vždy nastaví pole na `""`, takže po přepsání lidské hodnoty ji zničí. Musí obnovit hodnotu zachycenou bezprostředně před použitím návrhu.
+- **Task 12, testy:** Žádný test nespouští JavaScript. Test postavy bude po Tasku 9 procházet i bez jediné změny HTML; ostatní testují pouze server. Přidejte testy čistých JS přechodových funkcí nebo skutečný DOM/browser test pro použití a undo návrhů, zamčení, hromadnou akci, checkbox a serializaci.
+- **Tasky 12 a 14:** Testy očekávají úspěšný POST s prázdným `cz` u termínu, ale současné `server.validate()` jej správně odmítá. `test_unused_suggestion_never_reaches_saved_guide` skončí 422 a soubor nevznikne. Tři E2E testy navíc ponechávají `Nevernever.cz` prázdné. Test bez přijetí má ověřit 422 a nulovou mutaci; úspěšné scénáře musí rozhodnout všechny povinné položky.
+- **Task 14:** Stejně jako Task 9 vytváří fingerprint s `"corpus": None` a `source_root="/root"`, takže reference je vždy nečerstvá. Testy návrhu i `confirmed` nemohou ověřit deklarovanou cestu. Vytvořte skutečně čerstvou referenci.
+
+## IMPORTANT
+
+- **Task 3, krok 3:** `load_cache()` nevaliduje strukturu cache. Platný JSON s chybějícím `cz`, nečíselným klíčem nebo chybným typem vyvolá `KeyError`/`ValueError` místo návratu `None`. Přidejte bezpečnou validaci a test poškozené cache.
+- **Task 3, testy:** Chybí požadovaný test selhání načtení jedné strany páru a kontroly minima až po vyřazení celého dílu. Test nepárovaného souboru tuto větev nepokrývá.
+- **Task 4, krok 3:** „Velké počáteční písmeno“ je implementováno jako „není malé“. Povrch začínající číslicí nebo interpunkcí se tak může stát způsobilým. Použijte explicitní `surface[0].isupper()`.
+- **Task 9, krok 3:** Priorita lidských dat není správně implementována. `g.get("aliases") or d.get("aliases")` znemožní člověku odstranit všechny aliasy; `note` z `guide.json` se ignoruje a u guide-only položek zahodí; provenance postavy vychází jen z `cz`, nikoli z lidského `render`. Použijte kontrolu přítomnosti klíče a field-aware provenienci.
+- **Task 10, krok 3:** `_seed_one()` skončí na prvním aliasovém matchi, i když pozdější řádek odpovídá kanonickým názvem. „Nalezen jen přes alias“ proto nemusí být pravda. Hledejte nejprve všechny kanonické shody a teprve potom aliasy; přidejte test s oběma řádky.
+- **Task 13, krok 3:** Chyby `load_cache()`, `save_cache()`, `load_draft()` a `write_reference()` leží mimo obecný převod na `FatalRunError`. Mohou skončit tracebackem bez požadované CLI diagnostiky. Obalte celý pracovní úsek s výjimkou lifecycle a zachovejte předchozí `reference.json`.
+- **Tasky 7–8:** Interfaces a specifikace slibují `SurfaceItem` a `Finding` jako `TypedDict`, ale uvedená implementace je vůbec nedefinuje. Buď je skutečně přidejte, nebo opravte Interfaces.
+- **Task 14:** Chybí explicitní E2E pokrytí `evidence_only` a `not_attested`, přestože specifikace vyžaduje prokázat, že ani jedna třída nemůže bez lidského rozhodnutí skončit v glosáři.
+
+## NITS
+
+- **Task 1, krok 1:** Test cen kontroluje pouze `PRICE_IN_PER_MTOK`; runtime cost guard vyžaduje také `PRICE_OUT_PER_MTOK`.
+- **Task 2, krok 3:** Kontrola malého počátečního písmene aliasu používá `alias[:1]` před `strip()`, takže alias s úvodní mezerou projde.
+- **Task 8, krok 3:** Atomický zápis používá pevný název `path + ".tmp"`. Bezpečnější je unikátní dočasný soubor ve stejné složce a úklid při selhání.
+
+## VERDICT
+
+CHANGES_NEEDED

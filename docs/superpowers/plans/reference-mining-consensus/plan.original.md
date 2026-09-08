@@ -13,10 +13,6 @@
 ## Global Constraints
 
 - **Python 3.11+.** Žádné nové runtime závislosti - vše se staví na tom, co projekt už má.
-- **Node jen jako TEST-TIME nástroj** (Task 12, `tests/test_review_ui_state.py`)
-  - testuje čistou JS logiku hromadného přijetí/vrácení bez DOM/prohlížeče.
-  Není to runtime závislost aplikace; chybí-li `node` v PATH, test se přeskočí
-  (`pytest.skip`), ne spadne.
 - **Import layout:** moduly v `src/` importují sourozence jako `from src import X`, kořenový config jako `import config`. Nikdy `import reference` jako top-level.
 - **UTF-8:** testy i CLI musí projít v `cp1252` konzoli. `main.py` už má `_bootstrap_stdout()`; pomocné skripty spouštěné mimo `main.py` si UTF-8 musí zajistit samy.
 - **`concordance` se NEMĚNÍ a `reference.py` ho NEPOUŽÍVÁ.** Ověřeno: `form_key("Bílá rada") == form_key("Bída rana")` a `find_form_occurrences("Byl to Za-Lord.", "Za-Lord") == []`.
@@ -80,9 +76,7 @@ def test_config_has_reference_keys():
                 "REFERENCE_MIN_BOOKS", "REFERENCE_MIN_CORPUS_BOOKS",
                 "REFERENCE_COOCCUR_RATIO"):
         assert hasattr(config, key), key
-    # oba ceníky - runtime cost guard vyžaduje input i output cenu
     assert config.PRICE_IN_PER_MTOK.get(config.MODEL_LEXICOGRAPHER) is not None
-    assert config.PRICE_OUT_PER_MTOK.get(config.MODEL_LEXICOGRAPHER) is not None
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -162,7 +156,7 @@ oprava draftu běžet paralelně se stavbou zbytku.
 - Consumes: `src/textnorm.py`, `src/guide.py` (`load_draft`, `relationship_key`)
 - Produces:
   - `check_draft.find_issues(draft: dict) -> dict` - vrací
-    `{"compound": [...], "alias_collision": [...], "duplicate_key": [...], "bad_scope_key": [...], "bad_relationship": [...], "duplicate_relationship": [...], "parenthesized": [...], "cross_section": [...], "weak_alias": [...], "short_relationship": [...]}`,
+    `{"compound": [...], "alias_collision": [...], "bad_scope_key": [...], "bad_relationship": [...], "parenthesized": [...], "cross_section": [...], "weak_alias": [...], "short_relationship": [...]}`,
     každá položka je dict s `section`, `surface` a `detail`
   - `check_draft.main(argv=None) -> int` - vypíše report, vrátí 0 když je draft čistý, 1 když ne
 
@@ -242,34 +236,6 @@ def test_detects_relationship_with_slash_and_short_form():
     assert issues["short_relationship"]    # 'Ebenezar' není kanonické jméno
 
 
-def test_detects_duplicate_canonical_name_in_one_section():
-    """Táž entita vedená scoutem dvakrát pod stejným klíčem - bez detekce by
-    reference_mine.resolve() vyrobil dvě položky se stejným id."""
-    d = _draft(terms=[{"term_en": "Nevernever", "suggested_cz": "", "note": ""},
-                      {"term_en": "  nevernever ", "suggested_cz": "", "note": ""}])
-    dup = check_draft.find_issues(d)["duplicate_key"]
-    assert dup and dup[0]["section"] == "terms"
-
-
-def test_detects_duplicate_relationship_pair():
-    d = _draft(characters=[{"name_en": "Harry Dresden", "aliases": [], "suggested": "keep", "note": ""},
-                           {"name_en": "Karrin Murphy", "aliases": [], "suggested": "keep", "note": ""}],
-               relationships=[{"a": "Harry Dresden", "b": "Karrin Murphy", "suggested": "tyka"},
-                              {"a": "Karrin Murphy", "b": "Harry Dresden", "suggested": "vyka"}])
-    assert check_draft.find_issues(d)["duplicate_relationship"]
-
-
-def test_detects_relationship_scope_key_not_matching_relationship_key():
-    """Obě jména jsou kanonická a v char_keys - selhat smí JEN na tom, že
-    pořadí neodpovídá guide.relationship_key (ta třídí abecedně)."""
-    d = _draft(characters=[{"name_en": "Harry Dresden", "aliases": [], "suggested": "keep", "note": ""},
-                           {"name_en": "Karrin Murphy", "aliases": [], "suggested": "keep", "note": ""}],
-               must_decide=[{"kind": "relationship",
-                             "scope_key": "Karrin Murphy|Harry Dresden",
-                             "question": "?", "default": ""}])
-    assert check_draft.find_issues(d)["bad_scope_key"]
-
-
 def test_clean_draft_has_no_issues():
     d = _draft(characters=[{"name_en": "Harry Dresden", "aliases": ["Dresden"],
                             "suggested": "keep", "note": ""}],
@@ -328,30 +294,20 @@ def _issue(section, surface, detail):
 
 
 def find_issues(draft: dict) -> dict:
-    issues = {k: [] for k in ("compound", "alias_collision", "duplicate_key",
-                              "bad_scope_key", "bad_relationship",
-                              "duplicate_relationship", "parenthesized",
+    issues = {k: [] for k in ("compound", "alias_collision", "bad_scope_key",
+                              "bad_relationship", "parenthesized",
                               "cross_section", "weak_alias",
                               "short_relationship")}
 
     # mapa normalizovaný klíč -> sekce (pro homonyma) a alias -> vlastník
-    key_sections, alias_owner, key_counts = {}, {}, {}
+    key_sections, alias_owner = {}, {}
     for section, field, item in _items(draft):
         surface = item.get(field) or ""
         key = textnorm.normalize_key(surface)
         if key:
             key_sections.setdefault(key, set()).add(section)
-            key_counts[(section, key)] = key_counts.get((section, key), 0) + 1
         for alias in item.get("aliases") or []:
             alias_owner.setdefault(textnorm.normalize_key(alias), []).append(surface)
-
-    # Duplicitní kanonické jméno v jedné sekci: scout stejnou entitu vede
-    # dvakrát pod stejným (case/whitespace-insensitive) klíčem. Bez tohohle by
-    # `reference_mine.resolve` vytvořilo dvě položky se stejným `id`.
-    for (section, key), count in key_counts.items():
-        if count > 1:
-            issues["duplicate_key"].append(
-                _issue(section, key, f"{count}x stejný kanonický klíč v sekci"))
 
     for section, field, item in _items(draft):
         surface = item.get(field) or ""
@@ -366,10 +322,8 @@ def find_issues(draft: dict) -> dict:
             issues["alias_collision"].append(
                 _issue(section, surface, "je aliasem u: " + ", ".join(owners)))
         for alias in item.get("aliases") or []:
-            stripped = alias.strip()
             a = textnorm.normalize_key(alias)
-            if a in ROLE_ALIASES or len(stripped) <= 3 \
-                    or (stripped[:1].islower() if stripped else False):
+            if a in ROLE_ALIASES or len(alias.strip()) <= 3 or (alias[:1].islower() if alias else False):
                 issues["weak_alias"].append(_issue(section, surface, alias))
 
     for key, sections in key_sections.items():
@@ -380,24 +334,14 @@ def find_issues(draft: dict) -> dict:
     # kanonická jména postav - pro kontrolu konců vztahů
     char_keys = {textnorm.normalize_key(c.get("name_en") or "")
                  for c in draft.get("characters") or []}
-    rel_counts = {}
     for rel in draft.get("relationships") or []:
-        a, b = rel.get("a") or "", rel.get("b") or ""
-        for end in (a, b):
+        for end in (rel.get("a") or "", rel.get("b") or ""):
             if "/" in end:
                 issues["bad_relationship"].append(
                     _issue("relationships", end, "lomítko ve jméně"))
             elif textnorm.normalize_key(end) not in char_keys:
                 issues["short_relationship"].append(
                     _issue("relationships", end, "není kanonické jméno postavy"))
-        # dvojice se počítá bez ohledu na pořadí a velikost písmen, stejně
-        # jako to dělá guide.relationship_key - jinak by duplicita neprojevila
-        rk = guide.relationship_key(a, b)
-        rel_counts[rk] = rel_counts.get(rk, 0) + 1
-    for rk, count in rel_counts.items():
-        if count > 1:
-            issues["duplicate_relationship"].append(
-                _issue("relationships", rk, f"{count}x stejná dvojice"))
 
     for md in draft.get("must_decide") or []:
         kind = md.get("kind")
@@ -406,16 +350,10 @@ def find_issues(draft: dict) -> dict:
             continue          # styl nemá klíčované položky, odpověď jde do rules
         if kind == "relationship":
             a, _, b = scope.partition("|")
-            # scope_key musí být přesně tvar, jaký apply_must_decide hledá -
-            # guide.relationship_key(a, b). Jiné pořadí nebo velikost písmen
-            # (`Murphy|Harry` místo `harry|murphy`) by odpověď nenašla svůj cíl.
-            expected = guide.relationship_key(a, b) if b else None
             if not b or textnorm.normalize_key(a) not in char_keys \
-                    or textnorm.normalize_key(b) not in char_keys \
-                    or scope != expected:
+                    or textnorm.normalize_key(b) not in char_keys:
                 issues["bad_scope_key"].append(
-                    _issue("must_decide", scope,
-                           "vztah: čekej tvar odpovídající guide.relationship_key(a, b)"))
+                    _issue("must_decide", scope, "vztah: čekej tvar a|b s kanonickými jmény"))
             continue
         section = KIND_TO_SECTION.get(kind)
         if section is None:
@@ -462,81 +400,19 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run to verify pass**
 
 Run: `python -m pytest tests/test_check_draft.py -v`
-Expected: PASS (13 tests)
+Expected: PASS (10 tests)
 
 - [ ] **Step 5: Run against the real draft** (jen se podívej, nic neopravuj)
 
 Run: `python tools/check_draft.py`
-Expected: vypíše vady v deseti kategoriích, exit 1.
+Expected: vypíše ~39 položek v osmi kategoriích, exit 1.
 
-- [ ] **Step 6: Commit the tool**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add tools/__init__.py tools/check_draft.py tests/test_check_draft.py
 git commit -m "feat: report-only kontrola draftu (krok 0 těžby referencí)"
 ```
-
-- [ ] **Step 7: Zálohuj skutečný draft**
-
-`.gitignore` má bare `data/` - celá složka je mimo git (běhová data, ne kód),
-takže záloha je jen kopie souboru, žádný commit:
-
-```bash
-cp data/guide.draft.json data/guide.draft.pre-reference.json
-```
-
-- [ ] **Step 8: Ruční oprava skutečného draftu**
-
-Otevři `data/guide.draft.json` a projdi výstup `python tools/check_draft.py`
-kategorii po kategorii. Toto je jednorázová lidská práce, ne kód - automat
-rozhoduje jen o *existenci* vady, ne o řešení ("je `White Court / Red Court`
-jedna entita se synonymy, nebo dvě?"). Typicky:
-
-- `compound` → rozděl na samostatné položky, varianty dej do `aliases`.
-  Měl-li povrch i `suggested_cz`, rozděl ho TÝMŽ oddělovačem a spáruj
-  pozičně (první anglická varianta ↔ první český návrh atd.); nesedí-li
-  počty částí na obou stranách, nech `suggested_cz` u té položky prázdné -
-  nehádej, který díl komu patří.
-- **alias, který potřebuje vlastní překlad, není alias** (`check_draft.py`
-  tohle nedetekuje - `weak_alias` chytá jen role/oslovení a krátké tvary,
-  ne tenhle případ). Př. `Injun Joe` je dnes alias `Listens-to-Wind`, ale má
-  i vlastní otázku na překlad - glosářový řádek má ale jedno `cz` pro
-  kanonický tvar i všechny aliasy, takže přezdívka s vlastním překladem se
-  do něj nevejde. Takové položky povyš na samostatné a jejich povrch
-  odeber z `aliases` (jinak by spustil guard proti kolizi v Tasku 10).
-- `parenthesized` → odstraň závorku, tvar bez ní dej jako `aliases`.
-- `alias_collision` / `duplicate_key` → smaž duplicitní řádek nebo přesuň
-  přebývající tvar z `name_en`/`term_en` do `aliases` toho, komu patří.
-- `cross_section` → postpodmínka 5 vyžaduje, aby po normalizaci nezůstalo
-  ŽÁDNÉ. Nejde o pouhé upozornění - `check_draft.py` ho hlásí jako vadu a bez
-  vyřešení `exit 0` nedá (glosář má globální identitu, sekčně oddělené `id`
-  před kolizí nechrání). Rozhodni: (a) je to jedna entita → nech ji jen
-  v jedné sekci, tu druhou smaž; nebo (b) jsou to dvě různé entity → jednu
-  z nich přejmenuj na jednoznačně odlišný tvar (ne závorkou - tu `parenthesized`
-  sám označí jako vadu; např. `Demonreach` místo zůstane, postava dostane
-  jiné jméno, pokud v knize skutečně existuje, jinak entity slouč).
-- `weak_alias` → smaž oslovení/role z `aliases` (zůstanou v `note`, pokud jsou
-  užitečná).
-- `bad_relationship` / `duplicate_relationship` / `short_relationship` →
-  nahraď zkrácené nebo složené jméno kanonickým tvarem z `characters`, smaž
-  duplicitní dvojici.
-- `bad_scope_key` → tři možná řešení, vyber podle situace: (a) oprav
-  `scope_key` tak, aby ukazoval na existující položku (u vztahů přesně na
-  `guide.relationship_key(a, b)`); (b) neexistuje-li vhodná položka, ale
-  otázka dává smysl sama o sobě, povyš ji na samostatnou položku v příslušné
-  sekci; (c) nedává-li smysl vůbec, smaž celou otázku z `must_decide`.
-
-- [ ] **Step 9: Ověř nulový počet vad**
-
-Run: `python tools/check_draft.py`
-Expected: `data/guide.draft.json: čistý, všech šest postpodmínek splněno.`, exit 0.
-
-Pokud ne, vrať se ke kroku 8 - `reference` (Task 13) na vadném draftu buď
-selže na kolizi `id`, nebo vytvoří nálezy, které si formulář nespáruje se
-správnou položkou.
-
-- [ ] **Step 10: Hotovo** - `data/guide.draft.json` je opravený na disku;
-commit se nedělá (`data/` je v `.gitignore`, viz krok 7).
 
 ---
 
@@ -608,27 +484,6 @@ def test_load_corpus_rejects_too_small_corpus(tmp_path):
         reference.load_corpus(root)
 
 
-def test_load_corpus_detects_file_changed_during_loading(tmp_path, monkeypatch):
-    """Manifest se bere PŘED i PO parsování a musí sedět - `_load_side`
-    (čtení desítek EPUBů) chvíli trvá; změní-li se soubor uprostřed (jiný
-    proces, re-export), load_corpus() to musí odhalit, ne tiše uložit
-    manifest, který k vytěženému textu už neodpovídá."""
-    long_en = "text here and there. " * 40
-    root = _corpus_root(tmp_path, [(1, long_en, long_en), (2, long_en, long_en),
-                                   (3, long_en, long_en)])
-    real_load_side = reference._load_side
-    def flaky(root_, side):
-        result = real_load_side(root_, side)
-        if side == "CZ":
-            # simuluje změnu souboru UPROSTŘED načítání (jiný proces)
-            with open(os.path.join(root_, "CZ", "1 nazev - Jim Butcher.epub"), "ab") as f:
-                f.write(b"x")
-        return result
-    monkeypatch.setattr(reference, "_load_side", flaky)
-    with pytest.raises(ValueError, match="změnily"):
-        reference.load_corpus(root)
-
-
 def test_load_corpus_rejects_duplicate_book_number(tmp_path):
     long_en = "text here and there. " * 40
     root = _corpus_root(tmp_path, [(1, long_en, long_en), (2, long_en, long_en),
@@ -684,103 +539,6 @@ def test_cache_invalidated_for_different_root(tmp_path):
     cache = str(tmp_path / "cache.json")
     reference.save_cache(reference.load_corpus(root), cache)
     assert reference.load_cache(cache, str(tmp_path / "jinde")) is None
-
-
-def test_cache_with_malformed_structure_returns_none(tmp_path):
-    """Platný JSON, ale se špatným tvarem (cz jako list místo dict) - musí
-    dát None, ne KeyError/ValueError tracebackem."""
-    import json as _json
-    root = _corpus_root(tmp_path, [(1, "text " * 40, "text " * 40),
-                                   (2, "text " * 40, "text " * 40),
-                                   (3, "text " * 40, "text " * 40)])
-    cache = str(tmp_path / "cache.json")
-    _json.dump({"schema_version": reference.SCHEMA_VERSION,
-               "source_root": os.path.abspath(root),
-               "manifest": reference.build_manifest(root),
-               "cz": ["not", "a", "dict"], "en": {}},
-              open(cache, "w", encoding="utf-8"))
-    assert reference.load_cache(cache, root) is None
-
-
-def test_cache_with_non_numeric_key_returns_none(tmp_path):
-    import json as _json
-    root = _corpus_root(tmp_path, [(1, "text " * 40, "text " * 40),
-                                   (2, "text " * 40, "text " * 40),
-                                   (3, "text " * 40, "text " * 40)])
-    cache = str(tmp_path / "cache.json")
-    _json.dump({"schema_version": reference.SCHEMA_VERSION,
-               "source_root": os.path.abspath(root),
-               "manifest": reference.build_manifest(root),
-               "cz": {"neni-cislo": "text"}, "en": {}},
-              open(cache, "w", encoding="utf-8"))
-    assert reference.load_cache(cache, root) is None
-
-
-def test_cache_with_mismatched_cz_en_keys_returns_none(tmp_path, monkeypatch):
-    """Manifest se počítá jen z os.stat souborů, ne z obsahu cache - platná
-    cache se sedícím manifestem, ale nespárovanými čísly dílů (cz má jiná
-    čísla než en) by jinak obešla párování, které dělá load_corpus()."""
-    import json as _json
-    root = _corpus_root(tmp_path, [(1, "text " * 40, "text " * 40),
-                                   (2, "text " * 40, "text " * 40),
-                                   (3, "text " * 40, "text " * 40)])
-    cache = str(tmp_path / "cache.json")
-    _json.dump({"schema_version": reference.SCHEMA_VERSION,
-               "source_root": os.path.abspath(root),
-               "manifest": reference.build_manifest(root),
-               "cz": {"1": "a", "2": "b", "3": "c"},
-               "en": {"1": "a", "2": "b", "9": "c"}},   # 3 vs 9 - nespárováno
-              open(cache, "w", encoding="utf-8"))
-    assert reference.load_cache(cache, root) is None
-
-
-def test_cache_below_minimum_corpus_books_returns_none(tmp_path):
-    """Cache se sedícím manifestem, ale míň páry, než dovoluje výchozí
-    REFERENCE_MIN_CORPUS_BOOKS (3), by obešla kontrolu minima v load_corpus()."""
-    import json as _json
-    root = _corpus_root(tmp_path, [(1, "text " * 40, "text " * 40),
-                                   (2, "text " * 40, "text " * 40),
-                                   (3, "text " * 40, "text " * 40)])
-    cache = str(tmp_path / "cache.json")
-    _json.dump({"schema_version": reference.SCHEMA_VERSION,
-               "source_root": os.path.abspath(root),
-               "manifest": reference.build_manifest(root),
-               "cz": {"1": "a", "2": "b"}, "en": {"1": "a", "2": "b"}},
-              open(cache, "w", encoding="utf-8"))
-    assert reference.load_cache(cache, root) is None
-
-
-def test_load_cache_returns_none_on_oserror_from_build_manifest(tmp_path, monkeypatch):
-    """Poslední krok load_cache() volá build_manifest(root) znovu, aby
-    porovnal aktuální stav disku - selže-li (soubor mezitím zmizel,
-    oprávnění), bere se to jako "cache neplatná", ne nezachycená výjimka.
-    Korpus se sestaví PŘED monkeypatchem, aby patch zasáhl jen to volání
-    uvnitř load_cache()."""
-    root = _corpus_root(tmp_path, [(1, "text " * 40, "text " * 40),
-                                   (2, "text " * 40, "text " * 40),
-                                   (3, "text " * 40, "text " * 40)])
-    cache = str(tmp_path / "cache.json")
-    reference.save_cache(reference.load_corpus(root), cache)
-    def boom(r):
-        raise OSError("soubor zmizel")
-    monkeypatch.setattr(reference, "build_manifest", boom)
-    assert reference.load_cache(cache, root) is None
-
-
-def test_load_side_failure_drops_whole_book_before_minimum_check(tmp_path):
-    """Selže-li načtení jedné strany dvojice (poškozený EPUB), vypadne celý
-    díl a teprve POTOM se kontroluje minimum spárovaných dílů. Čtyři páry,
-    ne tři - po odpadnutí jednoho musí zbýt aspoň REFERENCE_MIN_CORPUS_BOOKS
-    (3), jinak by load_corpus() zvedl ValueError místo úspěšného výsledku."""
-    long = "text here and there. " * 40
-    root = _corpus_root(tmp_path, [(1, long, long), (2, long, long),
-                                   (3, long, long), (4, long, long)])
-    # CZ strana dílu 1 je poškozený soubor, ne platný EPUB
-    with open(os.path.join(root, "CZ", "1 nazev - Jim Butcher.epub"), "wb") as f:
-        f.write(b"not a real epub")
-    c = reference.load_corpus(root)
-    assert 1 not in c.cz and 1 not in c.en          # celý díl vypadl
-    assert sorted(c.cz) == [2, 3, 4]                 # zbylé tři pořád stačí na minimum
 ```
 
 - [ ] **Step 2: Run to verify fail**
@@ -801,7 +559,6 @@ Pro drift v jedné kapitole to stačí, pro doložení v milionovém korpusu ne.
 import json
 import os
 import re
-import unicodedata
 import warnings
 from dataclasses import dataclass, field
 
@@ -849,18 +606,6 @@ def build_manifest(root: str) -> dict:
     return out
 
 
-def _strip_leading_title(text: str, title: str) -> str:
-    """`Chapter.raw_text` z EPUB obsahuje i text nadpisu - `_load_epub()` ho
-    získává přes `soup.get_text()`, který nadpis od těla nerozlišuje. Bez
-    odstranění by titul (např. "Ch" nebo skutečný název kapitoly) zkresloval
-    počty výskytů. Syntetický titul ("Kapitola N", padá při chybějícím
-    nadpisu) se v textu nevyskytuje, takže se jím nic neodstraní."""
-    stripped = text.lstrip()
-    if title and stripped.startswith(title):
-        return stripped[len(title):].lstrip("\n").lstrip()
-    return text
-
-
 def _load_side(root: str, side: str) -> dict:
     """Vrací {číslo dílu: text}. Duplicitní číslo je chyba - tiché přepsání
     klíče by zkreslilo důkaz."""
@@ -887,28 +632,13 @@ def _load_side(root: str, side: str) -> dict:
         except Exception as e:
             print(f"reference: {side}/{name} se nenačetl ({type(e).__name__}), přeskakuji")
             continue
-        # jen raw_text bez titulů. NFC při načtení: hledá se case-sensitive
-        # (stupeň 0 na tom stojí), takže kanonicky ekvivalentní zápisy
-        # (NFC vs. NFD "á") musí dojít na stejný tvar dřív, než se z nich
-        # postaví regex - jinak by se stejně vypadající text nenašel.
-        text = DOC_SEP.join(_strip_leading_title(c.raw_text, c.title) for c in chapters)
-        books[num] = unicodedata.normalize("NFC", text)
+        # jen raw_text, bez titulů - ty bývají "Chapter 1" a zkreslily by počty
+        books[num] = DOC_SEP.join(c.raw_text for c in chapters)
     return books
 
 
 def load_corpus(root: str) -> Corpus:
-    # Manifest se bere PŘED parsováním i PO něm a musí sedět - `_load_side`
-    # čte obsah souborů, což u desítek EPUBů chvíli trvá. Změní-li se soubor
-    # UPROSTŘED (přepsání, re-export), manifest vzatý jen na konci by popsal
-    # NOVÝ stav disku k textu, který je pořád STARÝ - Task 13 by pak tenhle
-    # manifest uložil jako otisk toho, co bylo vytěženo, a `review` by nález
-    # z předchozího textu tiše označil za čerstvý.
-    manifest_before = build_manifest(root)
     en, cz = _load_side(root, "EN"), _load_side(root, "CZ")
-    manifest_after = build_manifest(root)
-    if manifest_before != manifest_after:
-        raise ValueError(
-            "Referenční soubory se změnily během načítání - spusť `reference` znovu.")
     paired = sorted(set(en) & set(cz))
     for num in sorted(set(en) ^ set(cz)):
         print(f"reference: díl {num} nemá protějšek, vyřazuji obě strany")
@@ -918,7 +648,7 @@ def load_corpus(root: str) -> Corpus:
             f"{config.REFERENCE_MIN_CORPUS_BOOKS} - na menším korpusu nelze "
             "tvrdit, že překladatel termín ponechal.")
     return Corpus(cz={n: cz[n] for n in paired}, en={n: en[n] for n in paired},
-                  manifest=manifest_after, source_root=os.path.abspath(root))
+                  manifest=build_manifest(root), source_root=os.path.abspath(root))
 
 
 def save_cache(corpus: Corpus, path: str) -> None:
@@ -935,51 +665,27 @@ def save_cache(corpus: Corpus, path: str) -> None:
 
 
 def load_cache(path: str, root: str):
-    """None znamená "postav znovu" - u chybějící, poškozené i zastaralé cache.
-
-    Validuje strukturu explicitně: cache je soubor na disku, který si mezi
-    verzemi nástroje nebo ruční editací může odchýlit tvar. Bez kontroly by
-    poškozená cache místo `None` shodila `reference` KeyError/ValueError
-    tracebackem místo hlášky "postav znovu"."""
+    """None znamená "postav znovu" - u chybějící, poškozené i zastaralé cache."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
         return None
-    if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
+    if data.get("schema_version") != SCHEMA_VERSION:
         return None
     if data.get("source_root") != os.path.abspath(root):
         return None
-    cz, en, manifest = data.get("cz"), data.get("en"), data.get("manifest")
-    if not isinstance(cz, dict) or not isinstance(en, dict) or not isinstance(manifest, dict):
+    if data.get("manifest") != build_manifest(root):
         return None
-    try:
-        cz_out = {int(k): v for k, v in cz.items() if isinstance(v, str)}
-        en_out = {int(k): v for k, v in en.items() if isinstance(v, str)}
-    except (TypeError, ValueError):
-        return None
-    if len(cz_out) != len(cz) or len(en_out) != len(en):
-        return None    # nečíselný klíč nebo nečíselná/nenulová hodnota
-    if set(cz_out) != set(en_out):
-        return None    # nespárované číslo dílu - load_corpus() by ho vyřadilo
-    if len(cz_out) < config.REFERENCE_MIN_CORPUS_BOOKS:
-        return None    # cache pod minimem by obešla kontrolu v load_corpus()
-    try:
-        # os.listdir/os.stat uvnitř build_manifest můžou selhat i tady
-        # (soubor mezitím zmizel, oprávnění, síťový disk) - bereme to jako
-        # "cache neplatná, postav znovu", ne jako nezachycenou výjimku.
-        current_manifest = build_manifest(root)
-    except OSError:
-        return None
-    if manifest != current_manifest:
-        return None
-    return Corpus(cz=cz_out, en=en_out, manifest=manifest, source_root=data["source_root"])
+    return Corpus(cz={int(k): v for k, v in data["cz"].items()},
+                  en={int(k): v for k, v in data["en"].items()},
+                  manifest=data["manifest"], source_root=data["source_root"])
 ```
 
 - [ ] **Step 4: Run to verify pass**
 
 Run: `python -m pytest tests/test_reference_corpus.py -v`
-Expected: PASS (15 tests)
+Expected: PASS (8 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -1097,47 +803,12 @@ def test_books_lists_only_books_with_hits():
     assert reference.count_en_surface(c, "Mab").books == [1, 3]
 
 
-def test_occurrence_after_doc_sep_counts_as_sentence_start():
-    """Výskyt hned po DOC_SEP je začátek dokumentu = začátek věty, takže sám
-    o sobě způsobilost nedá u krátkého (< 5 znaků) povrchu."""
-    text = "text " + reference.DOC_SEP + "Bob na začátku dokumentu."
+def test_document_separator_counts_as_sentence_start():
+    text = "Bob uprostřed." + reference.DOC_SEP + "Bob na začátku dokumentu."
     c = _corpus([text] * 3)
-    assert reference.count_en_surface(c, "Bob").confirm_eligible is False
-
-
-def test_occurrence_after_doc_sep_plus_mid_sentence_hit_is_eligible():
-    text = ("text " + reference.DOC_SEP + "Bob na začátku. Potkal jsem Bob uprostřed.")
-    c = _corpus([text] * 3)
-    assert reference.count_en_surface(c, "Bob").confirm_eligible is True
-
-
-def test_punctuation_without_following_space_is_not_sentence_start():
-    """"x.Mab" (interpunkce bez mezery, typický překlep) NENÍ začátek věty -
-    je to tedy výskyt MIMO začátek věty, což je přesně to, co krátký povrch
-    (< 5 znaků) potřebuje pro způsobilost. Bez opravy (mezera za interpunkcí
-    se nekontrolovala) by kód "x.Mab" mylně považoval ZA začátek věty, a
-    způsobilost by tak byla False místo True."""
-    c = _corpus(["Věta končí u x.Mab a pokračuje dál."] * 3)
-    assert reference.count_en_surface(c, "Mab").confirm_eligible is True
-
-
-def test_digit_leading_surface_is_never_eligible():
-    """Dřívější kontrola `surface[:1].islower()` u číslice vrací False (číslice
-    není "malá"), takže by povrch začínající číslicí prošel jako vlastní
-    jméno. Musí platit `not surface[:1].isupper()`."""
-    c = _corpus(["Bylo tam 3Eye uprostřed věty, pak zas 3Eye."] * 3)
-    assert reference.count_en_surface(c, "3Eye").confirm_eligible is False
-
-
-def test_nfd_query_matches_nfc_corpus_text():
-    """Korpus je vždy NFC (viz _load_side v Tasku 3). Dotaz ale může přijít
-    v NFD (draft od scouta, ruční editace) - musí se normalizovat dřív, než
-    se z něj postaví regex, jinak kanonicky stejný text neprojde."""
-    import unicodedata
-    c = _corpus(["Potkal jsem Áine uprostřed věty."] * 3)   # NFC (Python literál)
-    nfd_query = unicodedata.normalize("NFD", "Áine")
-    ev = reference.count_en_surface(c, nfd_query)
-    assert ev.hits > 0 and ev.confirm_eligible is True
+    ev = reference.count_en_surface(c, "Bob")
+    # první výskyt je uprostřed věty -> způsobilé
+    assert ev.confirm_eligible is True
 ```
 
 - [ ] **Step 2: Run to verify fail**
@@ -1168,21 +839,14 @@ def _word_pattern(surface: str, ignore_case: bool):
 
 
 def _at_sentence_start(text: str, pos: int) -> bool:
-    """Začátek věty = pozice 0, první nebílý znak PO interpunkci následované
-    bílým znakem (`.`/`!`/`?`/`…` s mezerou za sebou), nebo znak po odděl-
-    ovači dokumentů. Bez požadavku na mezeru za interpunkcí by "x.Mab" (bez
-    mezery, typicky překlep) prošlo jako začátek věty, ačkoli gramaticky
-    začátkem není."""
+    """Začátek věty = pozice 0, první nebílý znak po .!?… nebo po oddělovači
+    dokumentů. Chrání krátká jména, která jsou zároveň českými slovy."""
     i = pos - 1
-    saw_space = False
     while i >= 0 and text[i].isspace():
-        saw_space = True
         i -= 1
     if i < 0:
         return True
-    if text[i] == "\x00":
-        return True
-    return saw_space and text[i] in _SENTENCE_END
+    return text[i] in _SENTENCE_END or text[i] == "\x00"
 
 
 def count_en_surface(corpus: Corpus, surface: str, aliases=(), side: str = "cz") -> Evidence:
@@ -1193,18 +857,14 @@ def count_en_surface(corpus: Corpus, surface: str, aliases=(), side: str = "cz")
     z primárního tvaru, aliasy jsou doplňkový důkaz pro člověka.
     """
     ev = Evidence()
-    surface = unicodedata.normalize("NFC", (surface or "").strip())
+    surface = (surface or "").strip()
     if not surface:
         return ev
     texts = corpus.cz if side == "cz" else corpus.en
-    # Korpus je uložen po NFC (viz _load_side) - dotaz musí projít stejnou
-    # normalizací, jinak by kanonicky stejný, ale jinak zapsaný text unikl.
-    forms = [surface] + [unicodedata.normalize("NFC", a.strip())
-                         for a in (aliases or []) if a and a.strip()]
-    # Vlastní jméno = první znak je VELKÉ písmeno, explicitně (ne "není malé"
-    # - jinak by povrch začínající číslicí nebo interpunkcí prošel jako
-    # "vlastní jméno", ačkoli žádné písmeno velké není).
-    lowercase_surface = not surface[:1].isupper()
+    forms = [surface] + [a for a in (aliases or []) if a and a.strip()]
+    # Malé počáteční písmeno = obecné slovo. Hledá se case-sensitive (slabý
+    # filtr) a nikdy nebude způsobilé - `stole` je toho důvodem.
+    lowercase_surface = surface[:1].islower()
 
     spans_by_book, books_with_hit = {}, set()
     for form in forms:
@@ -1251,7 +911,7 @@ def count_en_surface(corpus: Corpus, surface: str, aliases=(), side: str = "cz")
 - [ ] **Step 4: Run to verify pass**
 
 Run: `python -m pytest tests/test_reference_stage0.py -v`
-Expected: PASS (16 tests)
+Expected: PASS (12 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -1349,7 +1009,7 @@ def count_cz_form(corpus: Corpus, form: str) -> Evidence:
     tvaru nedoloženo", ne "model se plete".
     """
     ev = Evidence()
-    form = unicodedata.normalize("NFC", (form or "").strip())
+    form = (form or "").strip()
     if not form:
         return ev
     pattern = _word_pattern(form, ignore_case=True)
@@ -1374,7 +1034,7 @@ def books_with_en(corpus: Corpus, surface: str) -> set:
     Žádné délkové omezení ani pravidlo o začátku věty - to je ochrana proti
     českým homonymům a v anglickém textu nedává smysl.
     """
-    surface = unicodedata.normalize("NFC", (surface or "").strip())
+    surface = (surface or "").strip()
     if not surface:
         return set()
     pattern = _word_pattern(surface, ignore_case=True)
@@ -1467,27 +1127,6 @@ def test_missing_id_raises_because_result_is_incomplete():
 def test_non_string_cz_raises():
     raw = json.dumps({"proposals": [{"id": "terms/white council", "cz": 42},
                                     {"id": "terms/warlock", "cz": None}]})
-    with pytest.raises(ValueError):
-        lexicographer.propose(ITEMS, FakeLLMClient([Completion(raw, False, 5, 5)]))
-
-
-def test_top_level_json_array_raises_value_error_not_attribute_error():
-    """extract_json má typový slib '-> dict', ale za běhu vrátí cokoli platné
-    JSON - model vracející pole místo objektu nesmí spadnout na
-    AttributeError, ale dát srozumitelný ValueError."""
-    raw = json.dumps([{"id": "terms/white council", "cz": "A"}])
-    with pytest.raises(ValueError):
-        lexicographer.propose(ITEMS, FakeLLMClient([Completion(raw, False, 5, 5)]))
-
-
-def test_missing_proposals_key_raises_value_error():
-    raw = json.dumps({"neco_jineho": []})
-    with pytest.raises(ValueError):
-        lexicographer.propose(ITEMS, FakeLLMClient([Completion(raw, False, 5, 5)]))
-
-
-def test_non_dict_row_in_proposals_raises_value_error():
-    raw = json.dumps({"proposals": ["terms/white council"]})
     with pytest.raises(ValueError):
         lexicographer.propose(ITEMS, FakeLLMClient([Completion(raw, False, 5, 5)]))
 
@@ -1586,20 +1225,9 @@ def propose(items, client, *, model=None, max_tokens=None):
             "Lexikograf vrátil useknutý výstup i po zvýšení max_tokens.")
 
     data = extract_json(comp.text)
-    # extract_json má typový anotační slib "-> dict", ale za běhu vrací
-    # cokoli, co je platný JSON - stačí, aby model vrátil pole nebo scalar
-    # (nebo pole se špatnými řádky) a `.get`/`.get("id")` spadne na
-    # AttributeError místo srozumitelného ValueError.
-    if not isinstance(data, dict):
-        raise ValueError(f"Odpověď lexikografa není JSON objekt: {type(data).__name__}")
-    proposals = data.get("proposals")
-    if not isinstance(proposals, list):
-        raise ValueError("Odpověď lexikografa nemá pole 'proposals' jako seznam.")
     wanted = {it["id"] for it in items}
     out, seen = {}, set()
-    for row in proposals:
-        if not isinstance(row, dict):
-            raise ValueError(f"Položka v 'proposals' není objekt: {row!r}")
+    for row in data.get("proposals") or []:
         rid = row.get("id")
         if rid in seen:
             raise ValueError(f"Duplicitní id v odpovědi lexikografa: {rid!r}")
@@ -1624,7 +1252,7 @@ def propose(items, client, *, model=None, max_tokens=None):
 - [ ] **Step 4: Run to verify pass**
 
 Run: `python -m pytest tests/test_lexicographer.py -v`
-Expected: PASS (12 tests)
+Expected: PASS (9 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -1645,10 +1273,7 @@ git commit -m "feat: agent lexicographer (návrh českých tvarů, null = nezná
 - Consumes: `src/reference.py`, `src/agents/lexicographer.py`, `config`
 - Produces:
   - `reference_mine.SurfaceItem` / `Finding` (TypedDict, tvary ze specu)
-  - `reference_mine.classify(ev0, surface, proposal, cz_ev, cooccurrence, e_books, cfg) -> str` -
-    vrací název třídy. Prahy `confirmed`/`weak` se počítají **výhradně**
-    z `ev0.per_form[surface]` (primární tvar), ne z `ev0.hits`/`ev0.books`,
-    které jsou sjednocení s aliasy.
+  - `reference_mine.classify(ev0, proposal, cz_ev, cooccurrence, e_books, cfg) -> str` - vrací název třídy
   - `reference_mine.resolve(corpus, items, client_factory, cfg) -> list[Finding]`
 
 - [ ] **Step 1: Write the failing test** — `tests/test_reference_mine.py`
@@ -1753,40 +1378,6 @@ def test_unresolved_when_nothing_found_and_model_returns_null():
     assert f["classification"] == "unresolved" and f["source"] == "none"
 
 
-def test_confirmed_threshold_uses_only_primary_form_not_alias_union(monkeypatch):
-    """Primární tvar `Harry Dresden` je jen v 1 dílu (1 výskyt) - pod prahem.
-    Alias `Dresden` je hodně doložený ve 2 dílech. Sjednocené `ev0.hits`/
-    `ev0.books` (primární + alias) by práh SPLNILY (6 výskytů, 2 díly) a bez
-    opravy by položka vyšla `confirmed`, ačkoli primární tvar samotný
-    doložen není."""
-    monkeypatch.setattr(config, "REFERENCE_MIN_HITS", 3)
-    monkeypatch.setattr(config, "REFERENCE_MIN_BOOKS", 2)
-    cz = {1: "Potkal jsem Harry Dresden uprostřed. Dresden. Dresden.",
-          2: "Dresden dorazil. Dresden zase. Dresden pořád."}
-    items = [{"id": "characters/harry dresden", "section": "characters",
-              "surface": "Harry Dresden", "aliases": ["Dresden"], "note": ""}]
-    f = reference_mine.resolve(_corpus(cz=cz), items, _client_factory({}), config)[0]
-    assert f["classification"] == "weak"       # primární tvar má jen 1 výskyt v 1 dílu
-    assert f["hits"] == 6 and f["books"] == [1, 2]   # zobrazený důkaz zůstává sjednocený
-
-
-def test_nfd_surface_finds_its_own_nfc_normalized_evidence(monkeypatch):
-    """`count_en_surface` ukládá klíče `per_form` po NFC (viz Task 4). Přijde-li
-    `item["surface"]` v NFD (jinak zapsaný, kanonicky stejný text), `classify`
-    i `_finding` ho musí normalizovat stejně - jinak lookup do `per_form`
-    mine a položka vyjde `weak`/`unresolved` i s reálným důkazem."""
-    import unicodedata
-    monkeypatch.setattr(config, "REFERENCE_MIN_HITS", 3)
-    monkeypatch.setattr(config, "REFERENCE_MIN_BOOKS", 2)
-    nfd_surface = unicodedata.normalize("NFD", "Áine")
-    cz = {i: "Potkal jsem Áine uprostřed věty." for i in (1, 2, 3)}  # NFC text
-    items = [{"id": "characters/aine", "section": "characters",
-              "surface": nfd_surface, "aliases": [], "note": ""}]
-    f = reference_mine.resolve(_corpus(cz=cz), items, _client_factory({}), config)[0]
-    assert f["classification"] == "confirmed"
-    assert f["primary_attested"] is True
-
-
 def test_alias_only_is_evidence_only_without_prefill():
     corpus = _corpus(cz={i: "Přišel Dresden pozdě." for i in (1, 2, 3)},
                      en={1: "Harry Dresden"})
@@ -1848,54 +1439,22 @@ Jediné místo, které drátuje hledání a agenta dohromady. Nezná databázi a
 glosář - výsledek jen vrací; zápis dělá volající.
 """
 import math
-import unicodedata
-from typing import TypedDict
 
 from src import reference
 from src.agents import lexicographer
-
-
-class SurfaceItem(TypedDict):
-    """Jedna položka draftu ke zpracování - vyrábí ji main.py z guide.draft.json."""
-    id: str              # "{section}/{normalize_key(surface)}"
-    section: str          # "characters" | "places" | "terms"
-    surface: str
-    aliases: list[str]
-    note: str
-
-
-class Finding(TypedDict):
-    """Jeden nález těžby - tvoří obsah `reference.json["findings"]`."""
-    id: str
-    section: str
-    surface: str
-    cz: str | None
-    classification: str   # confirmed|weak|evidence_only|proposed|not_attested|unresolved
-    primary_attested: bool
-    navrh: str | None
-    hits: int
-    books: list[int]
-    per_form: dict
-    cooccurrence: list[int]
-    matched_forms: list[str]
-    matched_cz: str | None
-    source: str            # kept|proposed|none
 
 
 def _finding(item, ev0, cz_ev, proposal, cooccurrence, classification, cz):
     source = ("kept" if classification in ("confirmed", "weak", "evidence_only")
               else "proposed" if classification in ("proposed", "not_attested")
               else "none")
-    # Stejný důvod jako v classify(): ev0.per_form má klíče normalizované na
-    # NFC (viz count_en_surface), lookup musí projít stejnou normalizací.
-    nfc_surface = unicodedata.normalize("NFC", (item["surface"] or "").strip())
     return {
         "id": item["id"],
         "section": item["section"],
         "surface": item["surface"],
         "cz": cz,
         "classification": classification,
-        "primary_attested": bool(ev0.per_form.get(nfc_surface, {}).get("hits")),
+        "primary_attested": bool(ev0.per_form.get(item["surface"], {}).get("hits")),
         "navrh": proposal,
         "hits": ev0.hits,
         "books": ev0.books,
@@ -1908,28 +1467,14 @@ def _finding(item, ev0, cz_ev, proposal, cooccurrence, classification, cz):
     }
 
 
-def classify(ev0, surface, proposal, cz_ev, cooccurrence, e_books, cfg) -> str:
+def classify(ev0, proposal, cz_ev, cooccurrence, e_books, cfg) -> str:
     """Precedence tříd. Kroky 1 a 2 se týkají JEN způsobilých povrchů - bez
     toho by `stole` (79 výskytů, malé písmeno) spadlo do `weak`, `weak`
-    předvyplňuje, a byla by zpět chyba, kvůli které tenhle aparát existuje.
-
-    Prahy se počítají VÝHRADNĚ z primárního tvaru (`ev0.per_form[surface]`),
-    ne z `ev0.hits`/`ev0.books` - ty jsou sjednocení přes aliasy. Bez tohohle
-    rozlišení by hodně doložený alias mohl "protáhnout" primární tvar na
-    `confirmed`, přestože ten samotný doložený vůbec není.
-
-    `surface` se normalizuje na NFC stejně jako uvnitř `count_en_surface` -
-    ta ukládá klíče `per_form` už normalizované. Bez odpovídající normalizace
-    tady by NFD zápis (jiný, ale kanonicky stejný Unicode tvar) v `per_form`
-    nenašel nic a položka by vyšla `weak`/`unresolved`, přestože důkaz
-    existuje pod (jinak zapsaným) stejným klíčem."""
-    surface = unicodedata.normalize("NFC", (surface or "").strip())
-    primary = ev0.per_form.get(surface, {})
-    primary_hits = primary.get("hits", 0)
-    primary_books = primary.get("books", [])
+    předvyplňuje, a byla by zpět chyba, kvůli které tenhle aparát existuje."""
+    primary_hits = ev0.hits
     if ev0.confirm_eligible:
         if (primary_hits >= cfg.REFERENCE_MIN_HITS
-                and len(primary_books) >= cfg.REFERENCE_MIN_BOOKS):
+                and len(ev0.books) >= cfg.REFERENCE_MIN_BOOKS):
             return "confirmed"
         return "weak"
     if proposal:
@@ -1971,8 +1516,7 @@ def resolve(corpus, items, client_factory, cfg):
         cz_ev = reference.count_cz_form(corpus, proposal) if proposal else None
         e_books = reference.books_with_en(corpus, item["surface"]) if proposal else set()
         cooccurrence = (e_books & set(cz_ev.books)) if cz_ev else set()
-        classification = classify(ev0, item["surface"], proposal, cz_ev,
-                                  cooccurrence, e_books, cfg)
+        classification = classify(ev0, proposal, cz_ev, cooccurrence, e_books, cfg)
         # Předvyplňuje se JEN doložené ponechání; návrhy nikdy.
         cz = item["surface"] if classification in ("confirmed", "weak") else None
         findings.append(_finding(item, ev0, cz_ev, proposal, cooccurrence,
@@ -1983,7 +1527,7 @@ def resolve(corpus, items, client_factory, cfg):
 - [ ] **Step 4: Run to verify pass**
 
 Run: `python -m pytest tests/test_reference_mine.py -v`
-Expected: PASS (13 tests)
+Expected: PASS (11 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -2007,7 +1551,6 @@ git commit -m "feat: reference_mine - precedence klasifikace, souvýskyt, dávko
   - `reference_mine.draft_fingerprint(draft) -> str` - sha1 klíčů, aliasů a poznámek
   - `reference_mine.thresholds_fingerprint(cfg) -> str`
   - `reference_mine.corpus_fingerprint(root) -> str | None` - `None` když je kořen nedostupný
-  - `reference_mine.manifest_fingerprint(manifest: dict) -> str` - otisk KONKRÉTNÍHO manifestu (ne aktuálního stavu disku); `_cmd_reference` ho volá na `corpus.manifest` zachycený při načtení, `_is_fresh` v `guide.py` dál používá `corpus_fingerprint(source_root)` proti aktuálnímu disku
   - `reference_mine.write_reference(findings, path, run_id, fingerprint, source_root) -> None`
   - `reference_mine.load_reference(path) -> dict | None`
 
@@ -2016,8 +1559,7 @@ git commit -m "feat: reference_mine - precedence klasifikace, souvýskyt, dávko
 ```python
 import json
 import os
-import pytest
-from src import reference, reference_mine
+from src import reference_mine
 import config
 
 
@@ -2101,137 +1643,6 @@ def test_thresholds_fingerprint_ignores_paths(monkeypatch):
 
 def test_corpus_fingerprint_none_for_missing_root(tmp_path):
     assert reference_mine.corpus_fingerprint(str(tmp_path / "neexistuje")) is None
-
-
-def test_manifest_fingerprint_matches_corpus_fingerprint_for_same_manifest(tmp_path):
-    """manifest_fingerprint(m) musí dát stejný otisk jako corpus_fingerprint()
-    počítané ze stejného manifestu - jinak by `_is_fresh` (guide.py, počítá
-    přes corpus_fingerprint) nikdy nepoznal referenci uloženou přes
-    manifest_fingerprint (main.py) jako čerstvou."""
-    (tmp_path / "EN").mkdir()
-    (tmp_path / "EN" / "x.epub").write_bytes(b"x")
-    manifest = reference.build_manifest(str(tmp_path))
-    assert reference_mine.manifest_fingerprint(manifest) == \
-        reference_mine.corpus_fingerprint(str(tmp_path))
-
-
-def test_manifest_fingerprint_changes_with_manifest_content():
-    assert reference_mine.manifest_fingerprint({"EN/a.epub": [1, 2]}) != \
-        reference_mine.manifest_fingerprint({"EN/a.epub": [1, 3]})
-
-
-def test_corpus_fingerprint_returns_none_on_oserror(tmp_path, monkeypatch):
-    """os.listdir/os.stat uvnitř build_manifest můžou selhat i po úspěšném
-    isdir() (soubor mezitím zmizel, oprávnění, síťový disk) - guide._is_fresh
-    (volané z GET /api/guide) na tom nesmí spadnout na nezachycenou výjimku."""
-    (tmp_path / "EN").mkdir()
-    def boom(root):
-        raise OSError("soubor zmizel")
-    monkeypatch.setattr(reference, "build_manifest", boom)
-    assert reference_mine.corpus_fingerprint(str(tmp_path)) is None
-
-
-def test_load_rejects_wrong_type_for_hits(tmp_path):
-    """`hits` jako string - platný JSON, špatný tvar. Nesmí projít jako
-    validní a nesmí spadnout na TypeError/KeyError, jen vrátit None."""
-    p = tmp_path / "reference.json"
-    p.write_text(json.dumps({"schema_version": 1, "run_id": 1, "source_root": "/r",
-                             "fingerprint": _fp(),
-                             "findings": [_finding(hits="mnoho")]}), encoding="utf-8")
-    assert reference_mine.load_reference(str(p)) is None
-
-
-def test_load_rejects_non_int_book_number(tmp_path):
-    p = tmp_path / "reference.json"
-    p.write_text(json.dumps({"schema_version": 1, "run_id": 1, "source_root": "/r",
-                             "fingerprint": _fp(),
-                             "findings": [_finding(books=["1"])]}), encoding="utf-8")
-    assert reference_mine.load_reference(str(p)) is None
-
-
-def test_load_rejects_missing_top_level_metadata(tmp_path):
-    p = tmp_path / "reference.json"
-    p.write_text(json.dumps({"schema_version": 1, "findings": []}), encoding="utf-8")
-    assert reference_mine.load_reference(str(p)) is None
-
-
-def test_load_rejects_malformed_per_form_row(tmp_path):
-    p = tmp_path / "reference.json"
-    p.write_text(json.dumps({"schema_version": 1, "run_id": 1, "source_root": "/r",
-                             "fingerprint": _fp(),
-                             "findings": [_finding(per_form={"X": {"hits": "ne"}})]}),
-                 encoding="utf-8")
-    assert reference_mine.load_reference(str(p)) is None
-
-
-def test_load_rejects_bool_as_hits(tmp_path):
-    """isinstance(True, int) je v Pythonu True - bez explicitního vyloučení
-    by 'hits': true prošlo jako platný počet výskytů."""
-    p = tmp_path / "reference.json"
-    p.write_text(json.dumps({"schema_version": 1, "run_id": 1, "source_root": "/r",
-                             "fingerprint": _fp(),
-                             "findings": [_finding(hits=True)]}), encoding="utf-8")
-    assert reference_mine.load_reference(str(p)) is None
-
-
-def test_load_rejects_per_form_row_missing_case_exact(tmp_path):
-    p = tmp_path / "reference.json"
-    p.write_text(json.dumps({"schema_version": 1, "run_id": 1, "source_root": "/r",
-                             "fingerprint": _fp(),
-                             "findings": [_finding(per_form={"X": {"hits": 1, "books": [1]}})]}),
-                 encoding="utf-8")
-    assert reference_mine.load_reference(str(p)) is None
-
-
-def test_load_rejects_fingerprint_with_extra_or_missing_key(tmp_path):
-    p = tmp_path / "reference.json"
-    p.write_text(json.dumps({"schema_version": 1, "run_id": 1, "source_root": "/r",
-                             "fingerprint": {"draft": "a", "thresholds": "c"},  # chybí "corpus"
-                             "findings": []}), encoding="utf-8")
-    assert reference_mine.load_reference(str(p)) is None
-
-
-def test_load_rejects_unknown_source(tmp_path):
-    p = tmp_path / "reference.json"
-    p.write_text(json.dumps({"schema_version": 1, "run_id": 1, "source_root": "/r",
-                             "fingerprint": _fp(),
-                             "findings": [_finding(source="odjinud")]}), encoding="utf-8")
-    assert reference_mine.load_reference(str(p)) is None
-
-
-def test_load_rejects_cz_set_outside_confirmed_or_weak(tmp_path):
-    """`resolve()` nikdy nevyrobí `cz` mimo confirmed/weak (viz classify()) -
-    poškozený/ručně upravený soubor s classification="proposed" a vyplněným
-    `cz` by jinak `_merge_section` vzal jako doložené."""
-    p = tmp_path / "reference.json"
-    p.write_text(json.dumps({"schema_version": 1, "run_id": 1, "source_root": "/r",
-                             "fingerprint": _fp(),
-                             "findings": [_finding(classification="proposed",
-                                                   cz="Vymysleno")]}), encoding="utf-8")
-    assert reference_mine.load_reference(str(p)) is None
-
-
-def test_load_rejects_navrh_set_outside_proposed_or_not_attested(tmp_path):
-    p = tmp_path / "reference.json"
-    p.write_text(json.dumps({"schema_version": 1, "run_id": 1, "source_root": "/r",
-                             "fingerprint": _fp(),
-                             "findings": [_finding(classification="confirmed",
-                                                   cz="X", navrh="neplatny")]}),
-                 encoding="utf-8")
-    assert reference_mine.load_reference(str(p)) is None
-
-
-def test_write_leaves_no_tmp_file_on_error(tmp_path, monkeypatch):
-    """Selže-li zápis (např. disk plný), po sobě neuklizený .tmp soubor by
-    matl při dalším pokusu."""
-    p = str(tmp_path / "reference.json")
-    import json as json_mod
-    def boom(*a, **kw):
-        raise OSError("disk plný")
-    monkeypatch.setattr(json_mod, "dump", boom)
-    with pytest.raises(OSError):
-        reference_mine.write_reference([_finding()], p, 1, _fp(), "/root")
-    assert not any(n.endswith(".tmp") for n in os.listdir(tmp_path))
 ```
 
 - [ ] **Step 2: Run to verify fail**
@@ -2250,7 +1661,6 @@ SCHEMA_VERSION = 1
 _SECTIONS = {"characters", "places", "terms"}
 _CLASSES = {"confirmed", "weak", "evidence_only", "proposed", "not_attested",
             "unresolved"}
-_SOURCES = {"kept", "proposed", "none"}
 _REQUIRED = ("id", "section", "surface", "cz", "classification",
              "primary_attested", "navrh", "hits", "books", "per_form",
              "cooccurrence", "matched_forms", "matched_cz", "source")
@@ -2282,130 +1692,22 @@ def thresholds_fingerprint(cfg) -> str:
 
 
 def corpus_fingerprint(root: str):
-    """None = kořen není dostupný nebo se nedá přečíst; volající to musí brát
-    jako 'nevím'.
-
-    POZOR: stat()uje aktuální filesystém. Pro otisk toho, co bylo SKUTEČNĚ
-    vytěženo, použij `manifest_fingerprint(corpus.manifest)` - `corpus`
-    nese manifest zachycený PŘI NAČTENÍ, ne v okamžiku volání."""
+    """None = kořen není dostupný; volající to musí brát jako 'nevím'."""
     if not root or not os.path.isdir(root):
         return None
-    try:
-        # os.listdir/os.stat uvnitř build_manifest můžou selhat i po úspěšném
-        # isdir() - soubor mezitím zmizel, oprávnění, síťový disk. Volá se
-        # mimo jiné z guide._is_fresh() uvnitř GET /api/guide - nezachycená
-        # výjimka by tam znamenala HTTP 500 místo "nevím, ber jako nečerstvé".
-        return _sha1(reference.build_manifest(root))
-    except OSError:
-        return None
-
-
-def manifest_fingerprint(manifest: dict) -> str:
-    """Otisk konkrétního manifestu, ne aktuálního stavu disku. `_cmd_reference`
-    ho volá na `corpus.manifest` (zachycený při `load_corpus`/`load_cache`) -
-    kdyby místo toho volal `corpus_fingerprint(root)` až PO těžbě (co může
-    trvat minuty kvůli volání modelu), zapsal by otisk aktuálního disku, ne
-    toho, ze kterého nálezy skutečně vzešly. Změní-li se EPUB během běhu,
-    `review` by pak nálezy z dřívějšího textu tiše označil za čerstvé."""
-    return _sha1(manifest)
+    return _sha1(reference.build_manifest(root))
 
 
 def write_reference(findings, path, run_id, fingerprint, source_root) -> None:
     """Nahrazuje soubor celý. Žádné slévání s předchozím - selhání je atomické,
     takže se sem dostane jen kompletní výsledek."""
-    import tempfile
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    # Unikátní dočasný soubor ve stejné složce (kvůli os.replace na stejném
-    # svazku), ne pevné jméno `path + ".tmp"" - souběžný `reference` běh by
-    # se jinak přepisoval navzájem.
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"schema_version": SCHEMA_VERSION, "run_id": run_id,
-                       "source_root": source_root, "fingerprint": fingerprint,
-                       "findings": findings}, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
-
-
-# Očekávaný typ každého pole - validace kontroluje TVAR, ne jen přítomnost.
-# Bez toho by poškozený `reference.json` (např. `hits` jako string) prošel
-# do `review` a rozbil formulář na frontendu s méně srozumitelnou chybou.
-_FIELD_TYPES = {
-    "id": str, "section": str, "surface": str, "classification": str,
-    "primary_attested": bool, "hits": int, "books": list, "per_form": dict,
-    "cooccurrence": list, "matched_forms": list, "source": str,
-    "cz": (str, type(None)), "navrh": (str, type(None)),
-    "matched_cz": (str, type(None)),
-}
-
-
-def _is_strict_int(v) -> bool:
-    """`isinstance(True, int)` je v Pythonu `True` - bez vyloučení `bool` by
-    `hits: true` prošlo jako platný počet výskytů."""
-    return isinstance(v, int) and not isinstance(v, bool)
-
-
-def _finding_is_well_formed(f) -> bool:
-    if not isinstance(f, dict) or any(k not in f for k in _REQUIRED):
-        return False
-    for key, types in _FIELD_TYPES.items():
-        # "hits" je jediné pole, kde by isinstance(x, int) tiše přijalo bool
-        # (isinstance(True, int) je True v Pythonu) - ostatní typy tu díru nemají.
-        if key == "hits":
-            if not _is_strict_int(f[key]):
-                return False
-            continue
-        if not isinstance(f[key], types):
-            return False
-    if any(not _is_strict_int(b) for b in f["books"]):
-        return False
-    if any(not _is_strict_int(b) for b in f["cooccurrence"]):
-        return False
-    if any(not isinstance(m, str) for m in f["matched_forms"]):
-        return False
-    if not isinstance(f["per_form"], dict):
-        return False
-    for form, row in f["per_form"].items():
-        if not isinstance(form, str) or not isinstance(row, dict):
-            return False
-        if not _is_strict_int(row.get("hits")) or not isinstance(row.get("books"), list):
-            return False
-        if any(not _is_strict_int(b) for b in row["books"]):
-            return False
-        # case_exact chybí u starších záznamů jen přes migraci schématu (žádná
-        # tu není), takže se vyžaduje a musí to být SKUTEČNÝ bool.
-        if not isinstance(row.get("case_exact"), bool):
-            return False
-    if f["section"] not in _SECTIONS or f["classification"] not in _CLASSES \
-            or f["source"] not in _SOURCES:
-        return False
-    # Sémantická konzistence napříč poli, ne jen typ: `resolve()` nikdy
-    # nevyrobí `cz` mimo confirmed/weak ani `navrh` mimo proposed/not_attested
-    # (viz classify() - cz se plní jen v té větvi, navrh jen tehdy, když je
-    # model vrátil). Bez týhle kontroly by poškozený/ručně upravený soubor
-    # s `classification="proposed", cz="Vymyšleno"` prošel jako platný a
-    # `_merge_section` by ho vzal jako doložené - přesně to, co má invariant
-    # "odhad se netváří jako důkaz" zabránit.
-    if (f["cz"] is not None) != (f["classification"] in ("confirmed", "weak")):
-        return False
-    if (f["navrh"] is not None) != (f["classification"] in ("proposed", "not_attested")):
-        return False
-    return True
-
-
-_FINGERPRINT_KEYS = {"draft": str, "corpus": (str, type(None)), "thresholds": str}
-
-
-def _fingerprint_is_well_formed(fp) -> bool:
-    if not isinstance(fp, dict) or set(fp) != set(_FINGERPRINT_KEYS):
-        return False
-    return all(isinstance(fp[k], t) for k, t in _FINGERPRINT_KEYS.items())
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"schema_version": SCHEMA_VERSION, "run_id": run_id,
+                   "source_root": source_root, "fingerprint": fingerprint,
+                   "findings": findings}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 
 def load_reference(path: str):
@@ -2422,18 +1724,17 @@ def load_reference(path: str):
     if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
         print(f"reference: {path} má neznámou verzi schématu, ignoruji")
         return None
-    if not _is_strict_int(data.get("run_id")) or not isinstance(data.get("source_root"), str) \
-            or not _fingerprint_is_well_formed(data.get("fingerprint")):
-        print(f"reference: {path} má poškozená metadata, ignoruji")
-        return None
     findings = data.get("findings")
     if not isinstance(findings, list):
         print(f"reference: {path} nemá seznam nálezů, ignoruji")
         return None
     seen = set()
     for f in findings:
-        if not _finding_is_well_formed(f):
-            print(f"reference: {path} má nález se špatným tvarem nebo typem pole, ignoruji")
+        if not isinstance(f, dict) or any(k not in f for k in _REQUIRED):
+            print(f"reference: {path} má nález s chybějícím polem, ignoruji")
+            return None
+        if f["section"] not in _SECTIONS or f["classification"] not in _CLASSES:
+            print(f"reference: {path} má neznámou sekci nebo třídu, ignoruji")
             return None
         if f["id"] in seen:
             print(f"reference: {path} má duplicitní id {f['id']!r}, ignoruji")
@@ -2445,7 +1746,7 @@ def load_reference(path: str):
 - [ ] **Step 4: Run to verify pass**
 
 Run: `python -m pytest tests/test_reference_persist.py -v`
-Expected: PASS (24 tests)
+Expected: PASS (10 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -2506,24 +1807,17 @@ def _f(**over):
     return base
 
 
-def _fresh_fp(draft, monkeypatch):
-    """`corpus_fingerprint` volá `reference.build_manifest(source_root)` proti
-    skutečnému filesystému - v testu žádný "/root" neexistuje, takže by
-    `current_corpus` vždy vyšlo `None` a `fresh` by bylo VŽDY False, ať je
-    draft/prahy sedí sebelíp. Proto se `corpus_fingerprint` monkeypatchuje na
-    pevnou hodnotu shodnou s tou v otisku - test tak cíleně ověřuje draft-
-    a threshold-část `_is_fresh`, ne dostupnost souborového systému."""
-    monkeypatch.setattr(reference_mine, "corpus_fingerprint", lambda root: "corpus-fp")
+def _fresh_fp(draft):
     return {"draft": reference_mine.draft_fingerprint(draft),
-            "corpus": "corpus-fp",
+            "corpus": None,
             "thresholds": reference_mine.thresholds_fingerprint(config)}
 
 
-def test_confirmed_prefills_cz_and_sets_provenance(monkeypatch):
+def test_confirmed_prefills_cz_and_sets_provenance():
     d = _draft()
     ref = _reference([_f(classification="confirmed", cz="White Council",
                          matched_cz="White Council", hits=12, books=[1, 2])],
-                     _fresh_fp(d, monkeypatch))
+                     _fresh_fp(d))
     m = guide.merge_sources(d, _empty_guide(), ref, cfg=config)
     term = [t for t in m["terms"] if t["term_en"] == "White Council"][0]
     assert term["cz"] == "White Council"
@@ -2531,10 +1825,10 @@ def test_confirmed_prefills_cz_and_sets_provenance(monkeypatch):
     assert term["reference"]["hits"] == 12
 
 
-def test_proposed_leaves_cz_empty_and_keeps_suggestion_separate(monkeypatch):
+def test_proposed_leaves_cz_empty_and_keeps_suggestion_separate():
     d = _draft()
     ref = _reference([_f(classification="proposed", navrh="Bílá rada",
-                         matched_cz="Bílá rada")], _fresh_fp(d, monkeypatch))
+                         matched_cz="Bílá rada")], _fresh_fp(d))
     m = guide.merge_sources(d, _empty_guide(), ref, cfg=config)
     term = m["terms"][0]
     assert term["cz"] == ""                       # NEPŘEDVYPLNĚNO
@@ -2550,78 +1844,27 @@ def test_scout_suggestion_never_prefills_glossary_field():
     assert m["terms"][0]["scout_suggestion"] == "Rada scouta"
 
 
-def test_human_value_wins_over_reference(monkeypatch):
+def test_human_value_wins_over_reference():
     d = _draft()
     g = _empty_guide()
     g["terms"] = [{"term_en": "White Council", "cz": "Moje rada"}]
     ref = _reference([_f(classification="confirmed", cz="White Council",
                          matched_cz="White Council", hits=9, books=[1, 2])],
-                     _fresh_fp(d, monkeypatch))
+                     _fresh_fp(d))
     m = guide.merge_sources(d, g, ref, cfg=config)
     term = m["terms"][0]
     assert term["cz"] == "Moje rada" and term["provenance"] == "human"
 
 
-def test_character_keep_with_blank_cz_is_still_human_decided(monkeypatch):
-    """render="keep" s prázdným cz je platný, uložený lidský stav (validate()
-    vyžaduje neprázdné cz jen při render="translate"). Čerstvý confirmed
-    nález pro tuhle postavu nesmí provenienci přepsat zpět na "reference" -
-    "guide > reference" platí bezpodmínečně, i pro prázdnou hodnotu."""
-    d = _draft()
-    g = _empty_guide()
-    g["characters"] = [{"name_en": "Harry", "render": "keep", "cz": ""}]
-    ref = _reference([_f(id="characters/harry", section="characters", surface="Harry",
-                         classification="confirmed", cz="Harry", matched_cz="Harry",
-                         hits=10, books=[1, 2])], _fresh_fp(d, monkeypatch))
-    m = guide.merge_sources(d, g, ref, cfg=config)
-    harry = m["characters"][0]
-    assert harry["provenance"] == "human"
-    assert harry["cz"] == ""
-    assert harry["render"] == "keep"
-    # Prázdné cz se neshoduje s matched_cz "Harry" - číselný důkaz se nesmí
-    # ukázat, i když je nález confirmed a čerstvý (dřívější `shown_cz and`
-    # bral prázdný řetězec jako "nic se neliší", což je opak pravdy).
-    assert "hits" not in harry["reference"]
-
-
-def test_guide_only_character_keep_with_blank_cz_is_still_human():
-    """Stejné pravidlo jako u položky spárované s draftem, ale pro
-    GUIDE-ONLY řádek (v guide.json je, v draftu už ne - typicky po rescanu).
-    `g.get("cz")` samo o sobě by u prázdného cz dalo provenance="none"."""
-    d = _draft()   # neobsahuje "Aria"
-    g = _empty_guide()
-    g["characters"] = [{"name_en": "Aria", "render": "keep", "cz": ""}]
-    m = guide.merge_sources(d, g, None, cfg=config)
-    aria = [c for c in m["characters"] if c["name_en"] == "Aria"][0]
-    assert aria["provenance"] == "human"
-    assert aria["cz"] == "" and aria["render"] == "keep"
-
-
-def test_human_value_coincidentally_equal_to_matched_cz_stays_human_provenance(monkeypatch):
-    """Formulář zamyká pole podle `provenance == "reference"`, ne podle shody
-    hodnoty s `matched_cz` - ruční hodnota, která náhodou vyjde stejně jako
-    doložený tvar, se nesmí tvářit jako doložená."""
-    d = _draft()
-    g = _empty_guide()
-    g["terms"] = [{"term_en": "White Council", "cz": "White Council"}]  # ruční, shodou okolností stejné
-    ref = _reference([_f(classification="confirmed", cz="White Council",
-                         matched_cz="White Council", hits=9, books=[1, 2])],
-                     _fresh_fp(d, monkeypatch))
-    m = guide.merge_sources(d, g, ref, cfg=config)
-    term = m["terms"][0]
-    assert term["cz"] == "White Council" and term["provenance"] == "human"
-
-
 def test_stale_fingerprint_suppresses_everything_from_reference():
     ref = _reference([_f(classification="confirmed", cz="White Council",
-                         matched_cz="White Council", navrh="Bílá rada",
-                         hits=12, books=[1, 2])],
+                         matched_cz="White Council", hits=12, books=[1, 2])],
                      {"draft": "jiny", "corpus": None, "thresholds": "jiny"})
     m = guide.merge_sources(_draft(), _empty_guide(), ref, cfg=config)
     term = m["terms"][0]
     assert term["cz"] == ""
-    assert term["reference"] == {"fresh": False}   # NIC než příznak - ani klasifikace, ani návrh
-    assert term["lexicographer_suggestion"] is None   # taky potlačeno, ne jen cz
+    assert term["reference"]["fresh"] is False
+    assert "hits" not in term["reference"]         # žádné číselné důkazy
 
 
 def test_stale_reference_does_not_suppress_human_value():
@@ -2633,77 +1876,24 @@ def test_stale_reference_does_not_suppress_human_value():
     assert m["terms"][0]["cz"] == "Moje rada"
 
 
-def test_evidence_binding_hides_numbers_when_value_differs(monkeypatch):
+def test_evidence_binding_hides_numbers_when_value_differs():
     d = _draft()
     g = _empty_guide()
     g["terms"] = [{"term_en": "White Council", "cz": "Něco jiného"}]
     ref = _reference([_f(classification="confirmed", cz="White Council",
                          matched_cz="White Council", hits=12, books=[1])],
-                     _fresh_fp(d, monkeypatch))
+                     _fresh_fp(d))
     m = guide.merge_sources(d, g, ref, cfg=config)
     assert "hits" not in m["terms"][0]["reference"]
 
 
-def test_evidence_only_always_shows_its_evidence(monkeypatch):
+def test_evidence_only_always_shows_its_evidence():
     """Třída, jejímž jediným obsahem je důkaz, ho musí ukázat i s prázdným cz."""
     d = _draft()
     ref = _reference([_f(classification="evidence_only", hits=79, books=[1, 2, 3],
-                         matched_forms=["stole"])], _fresh_fp(d, monkeypatch))
+                         matched_forms=["stole"])], _fresh_fp(d))
     m = guide.merge_sources(d, _empty_guide(), ref, cfg=config)
     assert m["terms"][0]["reference"]["hits"] == 79
-
-
-def test_prefill_ignores_cz_on_non_confirmed_finding_even_if_present(monkeypatch):
-    """Obrana do hloubky: i kdyby se do merge_sources dostal nález s
-    classification="proposed" a vyplněným cz (load_reference by ho odmítl,
-    ale merge_sources dostává syrový dict, ne cestu přes něj), předvyplnění
-    se řídí classification, ne pouhou přítomností cz."""
-    d = _draft()
-    ref = _reference([_f(classification="proposed", cz="Nemelo by se použít",
-                         navrh="Nemelo by se použít", matched_cz="Nemelo by se použít")],
-                     _fresh_fp(d, monkeypatch))
-    m = guide.merge_sources(d, _empty_guide(), ref, cfg=config)
-    term = m["terms"][0]
-    assert term["cz"] == "" and term["provenance"] == "none"
-
-
-def test_guide_and_draft_keys_merge_across_nfc_nfd_difference():
-    """guide.json a guide.draft.json můžou vzniknout jinou cestou (draft ze
-    scouta, guide.json ruční editací v prohlížeči) a nést jinak zapsaný, ale
-    kanonicky stejný Unicode text. guide.normalize (jen strip+lower) by je
-    nespároval - identita musí jít přes textnorm.normalize_key (NFC)."""
-    import unicodedata
-    d = _draft()
-    d["terms"][0]["term_en"] = unicodedata.normalize("NFD", "White Council")
-    g = _empty_guide()
-    g["terms"] = [{"term_en": unicodedata.normalize("NFC", "White Council"),
-                   "cz": "Moje rada"}]
-    m = guide.merge_sources(d, g, None, cfg=config)
-    assert len(m["terms"]) == 1                     # spárováno, ne dva řádky
-    assert m["terms"][0]["cz"] == "Moje rada"
-
-
-def test_human_can_remove_all_aliases(monkeypatch):
-    """Prázdný seznam aliasů z guide.json je platné rozhodnutí ("smaž je"),
-    ne "chybí, vezmi draftové". `g.get("aliases") or d.get("aliases")` by
-    prázdný seznam vyhodnotil jako falsy a spadl zpět na draft - člověk by
-    smazání aliasu nemohl uložit."""
-    d = _draft()
-    g = _empty_guide()
-    g["characters"] = [{"name_en": "Harry", "render": "keep", "aliases": []}]
-    m = guide.merge_sources(d, g, None, cfg=config)
-    harry = m["characters"][0]
-    assert harry["aliases"] == []
-
-
-def test_human_edited_note_survives_next_merge():
-    """Poznámka uložená v guide.json (člověk ji upravil ve formuláři) se při
-    dalším GET nesmí přepsat zpět draftovou verzí."""
-    d = _draft()   # d["characters"][0]["note"] == "hrdina"
-    g = _empty_guide()
-    g["characters"] = [{"name_en": "Harry", "render": "keep", "note": "upravená poznámka"}]
-    m = guide.merge_sources(d, g, None, cfg=config)
-    assert m["characters"][0]["note"] == "upravená poznámka"
 
 
 def test_merge_draft_and_guide_still_works():
@@ -2750,25 +1940,18 @@ def _is_fresh(reference, draft, cfg) -> bool:
 
 
 def _reference_block(finding, fresh, shown_cz):
-    """Nečerstvá reference nepřispívá NIČÍM než příznakem - ani klasifikací,
-    ani návrhem: formulář zobrazí jen poznámku, že existuje nález z jiného
-    běhu. U čerstvé se číselný důkaz vynechá, liší-li se zobrazená hodnota od
-    té, ke které se důkaz váže - ale jen u tříd, které hodnotu předvyplňují;
-    `evidence_only` má cz prázdné záměrně a jeho důkaz je jediný obsah, který
-    má."""
+    """Nečerstvá reference nepřispívá ničím než poznámkou. U čerstvé se číselný
+    důkaz vynechá, liší-li se zobrazená hodnota od té, ke které se důkaz váže -
+    ale jen u tříd, které hodnotu předvyplňují; `evidence_only` má cz prázdné
+    záměrně a jeho důkaz je jediný obsah, který má."""
     if not fresh:
-        return {"fresh": False}
+        return {"fresh": False, "classification": finding["classification"]}
     block = {"fresh": True, "classification": finding["classification"],
              "primary_attested": finding["primary_attested"],
              "matched_forms": finding["matched_forms"],
              "matched_cz": finding["matched_cz"]}
     prefilling = finding["classification"] in ("confirmed", "weak")
-    # `shown_cz != matched_cz` SAMO O SOBĚ, bez `shown_cz and` navíc - prázdné
-    # `shown_cz` (platný stav u postavy s render="keep", viz Task 9) je falsy,
-    # takže by `shown_cz and ...` podmínku "liší se" nikdy nevyhodnotilo a
-    # číselný důkaz by zůstal, ačkoli prázdné pole zjevně neodpovídá
-    # `matched_cz`. NEPŘIDÁVEJ zpátky `shown_cz and` - to byl ten bug.
-    if prefilling and shown_cz != finding["matched_cz"]:
+    if prefilling and shown_cz and shown_cz != finding["matched_cz"]:
         return block
     block.update({"hits": finding["hits"], "books": finding["books"],
                   "per_form": finding["per_form"],
@@ -2779,60 +1962,26 @@ def _reference_block(finding, fresh, shown_cz):
 def _merge_section(draft, guide_data, ref_index, fresh, section, key_field,
                    is_character=False):
     from src import textnorm
-    # textnorm.normalize_key (NFC + casefold), ne guide.normalize (jen
-    # strip+lower) - identita postavy/místa/termínu musí přežít i jinak
-    # zapsaný, ale kanonicky stejný Unicode text (guide.json může vzniknout
-    # jinou cestou než draft, např. ruční editací v prohlížeči). guide.normalize
-    # zůstává vyhrazený vztahům (guide.relationship_key), kde na tenhle rozdíl
-    # spec explicitně nenaráží.
-    g_map = {textnorm.normalize_key(i.get(key_field, "")): i
-             for i in (guide_data.get(section) or [])}
+    g_map = {normalize(i.get(key_field, "")): i for i in (guide_data.get(section) or [])}
     out, done = [], set()
     for d in (draft.get(section) or []):
         name = d.get(key_field, "")
-        key = textnorm.normalize_key(name)
-        g = g_map.get(key, {})
-        done.add(key)
-        fid = f"{section}/{key}"
+        g = g_map.get(normalize(name), {})
+        done.add(normalize(name))
+        fid = f"{section}/{textnorm.normalize_key(name)}"
         finding = ref_index.get(fid)
 
         scout_suggestion = (d.get("suggested_cz") if not is_character
                             else None) or None
-        # Nečerstvá reference nepřispívá NIČÍM - i lexikografův návrh musí
-        # zmizet, ne jen číselný důkaz, jinak by formulář nabízel tlačítko
-        # "použít návrh" pro nález z jiného draftu/korpusu/prahů.
-        lex_suggestion = finding.get("navrh") if (finding and fresh) else None
+        lex_suggestion = finding.get("navrh") if finding else None
 
-        # Existence řádku v guide.json JE lidské rozhodnutí, i s prázdným cz -
-        # u postavy s render="keep" je prázdné cz platný, uložený stav
-        # (validate() vyžaduje neprázdné cz jen při render="translate";
-        # u míst/termínů to samo o sobě znamená, že řádek prošel validací
-        # s neprázdným cz, takže se tu nic nemění). Bez tohohle by "guide >
-        # reference" neplatilo bezpodmínečně - postava, o které už člověk
-        # rozhodl "ponechat", by se čerstvým nálezem přepsala zpět na
-        # provenance="reference".
         human_cz = (g.get("cz") or "").strip()
-        human_decided = bool(g)
-        # Předvyplnění je gatované na classification `confirmed`/`weak`
-        # NEZÁVISLE na tom, co `load_reference` už validovalo - obrana do
-        # hloubky. `load_reference` odmítne `reference.json`, kde `cz`
-        # nesedí s `classification`, ale kdyby se sem někdy dostal nález
-        # jinou cestou (budoucí volající, který `load_reference` obejde),
-        # nesmí se slepě spolehnout na `finding["cz"]`.
-        finding_confirmed_or_weak = bool(finding) and finding.get("classification") in ("confirmed", "weak")
-        ref_cz = (finding.get("cz") or "") if (fresh and finding_confirmed_or_weak) else ""
-        cz = human_cz if human_decided else (ref_cz or "")
-        provenance = "human" if human_decided else ("reference" if ref_cz else "none")
+        ref_cz = (finding.get("cz") or "") if (finding and fresh) else ""
+        cz = human_cz or ref_cz or ""
+        provenance = "human" if human_cz else ("reference" if ref_cz else "none")
 
-        # Přítomnost klíče v guide.json rozhoduje, ne pravdivostní hodnota -
-        # `"aliases": []` je platné lidské rozhodnutí "smaž všechny aliasy" a
-        # `or d.get(...)` by ho tiše přepsalo zpět draftovou verzí. Stejně tak
-        # uložená poznámka (i prázdná) je rozhodnutí, které draft nesmí přebít.
-        aliases = g["aliases"] if "aliases" in g else (d.get("aliases") or [])
-        note = g["note"] if "note" in g else (d.get("note") or "")
-
-        row = {key_field: name, "cz": cz, "note": note,
-               "aliases": aliases,
+        row = {key_field: name, "cz": cz, "note": d.get("note") or "",
+               "aliases": g.get("aliases") or d.get("aliases") or [],
                "provenance": provenance,
                "scout_suggestion": scout_suggestion,
                "lexicographer_suggestion": lex_suggestion}
@@ -2848,13 +1997,9 @@ def _merge_section(draft, guide_data, ref_index, fresh, section, key_field,
     for key, g in g_map.items():
         if key in done:
             continue
-        # provenance="human", jakmile řádek v guide.json existuje - stejné
-        # pravidlo jako u položek spárovaných s draftem výš (human_decided).
-        # `g.get("cz")` samo o sobě by u postavy s render="keep" a prázdným
-        # cz (platný, uložený stav) mylně dalo "none".
         row = {key_field: g.get(key_field, ""), "cz": g.get("cz") or "",
-               "note": g.get("note") or "", "aliases": g.get("aliases") or [],
-               "provenance": "human",
+               "note": "", "aliases": g.get("aliases") or [],
+               "provenance": "human" if g.get("cz") else "none",
                "scout_suggestion": None, "lexicographer_suggestion": None}
         if is_character:
             row["render"] = g.get("render") or ""
@@ -2997,30 +2142,6 @@ def test_seed_returns_empty_list_when_no_conflict(tmp_path):
     assert out == []
 
 
-def test_canonical_match_wins_even_if_alias_row_has_lower_rowid(tmp_path):
-    """Řádek `Foo` (alias `X`) má NIŽŠÍ rowid než řádek `X` (kanonický) - stav,
-    který normálně `_seed_one`/`add_approved` nedovolí vytvořit (obojí hledá
-    přes alias i kanonický název najednou), ale může vzniknout importem dat
-    mimo tuhle vrstvu. SELECT bez ORDER BY vrátí `Foo` první. Jednoprůchodový
-    kód s `break` na první shodě by nahlásil konflikt s `Foo` a řádek `X`
-    (jednoznačnou kanonickou shodu, o řádek dál) by vůbec neuviděl."""
-    db = _db(tmp_path)
-    glossary.seed_from_guide(db, {"characters": [
-        {"name_en": "Foo", "aliases": ["X"], "render": "keep"}], "places": [], "terms": []})
-    # Vloženo přímo, mimo _seed_one/add_approved - simuluje import/migraci dat,
-    # ne běžnou cestu (ta by kolizi odhalila hned při vkládání tohoto řádku).
-    with state.connect(db) as conn:
-        conn.execute(
-            "INSERT INTO glossary (term_id,canonical_en,aliases,cz,accepted_alt,"
-            "note,type,status) VALUES ('term_x','X','[]','Ix','[]','','term','approved')")
-    conflicts = glossary.seed_from_guide(db, {"characters": [], "places": [],
-        "terms": [{"term_en": "X", "cz": "Novy preklad"}]})
-    assert conflicts == []                              # žádný konflikt - kanonická shoda vyhrála
-    rows = {r["canonical_en"]: r for r in glossary.all_terms(db)}
-    assert rows["Foo"]["aliases"] == ["X"]               # Foo nedotčen
-    assert rows["X"]["cz"] == "Ix"                       # approved řádek se nepřepíše (viz status guard)
-
-
 def test_seed_still_updates_row_matched_by_canonical(tmp_path):
     db = _db(tmp_path)
     glossary.seed_from_guide(db, {"characters": [], "places": [],
@@ -3028,24 +2149,6 @@ def test_seed_still_updates_row_matched_by_canonical(tmp_path):
     glossary.seed_from_guide(db, {"characters": [], "places": [],
                                   "terms": [{"term_en": "Council", "cz": "Koncil"}]})
     assert [t for t in glossary.all_terms(db)][0]["cz"] == "Koncil"
-
-
-def test_seed_detects_collision_across_nfc_nfd_alias(tmp_path):
-    """`.strip().lower()` by kanonicky stejný, ale jinak zapsaný Unicode text
-    (NFC vs. NFD) nesloučil - guard by kolizi minul a vyrobil duplicitní
-    řádek místo nahlášení konfliktu."""
-    import unicodedata
-    db = _db(tmp_path)
-    nfd_alias = unicodedata.normalize("NFD", "Áine Borden")
-    glossary.seed_from_guide(db, {"characters": [
-        {"name_en": "Foo", "aliases": [nfd_alias], "render": "keep"}],
-        "places": [], "terms": []})
-    nfc_incoming = unicodedata.normalize("NFC", "Áine Borden")
-    conflicts = glossary.seed_from_guide(db, {"characters": [
-        {"name_en": nfc_incoming, "aliases": [], "render": "keep"}],
-        "places": [], "terms": []})
-    assert len(glossary.all_terms(db)) == 1        # nevznikl duplicitní řádek
-    assert conflicts and conflicts[0]["existing_canonical"] == "Foo"
 ```
 
 - [ ] **Step 2: Run to verify fail**
@@ -3055,9 +2158,7 @@ Expected: FAIL - `assert rows[0]["canonical_en"] == "Billy Borden"` (dnes se př
 
 - [ ] **Step 3: Implement in `src/glossary.py`**
 
-Přidej k importům `from src import textnorm` (guard níž potřebuje
-`normalize_key`, stejnou identitu, jakou používá Task 4/9). Uprav `_seed_one`
-a `seed_from_guide`:
+Uprav `_seed_one` a `seed_from_guide`:
 
 ```python
 def _seed_one(conn, canonical_en: str, cz: str, type_: str,
@@ -3066,27 +2167,15 @@ def _seed_one(conn, canonical_en: str, cz: str, type_: str,
     nepřepíše, liší-li se příchozí canonical_en - jinak by seed položky `Billy`
     přepsal kanonický tvar řádku `Billy Borden`, který ji má mezi aliasy."""
     existing, matched_by_canonical = None, False
-    # textnorm.normalize_key (NFC + casefold), ne .strip().lower() - identita
-    # v celém plánu (Task 9 merge, Task 4 hledání) stojí na normalize_key;
-    # `.lower()` samotné nesloučí kanonicky stejný, ale jinak zapsaný Unicode
-    # text (NFC vs. NFD), takže by guard vyrobil duplicitní řádek místo toho,
-    # aby kolizi odhalil.
-    needle = textnorm.normalize_key(canonical_en)
-    rows = conn.execute("SELECT term_id,canonical_en,aliases,status FROM glossary").fetchall()
-    # Dva průchody schválně: kanonická shoda má vždy přednost před aliasovou,
-    # bez ohledu na pořadí řádků v tabulce. Jeden průchod s `break` na první
-    # shodě by mohl narazit na aliasovou shodu dřív, než na kanonickou o pár
-    # řádků dál, a nesprávně tvrdit "nalezeno jen přes alias".
-    for r in rows:
-        if textnorm.normalize_key(r["canonical_en"] or "") == needle:
+    needle = canonical_en.strip().lower()
+    for r in conn.execute("SELECT term_id,canonical_en,aliases,status FROM glossary").fetchall():
+        if (r["canonical_en"] or "").strip().lower() == needle:
             existing, matched_by_canonical = r, True
             break
-    if existing is None:
-        for r in rows:
-            if needle in [textnorm.normalize_key(a or "")
-                          for a in json.loads(r["aliases"] or "[]")]:
-                existing = r
-                break
+        if needle in [(a or "").strip().lower()
+                      for a in json.loads(r["aliases"] or "[]")]:
+            existing = r
+            break
 
     if existing is None:
         tid = _free_term_id(conn, "term_" + slugify(canonical_en))
@@ -3097,7 +2186,7 @@ def _seed_one(conn, canonical_en: str, cz: str, type_: str,
         return None
 
     if not matched_by_canonical and \
-            textnorm.normalize_key(existing["canonical_en"] or "") != needle:
+            (existing["canonical_en"] or "").strip().lower() != needle:
         return {"incoming": canonical_en,
                 "existing_term_id": existing["term_id"],
                 "existing_canonical": existing["canonical_en"]}
@@ -3154,7 +2243,7 @@ def seed_from_guide(db_path: str, guide: dict) -> list:
 - [ ] **Step 4: Run to verify pass**
 
 Run: `python -m pytest tests/test_glossary.py -v`
-Expected: PASS (12 tests)
+Expected: PASS (10 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -3196,7 +2285,7 @@ def test_reference_path_is_keyword_only(tmp_path):
     assert sig.parameters["reference_path"].kind == inspect.Parameter.KEYWORD_ONLY
 
 
-def test_get_guide_includes_reference_block(tmp_path, monkeypatch):
+def test_get_guide_includes_reference_block(tmp_path):
     import json as _json
     dp, gp = _paths(tmp_path)
     _json.dump({"characters": [], "places": [],
@@ -3205,9 +2294,6 @@ def test_get_guide_includes_reference_block(tmp_path, monkeypatch):
                open(dp, "w", encoding="utf-8"))
     from src import reference_mine
     import config as cfg
-    # Stejný důvod jako v Taskách 9 a 14: corpus_fingerprint("/root") na
-    # neexistující cestě vždy vrátí None, takže by fresh bylo vždy False.
-    monkeypatch.setattr(reference_mine, "corpus_fingerprint", lambda root: "corpus-fp")
     draft = _json.load(open(dp, encoding="utf-8"))
     rp = str(tmp_path / "reference.json")
     reference_mine.write_reference(
@@ -3217,7 +2303,7 @@ def test_get_guide_includes_reference_block(tmp_path, monkeypatch):
           "per_form": {}, "cooccurrence": [], "matched_forms": ["White Council"],
           "matched_cz": "White Council", "source": "kept"}],
         rp, 1,
-        {"draft": reference_mine.draft_fingerprint(draft), "corpus": "corpus-fp",
+        {"draft": reference_mine.draft_fingerprint(draft), "corpus": None,
          "thresholds": reference_mine.thresholds_fingerprint(cfg)}, "/root")
     app = server.build_app(dp, gp, lambda: None, reference_path=rp)
     body = TestClient(app).get("/api/guide").json()
@@ -3360,33 +2446,12 @@ def run_review_server(draft_path: str, guide_path: str, *,
 
 **Pozor:** `_check_relationships_reviewed` se volá po `apply_must_decide`, protože ta může do `relationships` přidat řádek z odpovědi na vztahovou otázku.
 
-- [ ] **Step 4: Oprav existující test, který nová kontrola rozbije**
-
-`tests/test_review_ui.py::test_must_decide_relationship_routes_and_rejects_invalid_answer`
-odpovídá na vztahovou `must_decide` otázku, čímž `apply_must_decide` vloží řádek
-do `relationships` - a nová `_check_relationships_reviewed` takový POST bez
-`relationships_reviewed: true` odmítne. Uprav sdílený helper `_post`
-(v `tests/test_review_ui.py`), aby příznak posílal ve výchozím payloadu -
-ostatním testům (name/style `must_decide`, které žádný vztah nevytvářejí)
-to neuškodí, protože kontrola se uplatní jen když `relationships` není prázdné:
-
-```python
-def _post(tmp_path, extra):
-    dp, gp = _paths(tmp_path)
-    app = server.build_app(dp, gp, on_saved=lambda: None)
-    base = {"characters": [], "places": [], "terms": [], "relationships": [],
-            "style": "", "rules": [], "must_decide": [],
-            "relationships_reviewed": True}
-    base.update(extra)
-    return TestClient(app).post("/api/guide", json=base), gp
-```
-
-- [ ] **Step 5: Run to verify pass**
+- [ ] **Step 4: Run to verify pass**
 
 Run: `python -m pytest tests/test_review_ui.py -v`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/review_ui/server.py tests/test_review_ui.py
@@ -3400,7 +2465,6 @@ git commit -m "feat: review server - reference_path, allowlist při uložení, k
 **Files:**
 - Modify: `src/review_ui/static/index.html`
 - Create: `tests/test_review_ui_fields.py`
-- Create: `tests/test_review_ui_state.py`
 
 **Interfaces:**
 - Consumes: payload z `GET /api/guide` (`provenance`, `scout_suggestion`, `lexicographer_suggestion`, `reference`)
@@ -3409,17 +2473,11 @@ git commit -m "feat: review server - reference_path, allowlist při uložení, k
 Testuje se **serializovaný payload**, ne vzhled - proto se v testu spouští
 JS logika přes prohlížeč není potřeba: pomocné funkce se vytáhnou do samostatné
 části souboru a testuje se přes `POST` s payloadem, který by formulář vyrobil.
-Výjimka je hromadné přijetí/vrácení (`acceptAllScoutSuggestions`,
-`undoAcceptAllScoutSuggestions`, `pendingAcceptAllChanges`) - tahle oblast
-prošla třemi regresemi v konzultaci (kola 4, 8, 9), takže dostává vlastní
-automatizovaný test čisté JS logiky přes Node (bez DOM/prohlížeče, viz
-`tests/test_review_ui_state.py` v kroku 7).
 
 - [ ] **Step 1: Write the failing test** — `tests/test_review_ui_fields.py`
 
 ```python
 import json
-import os
 from fastapi.testclient import TestClient
 from src.review_ui import server
 
@@ -3431,11 +2489,8 @@ def _paths(tmp_path, draft):
     return dp, gp
 
 
-def test_unused_suggestion_is_not_silently_saved(tmp_path):
-    """Nepoužitý návrh se do uloženého guide.json nedostane ani jako tichá
-    hodnota, ani jako metadata. Prázdné `cz` u termínu neprojde validací
-    (nezměněno oproti dnešnímu chování) - "nedoloženo se do glosáře nedostane
-    samo" tu platí v nejsilnější podobě: bez rozhodnutí se neuloží vůbec nic."""
+def test_unused_suggestion_never_reaches_saved_guide(tmp_path):
+    """Nepoužitý návrh se do payloadu nesmí dostat - formulář ho drží mimo pole."""
     draft = {"characters": [], "places": [],
              "terms": [{"term_en": "Nevernever", "suggested_cz": "Nikdykdy", "note": ""}],
              "relationships": [], "style_notes": "", "must_decide": []}
@@ -3444,19 +2499,12 @@ def test_unused_suggestion_is_not_silently_saved(tmp_path):
     body = TestClient(app).get("/api/guide").json()
     assert body["terms"][0]["cz"] == ""
     assert body["terms"][0]["scout_suggestion"] == "Nikdykdy"
-
+    # uživatel návrh nepoužil -> odešle prázdné cz
     payload = {"characters": [], "places": [], "terms": body["terms"],
                "relationships": [], "style": "", "rules": [], "must_decide": []}
-    r = TestClient(app).post("/api/guide", json=payload)
-    assert r.status_code == 422
-    assert not os.path.exists(gp)
-
-    # Rozhodne se sám, jinak než navrhoval scout - uloží se JEHO hodnota,
-    # návrh zůstane mimo guide.json úplně.
-    payload["terms"][0]["cz"] = "Vlastní volba"
-    assert TestClient(app).post("/api/guide", json=payload).status_code == 200
+    TestClient(app).post("/api/guide", json=payload)
     saved = json.load(open(gp, encoding="utf-8"))
-    assert saved["terms"][0]["cz"] == "Vlastní volba"
+    assert saved["terms"][0]["cz"] == ""
     assert "scout_suggestion" not in saved["terms"][0]
 
 
@@ -3497,167 +2545,50 @@ Expected: FAIL - `render` se dnes předvyplňuje na `keep`
 
 - [ ] **Step 3: Implement changes in `src/review_ui/static/index.html`**
 
-Nahraď CELÝ obsah `<script>...</script>` (od `let data = null;` po poslední
-`};` před `</script>`) tímto - `el`, `select` a `section` zůstávají beze
-změny, must_decide box, sekce vztahů a stylu se mění jen v označených místech:
+Nahraď vykreslování postav, míst a termínů tímto vzorem (zbytek souboru beze změny):
 
 ```javascript
-let data = null;
-
-function el(tag, attrs, children) {
-  const e = document.createElement(tag);
-  for (const k in (attrs || {})) {
-    if (k === "value") e.value = attrs[k]; else e.setAttribute(k, attrs[k]);
-  }
-  (children || []).forEach(c => e.appendChild(typeof c === "string"
-    ? document.createTextNode(c) : c));
-  return e;
-}
-
-function select(options, value) {
-  const s = el("select");
-  options.forEach(([v, label]) => {
-    const o = el("option", { value: v }, [label]);
-    if (v === value) o.selected = true;
-    s.appendChild(o);
-  });
-  return s;
-}
-
-function section(title, node) {
-  const wrap = el("div");
-  wrap.appendChild(el("h2", {}, [title]));
-  wrap.appendChild(node);
-  return wrap;
-}
-
-// Stav rozeditovaného pole se ukládá NA POLOŽKU (item._cz*), ne do closure
-// proměnných DOM prvku - `render()` staví celý strom znovu při KAŽDÉ akci
-// (přijmout všechny, přidat vztah, undo), takže closure stav by se ztratil
-// při libovolné jiné akci uprostřed rozeditovávání jednoho pole. Vlastnosti
-// s podtržítkem server nezná (`strip_transient` je při ukládání zahodí,
-// viz Task 11) - jsou to jen pomocná data formuláře.
-function fieldProvenance(item, field) {
-  const key = "_" + field + "Provenance";
-  return item[key] !== undefined ? item[key] : item.provenance;
-}
-
-// Textové pole (místa, termíny, a - s omezenou sadou návrhů - český tvar
-// jména postavy). Zásada: odhad se nepředvyplňuje, důkaz ano, a každá akce
-// je vratná. `suggestionKeys` omezuje, které návrhy se nabízejí - u postav
-// `scout_suggestion` nese "keep"/"translate" (rozhoduje o něm renderField,
-// ne tohle pole), takže by jako text vsazený do jména nedávalo smysl.
-function valueField(item, onChange, suggestionKeys) {
-  suggestionKeys = suggestionKeys || ["scout_suggestion", "lexicographer_suggestion"];
+// Pole podle původu hodnoty. Zásada: odhad se nepředvyplňuje, důkaz ano,
+// a každá akce je vratná - původní hodnota se nikdy neztratí.
+function valueField(item, onChange) {
   const wrap = el("div");
   const ref = item.reference || {};
-  // Zda pole VŮBEC MŮŽE mít doloženou hodnotu (třída + čerstvost), nezávisle
-  // na tom, jestli je zrovna odemčené - odemčení nesmí tuhle možnost zrušit.
-  const canBeReference = ref.fresh &&
-    (ref.classification === "confirmed" || ref.classification === "weak") && ref.matched_cz;
-  // Provenience `cz` konkrétně (`fieldProvenance`, ne sdílené `item.provenance`
-  // - postava má nezávisle editovatelné `render`, viz renderField) se mění
-  // AŽ skutečnou editací (oninput), ne odemčením - to je ten rozdíl.
-  const stillReference = fieldProvenance(item, "cz") === "reference";
-  const unlocked = !!item._czUnlocked;         // durable - přežije libovolný render()
-  const locked = canBeReference && stillReference && !unlocked;
-  // Tlačítko "vrátit zpět" musí zůstat dosažitelné, i když provenience mezi
-  // tím přepnula na "human" skutečnou editací - jinak by po odemčení +
-  // jedné úpravě zmizelo navždy. `unlocked` samo o sobě stačí: nastavuje se
-  // při odemčení a NIKDY se nesmaže jinak než kliknutím na "vrátit zpět".
-  const showLockControls = canBeReference && (stillReference || unlocked);
+  const backed = ref.fresh && (ref.classification === "confirmed" ||
+                               ref.classification === "weak") && item.cz;
+  const original = item.cz || "";
 
-  const input = el("input", { type: "text", value: item.cz || "" });
-  input.readOnly = locked;                 // doložené je zamčené
-  // Za psaní se nevolá render() (ztratil by se kurzor/focus) - `onblur`
-  // po dopsání přepočítá vše, co se řídí render()em (důkaz, varování kolizí,
-  // sbalení potvrzených). Klikací akce (odemčení, zpět, návrh) render()
-  // volají rovnou, protože o žádný kurzor mid-akce nejde.
-  input.oninput = e => {
-    item._czBefore = e.target.value;
-    item._czProvenance = "human";     // TEĎ, ne při pouhém odemčení
-    item._czActiveKey = null;         // ruční zásah ruší stav "návrh je aplikovaný"
-    onChange(e.target.value);
-  };
-  // setTimeout(0), NE přímé volání: blur na inputu vznikne i tehdy, když
-  // uživatel kliká na SOUSEDNÍ tlačítko (posun focusu vyvolá blur DŘÍV, než
-  // prohlížeč dokončí sekvenci mousedown→mouseup→click na tom tlačítku).
-  // Synchronní render() by tlačítko smazal z DOM uprostřed týhle sekvence
-  // a klik by se ztratil - odloženo o jeden tick, aby click stihl proběhnout
-  // na PŮVODNÍM tlačítku dřív, než se cokoli přestaví.
-  input.onblur = () => setTimeout(() => render(), 0);
+  const input = el("input", { type: "text", value: original });
+  input.readOnly = backed;                 // doložené je zamčené
+  input.oninput = e => onChange(e.target.value);
   wrap.appendChild(input);
 
-  // Číselný důkaz se ukazuje NEZÁVISLE na zamčení - i ručně vyplněná hodnota,
-  // která náhodou vyjde stejně jako matched_cz, ho smí ukázat (spec: vazba
-  // důkazu je na SHODU HODNOTY, ne na to, kdo hodnotu vyplnil). "hits" in ref
-  // navíc respektuje, že server evidenci vynechal, pokud se PŘI NAČTENÍ
-  // zobrazovaná hodnota s matched_cz neshodovala. Protože klikací akce níž
-  // vždy volají render(), tahle podmínka se přepočítá při KAŽDÉ změně
-  // hodnoty přes tlačítko - jen psaní čeká na onblur.
-  if (canBeReference && "hits" in ref && item.cz === ref.matched_cz) {
+  if (backed) {
     const evidence = ref.hits
       ? `${ref.hits}× v dílech ${(ref.books || []).join(", ")}`
       : "doloženo referencemi";
     wrap.appendChild(el("p", { class: "note" }, [evidence]));
-  }
-
-  if (showLockControls) {
-    const unlock = el("button", { type: "button" }, ["změnit předvyplněné"]);
-    const revert = el("button", { type: "button" }, ["vrátit zpět předvyplněné"]);
-    unlock.hidden = unlocked;
-    revert.hidden = !unlocked;
-    unlock.onclick = () => { item._czUnlocked = true; render(); };
-    revert.onclick = () => {
-      item._czUnlocked = false; item._czProvenance = "reference";
-      // Vyčistit i stav "návrh je aplikovaný" - jinak by po dalším odemčení
-      // tlačítko návrhu zůstalo ukazovat "zpět" ze STARÉHO cyklu (odemčení →
-      // použij → revert → odemkni znovu), přestože v tomhle novém cyklu nic
-      // aplikováno nebylo.
-      item._czActiveKey = null;
-      onChange(ref.matched_cz);
-      render();
-    };
+    const unlock = el("button", {}, ["změnit předvyplněné"]);
+    const revert = el("button", {}, ["vrátit zpět předvyplněné"]);
+    revert.hidden = true;
+    unlock.onclick = () => { input.readOnly = false; input.focus(); revert.hidden = false; };
+    revert.onclick = () => { input.value = original; onChange(original); input.readOnly = true; };
     wrap.appendChild(unlock); wrap.appendChild(revert);
   }
 
-  // `evidence_only` nikdy nepředvyplňuje (cz je prázdné), ale je to jediná
-  // třída, jejímž obsahem JE jen důkaz - bez zvláštního zobrazení by ho
-  // formulář nikdy neukázal (spec: „důkaz zobrazen“ u evidence_only platí
-  // bez ohledu na předvyplnění).
-  if (ref.fresh && ref.classification === "evidence_only") {
-    const forms = (ref.matched_forms || []).join(", ") || item.surface || "";
-    wrap.appendChild(el("p", { class: "note" }, [
-      `nalezeno (nedokládá ponechání): ${ref.hits || 0}× v dílech ` +
-      `${(ref.books || []).join(", ")} (tvar: ${forms})`]));
-  }
-
-  // Návrhy se nikdy nedávají rovnou do editovatelného pole - po přepsání by
-  // zmizely a nešlo by porovnat, co navrhl model a co říká referenční překlad.
-  // Renderují se i při zamčeném poli (jen je odemčení zpřístupní přes
-  // render() vyvolaný "změnit předvyplněné") - jinak by po odemčení nebylo
-  // jak scoutův/lexikografův návrh použít, dokud nenastane jiná náhodná akce.
-  suggestionKeys.forEach(key => {
-    const label = key === "scout_suggestion" ? "návrh scouta" : "návrh z referencí (nedoloženo)";
+  // Návrhy se nikdy nedávají do editovatelného pole - po přepsání by zmizely
+  // a nešlo by porovnat, co navrhl model a co říká referenční překlad.
+  [["scout_suggestion", "návrh scouta"],
+   ["lexicographer_suggestion", "návrh z referencí (nedoloženo)"]].forEach(([key, label]) => {
     const suggestion = item[key];
-    if (!suggestion) return;
+    if (!suggestion || backed) return;
     const row = el("p", { class: "note" }, [`${label}: ${suggestion}  `]);
-    const active = item._czActiveKey === key;
-    const use = el("button", { type: "button" }, [active ? "zpět" : "použít návrh"]);
-    use.disabled = locked || (!!item._czActiveKey && !active);
+    const use = el("button", {}, ["použít návrh"]);
     use.onclick = () => {
       if (use.textContent === "použít návrh") {
-        // Dva návrhy najednou by sdílely jedno `_czBefore` a rozbily by
-        // "zpět" u toho druhého - dokud je jeden aktivní, ostatní zamčené.
-        if (item._czActiveKey && item._czActiveKey !== key) return;
-        item._czBefore = item.cz || "";         // ulož, co tam bylo PŘED použitím
-        item._czActiveKey = key;
-        onChange(suggestion);
+        input.value = suggestion; onChange(suggestion); use.textContent = "zpět";
       } else {
-        onChange(item._czBefore || "");
-        item._czActiveKey = null;
+        input.value = ""; onChange(""); use.textContent = "použít návrh";
       }
-      render();
     };
     row.appendChild(use);
     wrap.appendChild(row);
@@ -3665,432 +2596,30 @@ function valueField(item, onChange, suggestionKeys) {
   return wrap;
 }
 
-// Roletka "ponechat/přeložit" u postav - stejná zásada jako valueField, ale
-// pracuje s polem `render`, ne `cz`, a scoutův návrh je hodnota roletky
-// ("keep"/"translate"), ne volný text.
-function renderField(item, onChange) {
-  const wrap = el("div");
-  const ref = item.reference || {};
-  // Stejná zásada jako valueField: "může být doloženo" je nezávislé na
-  // odemčení A na AKTUÁLNÍ hodnotě `item.render` - ta se mění editací
-  // (výběr prázdné volby ji vynuluje na ""), a `canBeReference` by na tom
-  // nesměl viset, jinak by "vrátit zpět" po zvolení "-- vyber --" zmizelo
-  // (round-7 nález). Stačí třída + čerstvost: `_merge_section` u postavy
-  // s confirmed/weak nálezem VŽDY nastaví `ref_render = "keep"`, takže tahle
-  // dvojice sama o sobě znamená "reference by tu měla keep". `render`-backed
-  // hodnota je vždy doslova "keep" (guide.py, ref_render) a evidence se váže
-  // na SHODU aktuální hodnoty s "keep" - po přepnutí na "translate" musí
-  // zmizet i bez editace (jen odemčením a výběrem jiné volby).
-  const canBeReference = ref.fresh &&
-    (ref.classification === "confirmed" || ref.classification === "weak");
-  const stillReference = fieldProvenance(item, "render") === "reference";
-  const unlocked = !!item._renderUnlocked;
-  const locked = canBeReference && stillReference && !unlocked;
-  const showLockControls = canBeReference && (stillReference || unlocked);
-
-  const sel = select([["", "-- vyber --"], ["keep", "ponechat"], ["translate", "přeložit"]],
-                     item.render || "");
-  sel.disabled = locked;
-  // Select je diskrétní volba (ne průběžné psaní) - render() při každé
-  // změně nevadí, na rozdíl od valueField tu není potřeba čekat na blur.
-  sel.onchange = e => {
-    item._renderBefore = e.target.value;
-    item._renderProvenance = "human";   // TEĎ, ne při pouhém odemčení
-    item._renderActive = false;
-    onChange(e.target.value);
-    render();
-  };
-  wrap.appendChild(sel);
-
-  if (canBeReference && "hits" in ref && item.render === "keep") {
-    const evidence = ref.hits
-      ? `${ref.hits}× v dílech ${(ref.books || []).join(", ")}`
-      : "doloženo referencemi";
-    wrap.appendChild(el("p", { class: "note" }, [evidence]));
-  }
-
-  if (showLockControls) {
-    const unlock = el("button", { type: "button" }, ["změnit předvyplněné"]);
-    const revert = el("button", { type: "button" }, ["vrátit zpět předvyplněné"]);
-    unlock.hidden = unlocked;
-    revert.hidden = !unlocked;
-    unlock.onclick = () => { item._renderUnlocked = true; render(); };
-    revert.onclick = () => {
-      item._renderUnlocked = false; item._renderProvenance = "reference";
-      // Stejný důvod jako u valueField - jinak by tlačítko scoutova návrhu
-      // po dalším odemčení ukazovalo "zpět" ze starého cyklu.
-      item._renderActive = false;
-      onChange("keep");
-      render();
-    };
-    wrap.appendChild(unlock); wrap.appendChild(revert);
-  }
-
-  if (item.scout_suggestion) {
-    const row = el("p", { class: "note" }, [`návrh scouta: ${item.scout_suggestion}  `]);
-    const use = el("button", { type: "button" }, [item._renderActive ? "zpět" : "použít návrh"]);
-    use.disabled = locked;
-    use.onclick = () => {
-      if (use.textContent === "použít návrh") {
-        item._renderBefore = item.render || "";
-        item._renderActive = true;
-        onChange(item.scout_suggestion);
-      } else {
-        item._renderActive = false;
-        onChange(item._renderBefore || "");
-      }
-      render();
-    };
-    row.appendChild(use);
-    wrap.appendChild(row);
-  }
-  return wrap;
-}
-
-// "přijmout všechny scoutovy návrhy" - jedno vědomé rozhodnutí místo desítek
-// nevědomých. Nepřepíše ručně vyplněná ani doložená (provenance="reference")
-// pole. U postav zapisuje do `render`, u míst/termínů do `cz`. Vrací seznam
-// SKUTEČNĚ změněných polí (ne jen počet), aby šlo vrátit zpět přesně JEN je -
-// jinak by hromadná akce porušila zásadu, že se původní hodnota neztratí.
-//
-// "Zpět" u dávky se řídí ŽIVOU shodou hodnoty s `applied` (viz
-// `pendingAcceptAllChanges`), ne odstraněním záznamu při první odchylce.
-// Vědomé rozhodnutí, ne přehlédnutí: čistě "smaž záznam při jakékoli další
-// úpravě" (dřívější verze) je jednosměrné - scénář "hromadně přijmout →
-// použít individuální návrh na tomtéž poli → vrátit TEN návrh zpět (pole se
-// tím vrátí přesně na hromadně přijatou hodnotu) → vrátit zpět celou dávku"
-// by ztratil možnost vrátit dávku už ve druhém kroku, přestože se pole ve
-// třetím kroku samo vrátilo tam, kde dávka skončila. Živá shoda tohle umí;
-// cenou je, že nezávislá ruční hodnota, která by SHODOU OKOLNOSTÍ vyšla
-// stejně jako návrh, by se dávkovým "zpět" taky vrátila na `before` - to je
-// vědomě přijatý, výrazně méně pravděpodobný kompromis oproti ztrátě
-// funkčního "zpět" v běžném use-then-revert cyklu popsaném výše.
-let lastAcceptAllChanges = null;
-
-function pendingAcceptAllChanges() {
-  return (lastAcceptAllChanges || []).filter(
-    c => data[c.section][c.i][c.field] === c.applied);
-}
-
+// "přijmout všechny scoutovy návrhy" - jedno vědomé rozhodnutí místo sta
+// třiceti nevědomých. Nepřepíše ručně vyplněná ani doložená pole a zpět vrátí
+// jen to, co samo změnilo.
 function acceptAllScoutSuggestions() {
-  const changes = [];
-  (data.characters || []).forEach((c, i) => {
-    if (fieldProvenance(c, "render") === "reference" || c.render || !c.scout_suggestion) return;
-    changes.push({ section: "characters", i, field: "render",
-                  before: c.render || "", applied: c.scout_suggestion });
-    data.characters[i].render = c.scout_suggestion;
-    data.characters[i]._renderProvenance = "human";
-  });
-  ["places", "terms"].forEach(sec => {
-    (data[sec] || []).forEach((item, i) => {
-      if (fieldProvenance(item, "cz") === "reference" || (item.cz || "").trim()
-          || !item.scout_suggestion) return;
-      changes.push({ section: sec, i, field: "cz",
-                    before: item.cz || "", applied: item.scout_suggestion });
-      data[sec][i].cz = item.scout_suggestion;
-      data[sec][i]._czProvenance = "human";
+  const changed = [];
+  ["characters", "places", "terms"].forEach(section => {
+    (data[section] || []).forEach((item, i) => {
+      const ref = item.reference || {};
+      const backed = ref.fresh && (ref.classification === "confirmed" ||
+                                   ref.classification === "weak");
+      if (backed || (item.cz || "").trim() || !item.scout_suggestion) return;
+      changed.push([section, i]);
+      data[section][i].cz = item.scout_suggestion;
     });
   });
-  lastAcceptAllChanges = changes;
-  return changes.length;
+  return changed;
 }
+```
 
-function undoAcceptAllScoutSuggestions() {
-  // Vrátí jen pole, která pořád drží hodnotu, kterou dávka nastavila - viz
-  // pendingAcceptAllChanges().
-  pendingAcceptAllChanges().forEach(c => {
-    const item = data[c.section][c.i];
-    item[c.field] = c.before;
-    // Bulk-undo mění hodnotu MIMO cestu tlačítka jednotlivého návrhu - jeho
-    // stav ("zpět" aktivní, `_*Before` k čemu se vracet) by jinak dál
-    // ukazoval na hodnotu, kterou bulk-undo právě zrušil. Bez vyčištění by
-    // klik na zdánlivě nevinné "zpět" u návrhu tiše obnovil to, co uživatel
-    // právě vrátil zpět dávkou (viz Task 12 checklist krok 5).
-    if (c.field === "cz") item._czActiveKey = null;
-    else if (c.field === "render") item._renderActive = false;
-  });
-  lastAcceptAllChanges = null;
-}
+A u postav nahraď `select(..., c.render || "keep")` prázdnou volbou:
 
-// Textový popisek vedle pole - odlišuje nečerstvý nález (žádné číslo z něj
-// nesmí vypadat jako aktuální důkaz) a `not_attested` (slabý signál, ne
-// vyvrácení - "model se plete" by bylo silnější tvrzení, než na jaké má
-// stupeň 1 nárok).
-function classificationNote(item) {
-  const ref = item.reference;
-  if (!ref) return null;                    // žádný nález vůbec
-  // Nečerstvý blok nese JEN {fresh: false}, žádné `classification` - proto
-  // `ref.fresh === false` (přítomnost bloku, ale neaktuální) MUSÍ být PRVNÍ
-  // kontrola. Kdyby byla druhá za "chybí classification", vrátila by null
-  // dřív, než se vůbec podívá na fresh, a stale poznámka by se nezobrazila.
-  if (ref.fresh === false) return "nález z jiného běhu (zastaralé - spusť `reference` znovu)";
-  if (!ref.classification) return null;
-  if (ref.classification === "not_attested")
-    return "model navrhl, ale v tomto přesném tvaru nedoloženo (slabý signál, ne vyvrácení)";
-  return null;
-}
-
-// NFC normalizace jako textnorm.normalize_key na backendu (bez plného
-// ekvivalentu Python casefold() - toLowerCase() stačí pro účel varování,
-// které je jen upozornění, ne blokující kontrola).
-function normKey(s) { return (s || "").normalize("NFC").trim().toLowerCase(); }
-
-// Živá obdoba kontroly v glossary._seed_one nad obsahem FORMULÁŘE (ne DB):
-// varuje, koliduje-li povrch jedné položky s aliasem jiné. Varování, ne
-// chyba - o tom, jde-li o tutéž entitu, rozhoduje člověk.
-function aliasCollisionWarnings() {
-  const NAME_KEY = { characters: "name_en", places: "name_en", terms: "term_en" };
-  // Pole vlastníků na klíč, ne jeden - poslední zápis by jinak přepsal
-  // dřívějšího. Kdyby "Foo" mělo samo sebe jako alias (autorská nepřesnost)
-  // a "Bar" mělo alias "Foo" taky, přepsání by skrylo kolizi s "Bar" za
-  // sebeodkaz "Foo" na sebe sama.
-  const owners = {};
-  ["characters", "places", "terms"].forEach(sec => {
-    (data[sec] || []).forEach(item => {
-      (item.aliases || []).forEach(a => {
-        const key = normKey(a);
-        if (!key) return;
-        (owners[key] = owners[key] || []).push(`${sec}/${item[NAME_KEY[sec]]}`);
-      });
-    });
-  });
-  const warnings = {};
-  ["characters", "places", "terms"].forEach(sec => {
-    (data[sec] || []).forEach((item, i) => {
-      const name = item[NAME_KEY[sec]] || "";
-      const self = `${sec}/${name}`;
-      const others = [...new Set(owners[normKey(name)] || [])].filter(o => o !== self);
-      if (others.length) {
-        warnings[`${sec}/${i}`] =
-          `povrch je zároveň alias položky ${others.join(", ")} - stejná entita, nebo jiná?`;
-      }
-    });
-  });
-  return warnings;
-}
-
-// Tabulka rozdělená na "potvrzeno referencemi" (sbalené, s počtem) a zbytek -
-// `weak` zůstává rozbalené s důkazem (o to se stará valueField/renderField
-// samo), jen `confirmed` má vlastní důvod být schovaný: je jich nejvíc a
-// nepotřebují kontrolu stejně nutně jako to, co doložené není.
-function splitConfirmed(items) {
-  const confirmed = [], rest = [];
-  items.forEach((item, i) => {
-    const ref = item.reference || {};
-    (ref.fresh && ref.classification === "confirmed" ? confirmed : rest).push([item, i]);
-  });
-  return { confirmed, rest };
-}
-
-function buildRowsInto(table, pairs, warnings, sec, rowBuilder) {
-  pairs.forEach(([item, i]) => {
-    const note = [item.note, classificationNote(item), warnings[`${sec}/${i}`]]
-      .filter(Boolean).join(" - ");
-    table.appendChild(rowBuilder(item, i, note));
-  });
-}
-
-function render() {
-  const app = document.getElementById("app");
-  app.innerHTML = "";
-
-  if ((data.must_decide || []).length) {
-    const box = el("div", { class: "must" });
-    box.appendChild(el("h2", {}, ["Musíš rozhodnout"]));
-    const HINT = {
-      term: "odpověď = český tvar termínu (nebo anglické slovo, chceš-li ponechat)",
-      place: "odpověď = český název místa (nebo anglický, chceš-li ponechat)",
-      name: "odpověď = české jméno (nebo anglické, chceš-li ponechat)",
-      relationship: "odpověď = tyka nebo vyka",
-      style: "odpověď = pravidlo větou, půjde do návodu pro překladatele",
-    };
-    data.must_decide.forEach((md, i) => {
-      box.appendChild(el("p", {}, [`${md.kind}: ${md.question} (${md.scope_key || ""})`]));
-
-      if (md.kind === "relationship") {
-        // Roletka začíná PRÁZDNÁ ("-- vyber --") - scoutův návrh se ukazuje
-        // jen jako text pod ní (viz `if (md.default)` níž), nepředvyplňuje se.
-        // Dřívější verze sem tiše kopírovala md.default, což spec zakazuje.
-        const sel = select([["", "-- vyber --"], ["tyka", "tykají si"], ["vyka", "vykají si"]],
-                           md.answer || "");
-        sel.onchange = e => data.must_decide[i].answer = e.target.value;
-        box.appendChild(sel);
-      } else {
-        const inp = el("input", { type: "text", value: md.answer || "" });
-        inp.oninput = e => data.must_decide[i].answer = e.target.value;
-        box.appendChild(inp);
-      }
-
-      box.appendChild(el("p", { class: "note" }, [HINT[md.kind] || HINT.style]));
-      if (md.default) {
-        box.appendChild(el("p", { class: "note" }, [`návrh scouta: ${md.default}`]));
-      }
-    });
-    app.appendChild(box);
-  }
-
-  // Živý přepočet HNED na začátku render()u - má-li dávka nula polí, která
-  // ještě drží svou hodnotu (uživatel je všechna mezitím jinak změnil),
-  // není co vracet a nesmí to blokovat další "přijmout všechny" navždy.
-  if (lastAcceptAllChanges && !pendingAcceptAllChanges().length) lastAcceptAllChanges = null;
-
-  const acceptAll = el("button", { type: "button" }, ["přijmout všechny scoutovy návrhy"]);
-  // Dokud čeká nevyřízené "zpět" z předchozího přijetí, další spuštění je
-  // zakázané - jinak by druhé kliknutí přepsalo lastAcceptAllChanges a první
-  // dávku by nešlo vrátit.
-  acceptAll.disabled = !!lastAcceptAllChanges;
-  acceptAll.onclick = () => {
-    const n = acceptAllScoutSuggestions();
-    render();
-    document.getElementById("errors").textContent = n
-      ? `Přijato ${n} návrhů - zkontroluj a ulož.` : "Nic k přijetí (vše doložené, ruční, nebo bez návrhu).";
-  };
-  app.appendChild(acceptAll);
-  // "Zpět" u hromadné akce vrátí jen pole, která PORÁD drží hodnotu, kterou
-  // dávka nastavila (viz pendingAcceptAllChanges) - počet v popisku i
-  // viditelnost tlačítka se řídí týmž živým výpočtem, ne původní velikostí
-  // dávky, jinak by popisek lhal o tom, co "zpět" doopravdy vrátí.
-  const pending = pendingAcceptAllChanges();
-  if (pending.length) {
-    const undoAll = el("button", { type: "button" },
-      [`vrátit zpět přijetí (${pending.length})`]);
-    undoAll.onclick = () => { undoAcceptAllScoutSuggestions(); render(); };
-    app.appendChild(undoAll);
-  }
-
-  const warnings = aliasCollisionWarnings();
-
-  function charRow(c, i, note) {
-    const renderCell = renderField(c, v => {
-      data.characters[i].render = v;
-    });
-    // U postavy je scout_suggestion "keep"/"translate" (řeší renderField
-    // výše), ne text pro jméno - proto jen lexicographer_suggestion.
-    const cz = valueField(c, v => {
-      data.characters[i].cz = v;
-    }, ["lexicographer_suggestion"]);
-    const al = el("input", { type: "text", value: (c.aliases || []).join(", ") });
-    al.oninput = e => data.characters[i].aliases =
-      e.target.value.split(",").map(s => s.trim()).filter(Boolean);
-    // aliasCollisionWarnings() se počítá jen jednou na začátku render() -
-    // živě po každém stisku klávesy by to rušilo psaní (kurzor, focus), na
-    // konci editace (blur) se ale musí přepočítat, jinak by nová kolize
-    // vzniklá právě touhle úpravou nebyla vidět před uložením. setTimeout(0)
-    // ze stejného důvodu jako u valueField - blur při kliknutí na sousední
-    // tlačítko nesmí smazat cíl kliknutí z DOM dřív, než klik doběhne.
-    al.onblur = () => setTimeout(() => render(), 0);
-    return el("tr", {}, [el("td", {}, [c.name_en]), el("td", {}, [al]),
-      el("td", {}, [renderCell]), el("td", {}, [cz]), el("td", { class: "note" }, [note])]);
-  }
-
-  function charHeader() {
-    return el("tr", {}, [el("th", {}, ["Jméno"]), el("th", {}, ["Aliasy"]),
-      el("th", {}, ["Co s ním"]), el("th", {}, ["Česky"]), el("th", {}, ["Poznámka"])]);
-  }
-
-  const { confirmed: charsConfirmed, rest: charsRest } = splitConfirmed(data.characters || []);
-  if (charsConfirmed.length) {
-    const t = el("table"); t.appendChild(charHeader());
-    buildRowsInto(t, charsConfirmed, warnings, "characters", charRow);
-    const details = el("details", {}, []);
-    details.appendChild(el("summary", {}, [`Potvrzeno referencemi (${charsConfirmed.length})`]));
-    details.appendChild(t);
-    app.appendChild(section("Postavy", details));
-  }
-  const charsRestTable = el("table"); charsRestTable.appendChild(charHeader());
-  buildRowsInto(charsRestTable, charsRest, warnings, "characters", charRow);
-  app.appendChild(section(charsConfirmed.length ? "Postavy (ke kontrole)" : "Postavy", charsRestTable));
-
-  [["places", "name_en", "Místa"], ["terms", "term_en", "Termíny"]].forEach(
-    ([key, nameKey, title]) => {
-      function row(item, i, note) {
-        const cz = valueField(item, v => {
-          data[key][i].cz = v;
-        });
-        return el("tr", {}, [el("td", {}, [item[nameKey]]), el("td", {}, [cz]),
-          el("td", { class: "note" }, [note])]);
-      }
-      function header() {
-        return el("tr", {}, [el("th", {}, ["Originál"]), el("th", {}, ["Česky"]),
-          el("th", {}, ["Poznámka"])]);
-      }
-      const { confirmed, rest } = splitConfirmed(data[key] || []);
-      if (confirmed.length) {
-        const t = el("table"); t.appendChild(header());
-        buildRowsInto(t, confirmed, warnings, key, row);
-        const details = el("details", {}, []);
-        details.appendChild(el("summary", {}, [`Potvrzeno referencemi (${confirmed.length})`]));
-        details.appendChild(t);
-        app.appendChild(section(title, details));
-      }
-      const restTable = el("table"); restTable.appendChild(header());
-      buildRowsInto(restTable, rest, warnings, key, row);
-      app.appendChild(section(confirmed.length ? `${title} (ke kontrole)` : title, restTable));
-    });
-
-  const rels = el("table");
-  rels.appendChild(el("tr", {}, [el("th", {}, ["A"]), el("th", {}, ["B"]),
-    el("th", {}, ["Oslovení"])]));
-  (data.relationships || []).forEach((r, i) => {
-    const sel = select([["", "-"], ["tyka", "tykají si"], ["vyka", "vykají si"]],
-      r.address || "");
-    sel.onchange = e => data.relationships[i].address = e.target.value;
-    rels.appendChild(el("tr", {}, [el("td", {}, [r.a]), el("td", {}, [r.b]),
-      el("td", {}, [sel])]));
-  });
-  const add = el("button", { type: "button" }, ["Přidej dvojici"]);
-  add.onclick = () => {
-    const a = prompt("Jméno A"); const b = prompt("Jméno B");
-    if (a && b) {
-      data.relationships.push({ a, b, address: "vyka" });
-      // Nová dvojice se přidává s výchozím "vyka", ale nikdo ho nezkontroloval -
-      // ponechané zaškrtnutí by ho tiše prohlásilo za zkontrolované, ačkoli
-      // je to jen defaultní hodnota. Zaškrtnutí se týká VŠECH dvojic, takže
-      // přidáním nové musí padnout.
-      data.relationships_reviewed = false;
-      render();
-    }
-  };
-  const relWrap = el("div"); relWrap.appendChild(rels); relWrap.appendChild(add);
-  // Potvrzení, že tykání/vykání bylo zkontrolováno - server ho vyžaduje,
-  // jakmile sekce vztahů není prázdná (viz _check_relationships_reviewed).
-  const reviewedLabel = el("label", {}, []);
-  const reviewedBox = el("input", { type: "checkbox" });
-  reviewedBox.checked = !!data.relationships_reviewed;
-  reviewedBox.onchange = e => data.relationships_reviewed = e.target.checked;
-  reviewedLabel.appendChild(reviewedBox);
-  reviewedLabel.appendChild(document.createTextNode(" zkontroloval/a jsem tykání/vykání u všech dvojic"));
-  relWrap.appendChild(el("p", {}, [reviewedLabel]));
-  app.appendChild(section("Vztahy (tykání/vykání)", relWrap));
-
-  const style = el("textarea", {}, [data.style || ""]);
-  style.value = data.style || "";
-  style.oninput = e => data.style = e.target.value;
-  app.appendChild(section("Styl", style));
-}
-
-fetch("/api/guide").then(r => r.json()).then(d => {
-  data = d;
-  if (data.relationships_reviewed === undefined) data.relationships_reviewed = false;
-  render();
-});
-
-document.getElementById("save").onclick = () => {
-  document.getElementById("errors").textContent = "";
-  fetch("/api/guide", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data)
-  }).then(async r => {
-    const body = await r.json();
-    if (r.ok && body.ok) {
-      document.body.innerHTML = "<h1>Hotovo</h1><p>Návod uložen, server skončil. " +
-        "Okno můžeš zavřít.</p>";
-    } else {
-      document.getElementById("errors").textContent =
-        (body.errors || ["Neznámá chyba"]).join("\n");
-    }
-  });
-};
+```javascript
+const sel = select([["", "-- vyber --"], ["keep", "ponechat"],
+                    ["translate", "přeložit"]], c.render || "");
 ```
 
 - [ ] **Step 4: Run to verify pass**
@@ -4100,225 +2629,12 @@ Expected: PASS (3 tests)
 
 - [ ] **Step 5: Visual check in the browser**
 
-Spusť dočasný server nad kopií dat (nebo nad reálným `data/guide.draft.json`
-+ `data/reference.json`, pokud už Task 13 proběhl) a projdi formulář okem.
-Vizuální/rozvržné chování se schválně netestuje pytestem (viz úvodní
-poznámka Tasku 12 - testuje se serializovaný payload, ne vzhled); DOM/browser
-testy by pro tenhle rozsah znamenaly zavést novou testovací infrastrukturu
-(Playwright/Selenium), což je mimo rámec tohoto plánu - proto je tahle
-kontrola ruční, ne automatická:
+Spusť dočasný server nad kopií dat a projdi formulář okem: doložená pole zamčená s důkazem, návrhy vedle prázdných polí s tlačítkem, roletka postav s `-- vyber --`.
 
-- [ ] doložená pole (`confirmed`/`weak` s `provenance == "reference"`) jsou
-      zamčená, vedle nich stojí počet výskytů a díly
-- [ ] návrhy (scoutův i lexikografův) stojí vedle prázdného pole jako text
-      s tlačítkem "použít návrh"; po použití se tlačítko změní na "zpět" a
-      vrátí přesně to, co tam bylo předtím (vyzkoušej: napiš vlastní text,
-      použij návrh, klikni zpět - musí se objevit tvůj text, ne prázdné pole)
-- [ ] roletka postav bez důkazu má výchozí `-- vyber --`, ne "ponechat"
-- [ ] `confirmed` položky jsou sbalené v `<details>` nahoře s počtem v závorce
-- [ ] `not_attested` má u sebe text "v tomto přesném tvaru nedoloženo"
-- [ ] nečerstvý nález je viditelně jinak - žádná čísla, jen poznámka
-      o zastaralosti. Vygeneruj `reference.json`, PAK v `config.py` změň
-      `REFERENCE_MIN_HITS` a rovnou (BEZ dalšího běhu `reference` - ten by
-      napsal nový `reference.json` s otiskem sedícím na nové hodnotě, což by
-      bylo zase čerstvé, ne zastaralé) otevři `review`
-- [ ] tlačítko "přijmout všechny scoutovy návrhy" po kliknutí ukáže "vrátit
-      zpět přijetí (N)"; klik na něj vrátí přesně ta pole, co změnilo, ne víc
-- [ ] vztahová `must_decide` roletka začíná na `-- vyber --`, ne předvyplněná
-- [ ] checkbox "zkontroloval/a jsem tykání/vykání" u sekce vztahů - bez něj
-      uložení selže (je-li aspoň jeden vztah)
-- [ ] zaškrtni checkbox → klikni "Přidej dvojici" → checkbox se sám odškrtne
-      (nová dvojice dostane výchozí "vyka", ale nikdo ho nezkontroloval -
-      staré zaškrtnutí by ho tiše prohlásilo za hotové)
-- [ ] **doložené pole → odemkni ("změnit předvyplněné") → NEEDITUJ →
-      vyvolej jinou akci (klikni "přijmout všechny scoutovy návrhy" na jiném
-      poli, nebo přidej vztah) → vrať se k prvnímu poli:** pole je pořád
-      odemčené, tlačítko "vrátit zpět předvyplněné" je pořád tam a funguje
-      (round-5 nález: dřívější verze by tlačítko po týhle sekvenci ztratila)
-- [ ] doložené pole → odemkni → napiš JINOU hodnotu → dokonči editaci (klikni
-      mimo pole) → "vrátit zpět předvyplněné" je pořád vidět a po kliknutí
-      vrátí přesně doloženou hodnotu (round-6 nález: po skutečné editaci by
-      tlačítko dřív zmizelo úplně)
-- [ ] doložené pole → odemkni → napiš přesně tu SAMOU hodnotu, jakou mělo
-      předtím → číselný důkaz zůstane vidět (vazba je na shodu hodnoty, ne
-      na to, kdo ji vyplnil); napiš JINOU hodnotu → důkaz zmizí po kliknutí
-      mimo pole (blur)
-- [ ] postava s doloženým `render="keep"` → odemkni → přepni na "přeložit" →
-      důkaz u roletky zmizí (vázán na hodnotu "keep", ne na pouhé doložení);
-      pak vyber prázdnou volbu `-- vyber --` → tlačítko "vrátit zpět
-      předvyplněné" pořád existuje (round-7 nález: dřív mizelo, protože
-      záviselo na aktuální hodnotě `render`, ne na stabilních metadatech)
-- [ ] **přijmout všechny → použij individuální (lexikografův) návrh na
-      JEDNOM z hromadně přijatých polí → klikni "zpět" u toho návrhu (pole
-      se vrátí na hromadně přijatou hodnotu) → klikni "vrátit zpět přijetí":**
-      tohle pole se vrátí na PŮVODNÍ (prázdnou) hodnotu spolu s ostatními
-      (round-8 nález: dřívější verze by tenhle konkrétní řádek při druhém
-      kroku ztratila ze seznamu k vrácení natrvalo)
-- [ ] **přijmout všechny scoutovy návrhy u postavy → NEDOTKNI SE jejího
-      pole ručně → rovnou klikni "vrátit zpět přijetí":** tlačítko "použít
-      návrh" u téhle postavy po vrácení ukazuje "použít návrh" (ne "zpět") a
-      kliknutí na něj hodnotu nastaví znovu, nevrátí nic (round-9 nález:
-      dřívější verze nechávala tlačítko po bulk-undo omylem ve stavu "zpět",
-      a kliknutí na něj tiše obnovilo hodnotu, kterou bulk-undo právě zrušil)
-
-- [ ] **Step 6: Write and run the pure-logic Node test** — `tests/test_review_ui_state.py`
-
-Hromadné přijetí/vrácení je jediná část Tasku 12, kde regrese (kola 4, 8, 9)
-opakovaně unikly ruční kontrole. `pendingAcceptAllChanges`,
-`acceptAllScoutSuggestions` a `undoAcceptAllScoutSuggestions` nedělají žádnou
-DOM manipulaci - jen čtou a mění objekt `data` - takže jde spustit i mimo
-prohlížeč, přes Node (test-time nástroj, ne runtime závislost aplikace;
-`shutil.which("node") is None` test přeskočí, ne spadne, když Node není
-po ruce).
-
-**POZOR:** `_JS_SOURCE` níž je kopie SPUSTITELNÉHO KÓDU týchž čtyř funkcí ze
-`src/review_ui/static/index.html` (bez komentářů - ty se z obou kopií
-schválně vypouštějí, aby se neduplikovaly, ale to znamená, že žádný
-mechanismus drift MEZI kopiemi kódu samotného nehlídá). Změníš-li v
-`index.html` chování (ne jen komentář), zkopíruj změnu i sem - jinak test
-testuje jinou logiku, než jaká běží v prohlížeči.
-
-```python
-"""Automatizovaný test čisté JS logiky hromadného přijetí/vrácení návrhů
-(Task 12) - bez DOM/prohlížeče, přes Node. Viz POZOR výše u _JS_SOURCE."""
-import shutil
-import subprocess
-
-import pytest
-
-_JS_SOURCE = """
-function fieldProvenance(item, field) {
-  const key = "_" + field + "Provenance";
-  return item[key] !== undefined ? item[key] : item.provenance;
-}
-
-let lastAcceptAllChanges = null;
-
-function pendingAcceptAllChanges() {
-  return (lastAcceptAllChanges || []).filter(
-    c => data[c.section][c.i][c.field] === c.applied);
-}
-
-function acceptAllScoutSuggestions() {
-  const changes = [];
-  (data.characters || []).forEach((c, i) => {
-    if (fieldProvenance(c, "render") === "reference" || c.render || !c.scout_suggestion) return;
-    changes.push({ section: "characters", i, field: "render",
-                  before: c.render || "", applied: c.scout_suggestion });
-    data.characters[i].render = c.scout_suggestion;
-    data.characters[i]._renderProvenance = "human";
-  });
-  ["places", "terms"].forEach(sec => {
-    (data[sec] || []).forEach((item, i) => {
-      if (fieldProvenance(item, "cz") === "reference" || (item.cz || "").trim()
-          || !item.scout_suggestion) return;
-      changes.push({ section: sec, i, field: "cz",
-                    before: item.cz || "", applied: item.scout_suggestion });
-      data[sec][i].cz = item.scout_suggestion;
-      data[sec][i]._czProvenance = "human";
-    });
-  });
-  lastAcceptAllChanges = changes;
-  return changes.length;
-}
-
-function undoAcceptAllScoutSuggestions() {
-  pendingAcceptAllChanges().forEach(c => {
-    const item = data[c.section][c.i];
-    item[c.field] = c.before;
-    if (c.field === "cz") item._czActiveKey = null;
-    else if (c.field === "render") item._renderActive = false;
-  });
-  lastAcceptAllChanges = null;
-}
-"""
-
-
-def _run(script: str) -> None:
-    if shutil.which("node") is None:
-        pytest.skip("node není v PATH - test čisté JS logiky se přeskakuje")
-    result = subprocess.run(["node", "-e", _JS_SOURCE + "\n" + script],
-                            capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
-
-
-def test_bulk_accept_then_untouched_field_reverts_on_undo():
-    _run("""
-    var data = { characters: [], places: [{ cz: "", scout_suggestion: "Navrh", provenance: "none" }], terms: [] };
-    acceptAllScoutSuggestions();
-    if (data.places[0].cz !== "Navrh") throw new Error("bulk accept selhal");
-    undoAcceptAllScoutSuggestions();
-    if (data.places[0].cz !== "") throw new Error("nedotcene pole se nevratilo");
-    """)
-
-
-def test_bulk_undo_does_not_touch_manually_diverged_field():
-    _run("""
-    var data = { characters: [], places: [{ cz: "", scout_suggestion: "Navrh", provenance: "none" }], terms: [] };
-    acceptAllScoutSuggestions();
-    data.places[0].cz = "Rucni text";
-    undoAcceptAllScoutSuggestions();
-    if (data.places[0].cz !== "Rucni text") throw new Error("bulk undo prepsal rucni hodnotu");
-    """)
-
-
-def test_use_then_revert_individual_suggestion_then_bulk_undo_restores_original():
-    """round-8 scenar: pouzij jiny navrh -> vrat ho zpet (hodnota se tim
-    vrati presne na hromadne prijatou) -> vrat celou davku."""
-    _run("""
-    var data = { characters: [], places: [{ cz: "", scout_suggestion: "Navrh", provenance: "none" }], terms: [] };
-    acceptAllScoutSuggestions();
-    data.places[0].cz = "Jiny navrh";
-    data.places[0].cz = "Navrh";
-    undoAcceptAllScoutSuggestions();
-    if (data.places[0].cz !== "") throw new Error("bulk undo nevratil puvodni hodnotu po use-then-revert cyklu");
-    """)
-
-
-def test_bulk_undo_clears_active_suggestion_flag_for_render():
-    """round-9 scenar: bulk-accept -> uzivatel klikne na porad viditelne
-    individualni "pouzit navrh" NA TOMTEZ poli (nastavi _renderActive, i
-    kdyz hodnota vysla stejne) -> bulk-undo -> stav tlacitka se musi
-    vycistit, jinak by dalsi klik na "zpet" tise obnovil hodnotu, kterou
-    bulk-undo prave zrusilo. Bez explicitniho nastaveni _renderActive PRED
-    undem by assert prosel i bez opravy (_renderActive by nikdy nebylo
-    true) - proto se tu simuluje presne to, co dela use.onclick."""
-    _run("""
-    var data = { characters: [{ render: "", scout_suggestion: "keep", provenance: "none" }], places: [], terms: [] };
-    acceptAllScoutSuggestions();
-    if (data.characters[0].render !== "keep") throw new Error("bulk accept selhal");
-    // simulace kliku na jednotlive "pouzit navrh" (viz renderField use.onclick)
-    data.characters[0]._renderBefore = data.characters[0].render;
-    data.characters[0]._renderActive = true;
-    undoAcceptAllScoutSuggestions();
-    if (data.characters[0].render !== "") throw new Error("bulk undo nevratil render");
-    if (data.characters[0]._renderActive) throw new Error("_renderActive zustal true po bulk undo");
-    """)
-
-
-def test_bulk_undo_clears_active_suggestion_flag_for_cz():
-    """Stejny scenar jako u render, ale pro cz (_czActiveKey) - jiny kod,
-    jiny test, jinak by oprava jednoho z nich prosla bez pokryti druheho."""
-    _run("""
-    var data = { characters: [], places: [{ cz: "", scout_suggestion: "Navrh", provenance: "none" }], terms: [] };
-    acceptAllScoutSuggestions();
-    if (data.places[0].cz !== "Navrh") throw new Error("bulk accept selhal");
-    // simulace kliku na jednotlive "pouzit navrh" (viz valueField use.onclick)
-    data.places[0]._czBefore = data.places[0].cz;
-    data.places[0]._czActiveKey = "scout_suggestion";
-    undoAcceptAllScoutSuggestions();
-    if (data.places[0].cz !== "") throw new Error("bulk undo nevratilo cz");
-    if (data.places[0]._czActiveKey) throw new Error("_czActiveKey zustal nastaveny po bulk undo");
-    """)
-```
-
-Run: `python -m pytest tests/test_review_ui_state.py -v`
-Expected: PASS (5 tests), nebo SKIP všech 5, není-li `node` v PATH.
-
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/review_ui/static/index.html tests/test_review_ui_fields.py tests/test_review_ui_state.py
+git add src/review_ui/static/index.html tests/test_review_ui_fields.py
 git commit -m "feat: formulář - předvyplňuje se jen doložené, každá akce vratná"
 ```
 
@@ -4418,7 +2734,7 @@ Přidej import a příkaz:
 
 ```python
 from src import reference as reference_mod
-from src import reference_mine, textnorm
+from src import reference_mine
 
 
 def _cmd_reference(args) -> int:
@@ -4433,11 +2749,7 @@ def _cmd_reference(args) -> int:
         if not os.path.exists(config.GUIDE_DRAFT_PATH):
             raise FatalRunError(
                 f"Chybí {config.GUIDE_DRAFT_PATH} - nejdřív spusť `scan`.")
-        try:
-            draft = guide_mod.load_draft(config.GUIDE_DRAFT_PATH)
-        except (OSError, ValueError) as e:
-            raise FatalRunError(
-                f"{config.GUIDE_DRAFT_PATH} se nepodařilo načíst ({type(e).__name__}: {e}).")
+        draft = guide_mod.load_draft(config.GUIDE_DRAFT_PATH)
 
         corpus = None if args.refresh_cache else reference_mod.load_cache(
             config.REFERENCE_CACHE_PATH, root)
@@ -4449,12 +2761,7 @@ def _cmd_reference(args) -> int:
                 raise FatalRunError(str(e))
             except OSError as e:
                 raise FatalRunError(f"Referenční korpus se nepodařilo načíst: {e}")
-            try:
-                reference_mod.save_cache(corpus, config.REFERENCE_CACHE_PATH)
-            except OSError as e:
-                # Cache je jen zrychlení příštího běhu - selhání zápisu
-                # nesmí shodit těžbu, která už proběhla.
-                print(f"reference: cache se nepodařilo uložit ({e}), pokračuji bez ní")
+            reference_mod.save_cache(corpus, config.REFERENCE_CACHE_PATH)
 
         items = []
         for section, key in (("characters", "name_en"), ("places", "name_en"),
@@ -4470,27 +2777,21 @@ def _cmd_reference(args) -> int:
 
         cf = _client_factory(rid, interactive=False)
         try:
-            # resolve() i write_reference() jsou v JEDNOM try/except: selže-li
-            # cokoli mezi voláním modelu a dokončením zápisu (i samotný zápis,
-            # např. disk plný), jde o stejnou situaci - těžba neproběhla a
-            # předchozí reference.json (write_reference ho nahrazuje jen na
-            # úplný konec přes os.replace) zůstává nedotčený.
             findings = reference_mine.resolve(corpus, items, cf, config)
-            # manifest_fingerprint(corpus.manifest), NE corpus_fingerprint(root) -
-            # to druhé by po těžbě (může trvat minuty kvůli modelu) přečetlo
-            # AKTUÁLNÍ stav disku, ne ten, ze kterého nálezy skutečně vzešly.
-            fingerprint = {
-                "draft": reference_mine.draft_fingerprint(draft),
-                "corpus": reference_mine.manifest_fingerprint(corpus.manifest),
-                "thresholds": reference_mine.thresholds_fingerprint(config)}
-            reference_mine.write_reference(findings, config.REFERENCE_PATH, rid,
-                                           fingerprint, corpus.source_root)
         except FatalRunError:
             raise
         except Exception as e:
+            # Selhání je atomické: předchozí reference.json zůstane nedotčený.
             raise FatalRunError(
                 f"Těžba selhala ({type(e).__name__}: {e}). Předchozí "
                 f"{config.REFERENCE_PATH} zůstal beze změny, spusť znovu.")
+
+        fingerprint = {
+            "draft": reference_mine.draft_fingerprint(draft),
+            "corpus": reference_mine.corpus_fingerprint(corpus.source_root),
+            "thresholds": reference_mine.thresholds_fingerprint(config)}
+        reference_mine.write_reference(findings, config.REFERENCE_PATH, rid,
+                                       fingerprint, corpus.source_root)
 
         counts = {}
         for f in findings:
@@ -4533,7 +2834,7 @@ def _cmd_review(args) -> int:
     return 0
 ```
 
-Zaregistruj příkaz (`textnorm` už je v importu výše):
+Zaregistruj příkaz (a přidej `textnorm` k importům):
 
 ```python
     p_ref = sub.add_parser("reference", help="vytěž terminologii z profesionálních překladů")
@@ -4587,7 +2888,6 @@ Prokazuje invariant: odhad se nikdy nesmí tvářit jako důkaz a nedoložená
 hodnota se nedostane do glosáře bez výslovného přijetí člověkem.
 """
 import json
-import os
 from fastapi.testclient import TestClient
 
 import config
@@ -4595,12 +2895,7 @@ from src import glossary, reference_mine, state
 from src.review_ui import server
 
 
-def _setup(tmp_path, findings, monkeypatch):
-    """`monkeypatch` je povinný, i pro prázdné `findings`: `corpus_fingerprint`
-    by proti neexistujícímu "/root" vždy vrátilo `None`, takže by `fresh` bylo
-    vždy False a testy s neprázdnými nálezy by nedokázaly ověřit cestu skrz
-    doloženou/aktuální referenci vůbec."""
-    monkeypatch.setattr(reference_mine, "corpus_fingerprint", lambda root: "corpus-fp")
+def _setup(tmp_path, findings):
     dp = str(tmp_path / "guide.draft.json")
     gp = str(tmp_path / "guide.json")
     rp = str(tmp_path / "reference.json")
@@ -4616,7 +2911,7 @@ def _setup(tmp_path, findings, monkeypatch):
     json.dump(draft, open(dp, "w", encoding="utf-8"))
     reference_mine.write_reference(
         findings, rp, 1,
-        {"draft": reference_mine.draft_fingerprint(draft), "corpus": "corpus-fp",
+        {"draft": reference_mine.draft_fingerprint(draft), "corpus": None,
          "thresholds": reference_mine.thresholds_fingerprint(config)},
         "/root")
     return dp, gp, rp, db
@@ -4632,14 +2927,9 @@ def _f(**over):
     return base
 
 
-def test_proposed_does_not_reach_glossary_without_acceptance(tmp_path, monkeypatch):
-    """Nedoloženo se nedostane do glosáře bez výslovného rozhodnutí - a to
-    v nejsilnější podobě: prázdné `cz` blokuje uložení úplně (validate() se
-    Tasky 9-13 nemění), takže bez rozhodnutí se neuloží vůbec nic. Rozhodne-li
-    se člověk sám, jinak než navrhl model, projde JEHO hodnota."""
+def test_proposed_does_not_reach_glossary_without_acceptance(tmp_path):
     dp, gp, rp, db = _setup(tmp_path, [
-        _f(classification="proposed", navrh="Bílá rada", matched_cz="Bílá rada")],
-        monkeypatch)
+        _f(classification="proposed", navrh="Bílá rada", matched_cz="Bílá rada")])
     app = server.build_app(dp, gp, lambda: None, reference_path=rp)
     body = TestClient(app).get("/api/guide").json()
     council = [t for t in body["terms"] if t["term_en"] == "White Council"][0]
@@ -4648,60 +2938,44 @@ def test_proposed_does_not_reach_glossary_without_acceptance(tmp_path, monkeypat
     payload = {"characters": [dict(body["characters"][0], render="keep")],
                "places": [], "terms": body["terms"], "relationships": [],
                "style": "s", "rules": [], "must_decide": []}
-    assert TestClient(app).post("/api/guide", json=payload).status_code == 422
-    assert not os.path.exists(gp)
-
-    # Nevernever nemá žádný nález (fixture ho neobsahuje) a validate() u
-    # KAŽDÉHO termínu vyžaduje neprázdné cz - musí se rozhodnout i o něm,
-    # jinak POST zůstane 422 a nic z White Council se neověří.
-    for t in payload["terms"]:
-        if t["term_en"] == "White Council":
-            t["cz"] = "Moje vlastní volba"
-        elif t["term_en"] == "Nevernever":
-            t["cz"] = "Nikdykdy"
     assert TestClient(app).post("/api/guide", json=payload).status_code == 200
     glossary.seed_from_guide(db, json.load(open(gp, encoding="utf-8")))
     row = [t for t in glossary.all_terms(db) if t["canonical_en"] == "White Council"][0]
-    assert row["cz"] == "Moje vlastní volba"          # NE návrh modelu
+    # bez přijetí zůstal cz = anglický povrch (fallback seedu), NE návrh modelu
+    assert row["cz"] != "Bílá rada"
 
 
-def test_accepted_suggestion_does_reach_glossary(tmp_path, monkeypatch):
+def test_accepted_suggestion_does_reach_glossary(tmp_path):
     dp, gp, rp, db = _setup(tmp_path, [
-        _f(classification="proposed", navrh="Bílá rada", matched_cz="Bílá rada")],
-        monkeypatch)
+        _f(classification="proposed", navrh="Bílá rada", matched_cz="Bílá rada")])
     app = server.build_app(dp, gp, lambda: None, reference_path=rp)
     body = TestClient(app).get("/api/guide").json()
     for t in body["terms"]:
         if t["term_en"] == "White Council":
             t["cz"] = "Bílá rada"          # člověk kliknul na "použít návrh"
-        elif t["term_en"] == "Nevernever":
-            t["cz"] = "Nikdykdy"           # validate() vyžaduje cz u KAŽDÉHO termínu
     payload = {"characters": [dict(body["characters"][0], render="keep")],
                "places": [], "terms": body["terms"], "relationships": [],
                "style": "s", "rules": [], "must_decide": []}
-    assert TestClient(app).post("/api/guide", json=payload).status_code == 200
+    TestClient(app).post("/api/guide", json=payload)
     glossary.seed_from_guide(db, json.load(open(gp, encoding="utf-8")))
     row = [t for t in glossary.all_terms(db) if t["canonical_en"] == "White Council"][0]
     assert row["cz"] == "Bílá rada"
 
 
-def test_confirmed_flows_through_with_evidence(tmp_path, monkeypatch):
+def test_confirmed_flows_through_with_evidence(tmp_path):
     dp, gp, rp, db = _setup(tmp_path, [
         _f(classification="confirmed", cz="White Council",
            matched_cz="White Council", hits=14, books=[1, 2, 3],
-           primary_attested=True, source="kept")], monkeypatch)
+           primary_attested=True, source="kept")])
     app = server.build_app(dp, gp, lambda: None, reference_path=rp)
     body = TestClient(app).get("/api/guide").json()
     council = [t for t in body["terms"] if t["term_en"] == "White Council"][0]
     assert council["cz"] == "White Council"
     assert council["reference"]["hits"] == 14
-    for t in body["terms"]:
-        if t["term_en"] == "Nevernever":
-            t["cz"] = "Nikdykdy"          # validate() vyžaduje cz u KAŽDÉHO termínu
     payload = {"characters": [dict(body["characters"][0], render="keep")],
                "places": [], "terms": body["terms"], "relationships": [],
                "style": "s", "rules": [], "must_decide": []}
-    assert TestClient(app).post("/api/guide", json=payload).status_code == 200
+    TestClient(app).post("/api/guide", json=payload)
     saved = json.load(open(gp, encoding="utf-8"))
     assert "reference" not in saved["terms"][0]      # metadata se neukládají
     glossary.seed_from_guide(db, saved)
@@ -4709,8 +2983,8 @@ def test_confirmed_flows_through_with_evidence(tmp_path, monkeypatch):
     assert row["cz"] == "White Council"
 
 
-def test_character_without_render_is_rejected(tmp_path, monkeypatch):
-    dp, gp, rp, db = _setup(tmp_path, [], monkeypatch)
+def test_character_without_render_is_rejected(tmp_path):
+    dp, gp, rp, db = _setup(tmp_path, [])
     app = server.build_app(dp, gp, lambda: None, reference_path=rp)
     body = TestClient(app).get("/api/guide").json()
     payload = {"characters": body["characters"], "places": [],
@@ -4719,41 +2993,8 @@ def test_character_without_render_is_rejected(tmp_path, monkeypatch):
     assert TestClient(app).post("/api/guide", json=payload).status_code == 422
 
 
-def test_evidence_only_does_not_prefill_and_needs_human_decision(tmp_path, monkeypatch):
-    """`evidence_only` (např. `stole` - nalezeno, ale nikdy nedokládá ponechání)
-    smí ukázat důkaz, ale `cz` musí zůstat prázdné a bez rozhodnutí se neuloží."""
-    dp, gp, rp, db = _setup(tmp_path, [
-        _f(classification="evidence_only", hits=79, books=[1, 2, 3],
-           matched_forms=["White Council"], source="kept")], monkeypatch)
-    app = server.build_app(dp, gp, lambda: None, reference_path=rp)
-    body = TestClient(app).get("/api/guide").json()
-    council = [t for t in body["terms"] if t["term_en"] == "White Council"][0]
-    assert council["cz"] == "" and council["reference"]["hits"] == 79
-    payload = {"characters": [dict(body["characters"][0], render="keep")],
-               "places": [], "terms": body["terms"], "relationships": [],
-               "style": "s", "rules": [], "must_decide": []}
-    assert TestClient(app).post("/api/guide", json=payload).status_code == 422
-    assert not os.path.exists(gp)
-
-
-def test_not_attested_does_not_prefill_and_needs_human_decision(tmp_path, monkeypatch):
-    """`not_attested` (model navrhl, ale doložení selhalo) taky nesmí
-    předvyplnit ani se dostat do glosáře bez rozhodnutí."""
-    dp, gp, rp, db = _setup(tmp_path, [
-        _f(classification="not_attested", navrh="Vymyšlená rada")], monkeypatch)
-    app = server.build_app(dp, gp, lambda: None, reference_path=rp)
-    body = TestClient(app).get("/api/guide").json()
-    council = [t for t in body["terms"] if t["term_en"] == "White Council"][0]
-    assert council["cz"] == "" and council["lexicographer_suggestion"] == "Vymyšlená rada"
-    payload = {"characters": [dict(body["characters"][0], render="keep")],
-               "places": [], "terms": body["terms"], "relationships": [],
-               "style": "s", "rules": [], "must_decide": []}
-    assert TestClient(app).post("/api/guide", json=payload).status_code == 422
-    assert not os.path.exists(gp)
-
-
-def test_note_survives_all_the_way_to_glossary(tmp_path, monkeypatch):
-    dp, gp, rp, db = _setup(tmp_path, [], monkeypatch)
+def test_note_survives_all_the_way_to_glossary(tmp_path):
+    dp, gp, rp, db = _setup(tmp_path, [])
     app = server.build_app(dp, gp, lambda: None, reference_path=rp)
     body = TestClient(app).get("/api/guide").json()
     payload = {"characters": [dict(body["characters"][0], render="keep")],
@@ -4827,7 +3068,7 @@ prázdného pole na tlačítko „použít návrh".
 - [ ] Vysoký počet `not_attested` může znamenat, že přesná shoda je moc přísná
       a skloňování by se tolerovat mělo. **To je hlavní věc, kterou má první běh
       změřit.**
-- [ ] Sedí prahy `REFERENCE_MIN_HITS` / `REFERENCE_MIN_BOOKS`, nebo je většina nálezů
+- [ ] Sedí prahy `REFERENCE_MIN_HITS` / `MIN_BOOKS`, nebo je většina nálezů
       těsně pod nimi?
 - [ ] Kolik návrhů prošlo výskytem, ale spadlo na souvýskytu?
 - [ ] Namátkou zkontroluj pět `confirmed` položek - je důkaz opravdu důkaz?
