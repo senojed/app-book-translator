@@ -51,6 +51,11 @@ Pravidla:
   nikdy s pomlčkou - jména sama pomlčky obsahují.
   "default" ať je rovnou použitelná odpověď (u termínu český tvar, u vztahu
   "tyka"/"vyka"), ne věta o tom, co by se dalo udělat.
+- Jedna položka = **jeden povrch**. Nikdy nepiš výčty jako
+  "White Court / Red Court" ani poznámky v závorce jako "Warden(s)" -
+  synonyma patří do "aliases", varianty jako samostatné položky.
+- Do "aliases" dávej jen tvary, které entitu **identifikují**. Oslovení
+  a role ("sir", "kid", "captain") tam nepatří.
 - Nic nevynechávej kvůli délce. Když je toho moc, zkracuj poznámky, ne seznamy."""
 
 

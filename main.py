@@ -20,10 +20,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 from src import guide as guide_mod
 from src import ingest, pipeline, requeue, state
+from src import reference as reference_mod
+from src import reference_mine, textnorm
 from src.agents import scout
 from src.llm.client import AnthropicClient, FatalRunError, OutputTruncated, PipelineLLMClient
 
-_MUTATING = {"init", "scan", "run", "answer", "review"}
+_MUTATING = {"init", "scan", "run", "answer", "review", "reference"}
 
 _MARKERS = {"done": "OK", "pending": "..", "flagged": "!!", "needs_human": "??",
             "error": "XX", "processing": "~~"}
@@ -117,15 +119,112 @@ def _cmd_scan(args) -> int:
         state.finish_run(db, rid, status)
 
 
+def _cmd_reference(args) -> int:
+    db = config.DB_PATH
+    root = args.dir or config.REFERENCE_DIR
+    rid = state.create_run(db, "reference")
+    status = "fatal"
+    try:
+        if not root:
+            raise FatalRunError("Chybí cesta k referencím - použij `--dir CESTA` "
+                                "nebo nastav REFERENCE_DIR v config.py.")
+        if not os.path.exists(config.GUIDE_DRAFT_PATH):
+            raise FatalRunError(
+                f"Chybí {config.GUIDE_DRAFT_PATH} - nejdřív spusť `scan`.")
+        try:
+            draft = guide_mod.load_draft(config.GUIDE_DRAFT_PATH)
+        except (OSError, ValueError) as e:
+            raise FatalRunError(
+                f"{config.GUIDE_DRAFT_PATH} se nepodařilo načíst ({type(e).__name__}: {e}).")
+
+        corpus = None if args.refresh_cache else reference_mod.load_cache(
+            config.REFERENCE_CACHE_PATH, root)
+        if corpus is None:
+            print("Načítám referenční korpus (~30 s)...")
+            try:
+                corpus = reference_mod.load_corpus(root)
+            except ValueError as e:
+                raise FatalRunError(str(e))
+            except OSError as e:
+                raise FatalRunError(f"Referenční korpus se nepodařilo načíst: {e}")
+            try:
+                reference_mod.save_cache(corpus, config.REFERENCE_CACHE_PATH)
+            except OSError as e:
+                # Cache je jen zrychlení příštího běhu - selhání zápisu
+                # nesmí shodit těžbu, která už proběhla.
+                print(f"reference: cache se nepodařilo uložit ({e}), pokračuji bez ní")
+
+        items = []
+        for section, key in (("characters", "name_en"), ("places", "name_en"),
+                             ("terms", "term_en")):
+            for it in draft.get(section) or []:
+                surface = (it.get(key) or "").strip()
+                if not surface:
+                    continue
+                items.append({"id": f"{section}/{textnorm.normalize_key(surface)}",
+                              "section": section, "surface": surface,
+                              "aliases": list(it.get("aliases") or []),
+                              "note": it.get("note") or ""})
+
+        cf = _client_factory(rid, interactive=False)
+        try:
+            # resolve() i write_reference() jsou v JEDNOM try/except: selže-li
+            # cokoli mezi voláním modelu a dokončením zápisu (i samotný zápis,
+            # např. disk plný), jde o stejnou situaci - těžba neproběhla a
+            # předchozí reference.json (write_reference ho nahrazuje jen na
+            # úplný konec přes os.replace) zůstává nedotčený.
+            findings = reference_mine.resolve(corpus, items, cf, config)
+            # manifest_fingerprint(corpus.manifest), NE corpus_fingerprint(root) -
+            # to druhé by po těžbě (může trvat minuty kvůli modelu) přečetlo
+            # AKTUÁLNÍ stav disku, ne ten, ze kterého nálezy skutečně vzešly.
+            fingerprint = {
+                "draft": reference_mine.draft_fingerprint(draft),
+                "corpus": reference_mine.manifest_fingerprint(corpus.manifest),
+                "thresholds": reference_mine.thresholds_fingerprint(config)}
+            reference_mine.write_reference(findings, config.REFERENCE_PATH, rid,
+                                           fingerprint, corpus.source_root)
+        except FatalRunError:
+            raise
+        except Exception as e:
+            raise FatalRunError(
+                f"Těžba selhala ({type(e).__name__}: {e}). Předchozí "
+                f"{config.REFERENCE_PATH} zůstal beze změny, spusť znovu.")
+
+        counts = {}
+        for f in findings:
+            counts[f["classification"]] = counts.get(f["classification"], 0) + 1
+        print(f"Vytěženo do {config.REFERENCE_PATH}:")
+        for name in ("confirmed", "weak", "evidence_only", "proposed",
+                     "not_attested", "unresolved"):
+            print(f"   {name:<15} {counts.get(name, 0)}")
+        _print_usage(db, rid)
+        print("Dál: `python main.py review`")
+        status = "ok"
+        return 0
+    except FatalRunError as e:
+        print(e)
+        return 1
+    except KeyboardInterrupt:
+        status = "interrupted"
+        raise
+    finally:
+        state.finish_run(db, rid, status)
+
+
 def _cmd_review(args) -> int:
     from src import glossary
     from src.review_ui import server
-    rc = server.run_review_server(config.GUIDE_DRAFT_PATH, config.GUIDE_PATH)
+    rc = server.run_review_server(config.GUIDE_DRAFT_PATH, config.GUIDE_PATH,
+                                  reference_path=config.REFERENCE_PATH)
     if rc != 0:
         print("Návod nebyl uložen - glosář zůstává beze změny.")
         return rc
     # Reseed dělá CLI, ne UI - UI o DB nic neví (izolace modulů).
-    glossary.seed_from_guide(config.DB_PATH, guide_mod.load_guide(config.GUIDE_PATH))
+    conflicts = glossary.seed_from_guide(config.DB_PATH,
+                                         guide_mod.load_guide(config.GUIDE_PATH))
+    for c in conflicts:
+        print(f"KONFLIKT: {c['incoming']!r} je alias položky "
+              f"{c['existing_canonical']!r} - nic jsem nepřepsal, rozhodni ručně.")
     print("Návod uložen, glosář naseedován. Dál: `python main.py run`")
     return 0
 
@@ -294,6 +393,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("--chunked", action="store_true",
                         help="po částech, když se kniha nevejde do kontextu")
     p_scan.set_defaults(func=_cmd_scan)
+
+    p_ref = sub.add_parser("reference", help="vytěž terminologii z profesionálních překladů")
+    p_ref.add_argument("--dir", default=None, help="kořen se složkami EN/ a CZ/")
+    p_ref.add_argument("--refresh-cache", action="store_true", dest="refresh_cache",
+                       help="postav korpus znovu bez ohledu na cache")
+    p_ref.set_defaults(func=_cmd_reference)
 
     sub.add_parser("review", help="web UI: potvrď návod → guide.json"
                    ).set_defaults(func=_cmd_review)

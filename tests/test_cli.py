@@ -228,3 +228,70 @@ def test_run_without_only_still_takes_whole_queue(tmp_path, monkeypatch):
     monkeypatch.setattr(P, "process_chapter", fake)
     assert _run(["run"], tmp_path, monkeypatch) == 0
     assert seen == [1, 2, 3, 4]
+
+
+def test_reference_requires_scan_first(tmp_path, monkeypatch):
+    book = tmp_path / "k.txt"; book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    # guide.draft.json neexistuje
+    assert _run(["reference", "--dir", str(tmp_path / "ref")], tmp_path, monkeypatch) == 1
+
+
+def test_reference_missing_dir_is_fatal(tmp_path, monkeypatch):
+    import json as _json
+    book = tmp_path / "k.txt"; book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    _json.dump({"characters": [], "places": [], "terms": [], "relationships": [],
+                "style_notes": "", "must_decide": []},
+               open("data/guide.draft.json", "w", encoding="utf-8"))
+    assert _run(["reference", "--dir", str(tmp_path / "neexistuje")],
+                tmp_path, monkeypatch) == 1
+    assert not os.path.exists("data/reference.json")
+
+
+def test_reference_writes_findings_and_closes_run(tmp_path, monkeypatch):
+    import json as _json
+    book = tmp_path / "k.txt"; book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    _json.dump({"characters": [], "places": [],
+                "terms": [{"term_en": "Nevernever", "suggested_cz": "N", "note": ""}],
+                "relationships": [], "style_notes": "", "must_decide": []},
+               open("data/guide.draft.json", "w", encoding="utf-8"))
+    import src.reference as R
+    import src.reference_mine as M
+    monkeypatch.setattr(R, "load_corpus", lambda root: R.Corpus(
+        cz={1: "Nevernever tady je uprostřed věty.", 2: "a Nevernever zase.",
+            3: "Nevernever potřetí uprostřed."},
+        en={1: "Nevernever", 2: "Nevernever", 3: "Nevernever"},
+        manifest={}, source_root=root))
+    monkeypatch.setattr(R, "load_cache", lambda p, r: None)
+    monkeypatch.setattr(R, "save_cache", lambda c, p: None)
+    ref_dir = tmp_path / "ref"; ref_dir.mkdir()
+    assert _run(["reference", "--dir", str(ref_dir)], tmp_path, monkeypatch) == 0
+    data = M.load_reference("data/reference.json")
+    assert data["findings"][0]["classification"] in ("confirmed", "weak")
+    with state.connect("data/state.sqlite3") as conn:
+        r = conn.execute("SELECT status FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+    assert r["status"] == "ok"
+
+
+def test_reference_failure_leaves_previous_file_untouched(tmp_path, monkeypatch):
+    import json as _json
+    book = tmp_path / "k.txt"; book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    _json.dump({"characters": [], "places": [],
+                "terms": [{"term_en": "Foo", "suggested_cz": "", "note": ""}],
+                "relationships": [], "style_notes": "", "must_decide": []},
+               open("data/guide.draft.json", "w", encoding="utf-8"))
+    os.makedirs("data", exist_ok=True)
+    with open("data/reference.json", "w", encoding="utf-8") as f:
+        f.write('{"schema_version": 1, "run_id": 0, "source_root": "/old", '
+                '"fingerprint": {}, "findings": []}')
+    before = open("data/reference.json", encoding="utf-8").read()
+    import src.reference as R
+    monkeypatch.setattr(R, "load_corpus", lambda root: (_ for _ in ()).throw(
+        ValueError("korpus je rozbitý")))
+    monkeypatch.setattr(R, "load_cache", lambda p, r: None)
+    ref_dir = tmp_path / "ref"; ref_dir.mkdir()
+    assert _run(["reference", "--dir", str(ref_dir)], tmp_path, monkeypatch) == 1
+    assert open("data/reference.json", encoding="utf-8").read() == before
