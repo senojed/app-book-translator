@@ -20,10 +20,12 @@ def test_merge_translates_draft_field_names_to_final(tmp_path):
          "style": "", "rules": []}
     m = guide.merge_draft_and_guide(draft, g)
     assert m["style"] == "sarkastický"
-    assert m["terms"][0] == {"term_en": "Nevernever", "cz": "Nikdykdy", "note": ""} \
-        or (m["terms"][0]["term_en"] == "Nevernever" and m["terms"][0]["cz"] == "Nikdykdy")
-    assert m["places"][0]["cz"] == "Chicago"
-    assert m["characters"][0]["render"] == "translate"
+    # scoutův návrh se drží ODDĚLENĚ, nepředvyplňuje se do cz
+    assert m["terms"][0]["term_en"] == "Nevernever"
+    assert m["terms"][0]["cz"] == ""
+    assert m["terms"][0]["scout_suggestion"] == "Nikdykdy"
+    assert m["places"][0]["scout_suggestion"] == "Chicago"
+    assert m["characters"][0]["scout_suggestion"] == "translate"
 
 
 def test_load_guide_normalizes_partial_existing_file(tmp_path):
@@ -57,9 +59,10 @@ def test_merge_keeps_human_decisions(tmp_path):
          "places": [], "terms": [], "relationships": [], "style": "", "rules": []}
     merged = guide.merge_draft_and_guide(draft, g)
     harry = [c for c in merged["characters"] if c["name_en"] == "Harry"][0]
-    assert harry["render"] == "keep"  # lidské rozhodnutí zůstalo
+    assert harry["render"] == "keep"          # lidské rozhodnutí zůstalo
     newguy = [c for c in merged["characters"] if c["name_en"] == "NewGuy"][0]
-    assert newguy["render"] == "translate"  # předvyplněno z draft.suggested
+    assert newguy["render"] == ""             # bez doložení se nepředvyplňuje
+    assert newguy["scout_suggestion"] == "translate"
 
 
 def test_prompt_block_has_no_cz_pairs(tmp_path):
