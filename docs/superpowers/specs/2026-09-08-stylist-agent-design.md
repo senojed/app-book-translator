@@ -12,8 +12,11 @@ učeše - beze změny faktů, jmen, termínů nebo struktury děje.
 Riziko, které to musí zvládnout: Codex jako obecný kódovací agent má sklon
 "halucinovat" - přidávat, měnit nebo mazat obsah, když dostane volnou ruku.
 Řešení: stylizace se nikdy nepřijme naslepo, vždy prochází stejnou
-kontrolou (konkordance + kritik), jakou prochází původní překlad. Neprojde-li,
-zahodí se a použije se původní text.
+kontrolou (konkordance + kritik), jakou prochází původní překlad.
+Neprojde-li, NEPŘIJME se a použije se původní text kapitoly (do DB se
+zapíše původní překlad beze změny; zamítnutý výstup Codexu se do
+diagnostického reportu ukládá jen za explicitním opt-inem
+`STYLIST_REPORT_REJECTED_TEXT`, viz kolo 31 níž).
 
 ## Mimo rozsah
 
@@ -88,6 +91,25 @@ běží AŽ POTOM - exfiltrace nastane dřív, uvnitř Codexova běhu.
 default `False`), s jasnou hláškou při vypnutém stavu. Není default
 dostupný. Codex tohle bere jako přijatelné minimum, když funkce není
 standardně zapnutá.
+
+**Doplnění (kolo 27-31):** report soubor (`_write_polish_report`) u
+ZAMÍTNUTÝCH kapitol MŮŽE perzistentně uložit zamítnutý text od Codexu +
+volná textová pole nálezů (`issue`, `cz_excerpt`, ...) + vytisknout
+popisy nálezů do konzole - všechno to může (pokud proběhla exfiltrace
+přes prompt injection) nést obsah cizího souboru. Dřív se zamítnutý
+výstup zahodil, teď by zůstal v JSON na disku. NENÍ to "žádná nová
+expozice" - je to nová PERZISTENCE potenciálně exfiltrovaného obsahu.
+
+**Rozhodnutí (kolo 31 IMPORTANT):** `config.STYLIST_REPORT_REJECTED_TEXT`
+je defaultně `False`. Argument "je to uvnitř už přijatého FS rizika"
+NEOBSTÁL: `STYLIST_ACCEPT_FS_RISK` = "agent SMÍ číst disk během běhu", NE
+"exfiltrovaný obsah se smí TRVALE uložit do souboru" (navíc
+`polish-reports/` leží vedle repa, které bývá v synchronizované složce -
+Nextcloud - takže by to teklo dál). Plný text = SAMOSTATNÝ explicitní
+opt-in (`= True`). Report v redukovaném režimu (`False`) pořád dá reject
+rate + rozpad podle `reason_types` - to na měření v1 stačí; plný text se
+zapne jen pro konkrétní běh, co je potřeba prozkoumat očima. Po přechodu
+na neagentní API (viz níž) tenhle přípis padá spolu s celým FS rizikem.
 
 **Migrační cesta na bezpečnější variantu (proč jde odložit):** design od
 začátku izoluje `stylist.polish()` jako JEDINÉ místo, co mluví s Codexem
@@ -353,6 +375,29 @@ STYLIST_MAX_CHARS = 60_000
 # nebo OS/kontejnerová izolace) tohle celé nahradí - viz sekce
 # "Bezpečnostní rozhodnutí (kolo 19)" níže.
 STYLIST_ACCEPT_FS_RISK = False
+# Kolo 27-37 - report běhu `polish` (`polish-reports/run-*.json`).
+# `False` (DEFAULT) = u ZÁMÍTNUTÝCH (`rejected`) kapitol report nese JEN
+# `reason_types` (normalizované kategorie `"source/type"`), žádná volná
+# textová pole nálezů ani zamítnutý text; konzole vynechá popisy nálezů;
+# `polish()` chybové hlášky (`StylistError`) i `failed.error` v reportu
+# jdou přes `stylist._redact_detail` - žádná hodnota odvozená z Codexova
+# výstupu (stderr, sekvence čísel, počet odstavců, poměr délky,
+# `str(e)`). Hlavičkové `run_error`/`finalization_error` nesou jen
+# hlášky programu / redigované `FatalRunError` (kolo 35), `summary` a
+# `run_id`/`generated_at`/... jsou metadata - v reportu zůstávají vždy.
+# `True` (jen literál, `is True`) = PLNÝ DETAIL: zamítnutý text od
+# Codexu + volná pole nálezů (`issue`, `cz_excerpt`, ...) + konzolové
+# popisy + raw stderr/čísla/odstavce. Ať jde očima posoudit, jestli byl
+# reject oprávněný.
+# PROČ NENÍ `True` DEFAULT (kolo 31 IMPORTANT): zapnutím
+# `STYLIST_ACCEPT_FS_RISK` bereš, že agent SMÍ číst disk BĚHEM běhu - NE
+# že se případně exfiltrovaný obsah TRVALE uloží do souboru (navíc
+# `polish-reports/` je vedle repa, které bývá v synchronizované složce -
+# Nextcloud apod. - takže by to teklo dál). To je samostatné rozhodnutí,
+# proto samostatný explicitní opt-in. Report v redukovaném režimu
+# (`False`) pořád dá reject rate + rozpad podle `reason_types`; plný text
+# zapni, jen když ten konkrétní běh potřebuješ prozkoumat očima.
+STYLIST_REPORT_REJECTED_TEXT = False
 ```
 
 `main.py` navíc potřebuje (kolo 3 nález - `concordance`/`glossary` v
@@ -361,6 +406,7 @@ STYLIST_ACCEPT_FS_RISK = False
 každé volání, proto na úrovni modulu):
 
 ```python
+import datetime as _dt
 import hashlib
 import sqlite3
 import time
@@ -372,13 +418,15 @@ from src import concordance, glossary
 copy2` - kolo 14 ho nahradilo SQLite vlastním backup API, `import shutil`
 tak v `main.py` runtime kódu už není potřeba. `time` pro `time.monotonic()`
 - časový limit `_snapshot_db` proti neomezenému čekání na zamčenou DB,
-viz kolo 15 IMPORTANT níže. `collections.Counter` pro `_polish_rejected`
-NAVRŽEN v kole 16, ale kolo 17-18 přímým ověřením `concordance.py`
-potvrdilo, že je zbytečný - `check_chapter()` sama nikdy nevrátí
+viz kolo 15 IMPORTANT níže. `collections.Counter` pro rozhodovací logiku
+zamítnutí (dnes `_rejection_reasons`) NAVRŽEN v kole 16, ale kolo 17-18
+přímým ověřením `concordance.py` potvrdilo, že je zbytečný - `check_chapter()` sama nikdy nevrátí
 duplicitní `(type, term_id, actual)` klíč v jednom volání, takže
 množinové srovnání stačí - `import` se do `main.py` nakonec nedostal.)
 
-(`json` už je v importech, `pipeline`/`state`/`FatalRunError` taky.)
+(`datetime as _dt` pro timezone-aware `generated_at` v report souboru
+- kolo 34 NIT. `json` už je v importech, `pipeline`/`state`/
+`FatalRunError` taky.)
 
 ### `src/agents/stylist.py`
 
@@ -404,7 +452,10 @@ Bezpečnostní detaily (kola 1-6, 17-20 a 25 plan-consensus review):
    procesů. Stdin nemá žádný z těchhle limitů a PŮVODNÍ text kapitoly se
    navíc nezapisuje jako samostatný čitelný soubor (drobný bonus k bodu 5;
    pozor - STYLIZOVANÁ verze se stejně zapíše přes `-o`, viz bod 2, jen
-   dočasně a bez záruky bezpečného vymazání).
+   dočasně a bez záruky bezpečného vymazání. Navíc kolo 27: ZAMÍTNUTÁ
+   stylizovaná verze se PERZISTENTNĚ ukládá do report souboru, když
+   `config.STYLIST_REPORT_REJECTED_TEXT` - viz `_write_polish_report`
+   docstring "BEZPEČNOST").
 2. VÝSTUP jde přes `-o out_path`/`--output-last-message` - `codex exec`
    samo zachytí POSLEDNÍ ZPRÁVU agenta a zapíše ji do souboru (capture na
    úrovni CLI, ne akce sandboxovaného procesu - `--sandbox read-only` by
@@ -555,6 +606,21 @@ def _paragraph_count(text: str) -> int:
 # přínos zachycení řídkého případu úmyslně otočeného znaménka (to navíc
 # pořád hlídá `check_meaning_preserved`, jen ne deterministicky).
 _NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?[   ]?%?")
+
+
+_REDACTED = "(hodnoty potlačeny - config.STYLIST_REPORT_REJECTED_TEXT není True)"
+
+
+def _redact_detail(detail: str) -> str:
+    """Konkrétní hodnoty odvozené z Codexova výstupu (stderr, sekvence
+    čísel, počty odstavců, poměr délky, `str(e)` neočekávané výjimky) do
+    chybové hlášky JEN za `config.STYLIST_REPORT_REJECTED_TEXT is True`
+    (kolo 32-34). Bez toho by je prompt injection mohla použít jako
+    covert channel / je nechat perzistovat v `failed`/`error` záznamu
+    reportu. `is True` (ne truthiness) - `1`/`"False"`/`None` = redigovat.
+    `main.py` (`_cmd_polish` obecný `except`) to volá přes
+    `stylist._redact_detail`."""
+    return detail if config.STYLIST_REPORT_REJECTED_TEXT is True else _REDACTED
 
 
 def _number_sequence(text: str) -> list:
@@ -778,7 +844,11 @@ def polish(en_text: str, cz_text: str, *, timeout: int | None = None,
     # TemporaryDirectory jako context manager (kolo 3 nález) - slouží jako
     # izolovaný `-C` kořen a cíl pro `-o` (VÝSTUP se sem zapíše - vstup jde
     # stdinem, viz docstring bod 1, takže PŮVODNÍ text sem jako soubor
-    # nejde; STYLIZOVANÁ verze ano, viz `out_path` níže).
+    # nejde; STYLIZOVANÁ verze ano, viz `out_path` níže). TENHLE soubor se
+    # po `with` bloku smaže; ZAMÍTNUTÝ výstup ale může skončit v report
+    # souboru `main._write_polish_report` (kolo 27, JEN za explicitním
+    # opt-inem `config.STYLIST_REPORT_REJECTED_TEXT is True`, default
+    # `False`) - to je MIMO tenhle modul.
     with tempfile.TemporaryDirectory(prefix="stylist-") as work_dir:
         out_path = os.path.join(work_dir, "out.txt")
 
@@ -821,9 +891,16 @@ def polish(en_text: str, cz_text: str, *, timeout: int | None = None,
             raise StylistError(f"codex exec překročil timeout {timeout}s.")
 
         if proc.returncode != 0:
+            # VŠECHNY chybové hlášky `polish()`, co nesou hodnotu odvozenou
+            # z Codexova výstupu (`stderr`, počet odstavců, poměr délky,
+            # sekvence čísel), jdou přes `_redact_detail` (kolo 32-34) -
+            # bez `STYLIST_REPORT_REJECTED_TEXT is True` uvedou jen
+            # generickou náhradu, ne konkrétní hodnoty (prompt injection
+            # by je jinak mohla exfiltrovat / použít jako covert channel
+            # do `failed` záznamu reportu).
             raise StylistError(
                 f"codex exec skončil s kódem {proc.returncode}: "
-                f"{stderr[:500]}")
+                f"{_redact_detail(stderr[:500])}")
         if not os.path.exists(out_path):
             raise StylistError(
                 "codex exec nevytvořil výstupní soubor (-o) - žádná "
@@ -846,14 +923,14 @@ def polish(en_text: str, cz_text: str, *, timeout: int | None = None,
     # cílem je odchytit JEN hrubé selhání (uťatý výstup, smazaný obsah).
     if _paragraph_count(styled) != _paragraph_count(cz_text):
         raise StylistError(
-            f"počet odstavců se liší ({_paragraph_count(styled)} vs. "
-            f"{_paragraph_count(cz_text)} originál) - podezření na "
-            "useknutý nebo přepsaný výstup.")
+            "počet odstavců se liší "
+            f"{_redact_detail(f'({_paragraph_count(styled)} vs. {_paragraph_count(cz_text)} originál)')}"
+            " - podezření na useknutý nebo přepsaný výstup.")
     ratio = len(styled) / max(1, len(cz_text))
     if not (0.5 <= ratio <= 1.5):
         raise StylistError(
-            f"délka výstupu se od originálu liší {ratio:.1f}x - "
-            "podezření na useknutý nebo přepsaný výstup.")
+            f"délka výstupu se od originálu liší {_redact_detail(f'{ratio:.1f}x')}"
+            " - podezření na useknutý nebo přepsaný výstup.")
     # Sekvence arabských číslic (kolo 6 IMPORTANT, revize kol 4-5, ŘAZENÍ
     # odstraněno kolo 13 BLOCKING - viz `_number_sequence` docstring) -
     # levné, deterministické, fail-closed. Zachytí přehození číslic
@@ -863,8 +940,11 @@ def polish(en_text: str, cz_text: str, *, timeout: int | None = None,
     # "čitelné". Slovně vypsaná čísla mimo rozsah.
     before_nums, after_nums = _number_sequence(cz_text), _number_sequence(styled)
     if before_nums != after_nums:
+        # `after_nums` pochází ze STYLIZOVANÉHO textu (Codexův výstup) -
+        # přes `_redact_detail` (kolo 33-34).
         raise StylistError(
-            f"čísla v textu se změnila ({before_nums} → {after_nums}) - "
+            "čísla v textu se změnila "
+            f"{_redact_detail(f'({before_nums} → {after_nums})')} - "
             "podezření na faktickou změnu, ne jen styl.")
     return styled
 
@@ -998,11 +1078,16 @@ Kola 1-3 plan-consensus review navíc opravily:
   volání `stylist.polish`), ale `FatalRunError` (např. cost guard) se
   explicitně přeposílá ven a ukončí celý `polish` (kolo 2 nález - dřívější
   draft `FatalRunError` z kritika tiše "spolykal" jako `failed += 1`, což
-  by cost guard udělalo bezzubým). `KeyboardInterrupt` se v `isinstance`
-  kontrole NEKONTROLUJE (kolo 3 NIT) - `except Exception` ho nikdy
-  nezachytí, `KeyboardInterrupt` dědí přímo z `BaseException`, takže by to
-  byl mrtvý kód; vnější `except KeyboardInterrupt` na úrovni `_cmd_polish`
-  stačí sám o sobě.
+  by cost guard udělalo bezzubým). `KeyboardInterrupt` dědí přímo z
+  `BaseException`, takže ho `except Exception` NIKDY nezachytí - do
+  `isinstance` kontroly se proto necpe (kolo 3 NIT). Pro STAV BĚHU stačí
+  vnější `except KeyboardInterrupt` na úrovni `_cmd_polish` (nastaví
+  `status="interrupted"`, re-raise). Pro REPORT ale NE (kolo 30-35) -
+  `_cmd_polish` má NAVÍC in-loop `except KeyboardInterrupt`, co PODLE
+  STAVU DB přidá `outcome=="polished"` (commit už proběhl - `translated_
+  text` se změnil) NEBO `outcome=="interrupted"` (nezměnil) záznam
+  PŘERUŠENÉ kapitoly (jinak by ji `attempted_count` počítal jako
+  nezpracovanou), a pak re-raisne k vnějšímu handleru.
 - **Řízený, POVINNÝ model** - `config.CODEX_MODEL` musí být nastavený
   (ne prázdný) - `_cmd_polish` to zkontroluje HNED na začátku a odmítne
   běžet bez něj. Hodnota se normalizuje (`.strip()`) JEDNOU a stejná
@@ -1035,6 +1120,19 @@ jinde v kódu, co nálezy čte, nespadne na neznámý klíč). Další `polish` 
 `--force` takové kapitoly přeskočí.
 
 ```python
+def _say(msg: str) -> None:
+    """Best-effort diagnostický výpis (kolo 35 IMPORTANT). Používá se
+    pro VŠECHNY per-kapitolové hlášky v `_polish_one_chapter` i
+    `_cmd_polish` smyčce - `print()` může vyhodit (`BrokenPipeError`,
+    zavřený stdout), a to NESMÍ změnit `outcome` kapitoly ani stav běhu
+    (zvlášť po úspěšném commitu). Výsledek běhu se řídí stavem DB a
+    kontrolami, ne tím, jestli hláška dorazila na terminál."""
+    try:
+        print(msg)
+    except Exception:
+        pass
+
+
 def _parse_findings(notes_json: str | None) -> list:
     """Bezpečné čtení `notes` jako seznamu nálezů - platný JSON, co NENÍ
     seznam (starší/cizí tvar `notes`), nebo úplně rozbitý JSON, dá prázdný
@@ -1171,12 +1269,24 @@ def _rejection_reasons(baseline_concordance: list, after_findings: list,
     # JINÉHO aliasu, když `actual` (= `leaked[0]`) zůstane stejný, by
     # jinak prošel.
     by_id = {t.get("term_id"): t for t in glossary_rows}
+    # Dedup pro případ z kola 28 IMPORTANT: týž problém se může objevit
+    # v NOVÝ-klíč větvi výš I v počet-výskytů větvi níž - report by pak
+    # tutéž regresi započetl dvakrát. Kolo 31 IMPORTANT: dedup je
+    # NA ÚROVNI KONKRÉTNÍHO POVRCHU (`_finding_key` = `(type, term_id,
+    # actual)`), NE celého termínu - jinak by nový chybný povrch B
+    # zamaskoval, že SOUČASNĚ narostl i výskyt povrchu A (report by ztratil
+    # jednu ze skutečných příčin). Nekonkordanční důvody
+    # (meaning/register drift, kritik) se NEdedupují - dva kritikovy
+    # `fidelity` nálezy jsou dvě informace.
+    seen_keys = {_finding_key(r) for r in reasons
+                 if r.get("source") == "concordance"}
     for f in after_findings:
         if f.get("source") != "concordance":
             continue
         ftype = f.get("type")
         if ftype not in ("leak", "inconsistency"):
             continue
+        tid = f.get("term_id")
         # inconsistency: sleduj konkrétní chybný CZ tvar (`actual`).
         surfaces = []
         if f.get("actual"):
@@ -1186,27 +1296,26 @@ def _rejection_reasons(baseline_concordance: list, after_findings: list,
         # SKUTEČNĚ mají překládat (keep-untranslated termín má EN povrch
         # SPRÁVNĚ, jeho přibývání není leak).
         if ftype == "leak":
-            term = by_id.get(f.get("term_id")) or {}
+            term = by_id.get(tid) or {}
             canonical = (term.get("canonical_en") or "").strip().lower()
             cz = (term.get("cz") or "").strip().lower()
             if canonical and cz != canonical:
                 surfaces += [s for s in ([term.get("canonical_en", "")]
                              + list(term.get("aliases") or [])) if s]
         for s in set(surfaces):
+            if (ftype, tid, s) in seen_keys:
+                continue   # týž povrch už nahlášen (nový klíč / dřív tady)
             before_n = len(concordance.find_form_occurrences(cz_before, s))
             after_n = len(concordance.find_form_occurrences(cz_after, s))
             if after_n > before_n:
                 reasons.append({
                     "source": "concordance", "type": ftype,
                     "severity": "critical", "action": "revise",
-                    "term_id": f.get("term_id"), "expected": None,
+                    "term_id": tid, "expected": None,
                     "actual": s, "cz_excerpt": None, "suggestion": None,
                     "issue": (f"po stylizaci PŘIBYL výskyt zakázaného "
                               f"povrchu {s!r} ({before_n} -> {after_n})")})
-    # Poznámka: NOVÝ-klíč větev a počet-výskytů větev můžou týž `leak`/
-    # `inconsistency` nahlásit dvakrát (nový klíč A zároveň víc výskytů).
-    # V logu to neškodí - obě jsou platné důvody. Rozhodovací bránu
-    # (`_polish_rejected`) to neovlivní (jakýkoli neprázdný seznam = zamítni).
+                seen_keys.add((ftype, tid, s))
     return reasons
 
 
@@ -1345,23 +1454,45 @@ def _backup_db_once(db: str, backup_state: dict) -> None:
         return
     backup_path = db + ".pre-polish-backup"
     os.replace(backup_state["snapshot_path"], backup_path)
-    print(f"Záloha DB (stav před tímto během `polish`): {backup_path}")
+    # `done = True` HNED po `os.replace` (kolo 36 IMPORTANT), PŘED
+    # diagnostickým výpisem - jinak by `BrokenPipeError` z `print`
+    # udělal z úspěšné promoce `FatalRunError` a `_polish_one_chapter` by
+    # commit vůbec nezkusil. `_say` je navíc nevyhazující.
     backup_state["done"] = True
+    _say(f"Záloha DB (stav před tímto během `polish`): {backup_path}")
 
 
 def _polish_one_chapter(c, glossary_rows, cf, db, model: str, guide_block: str,
-                        codex_cmd: list, backup_state: dict, report: list):
-    """Vrací 'polished' | 'unchanged' | 'rejected' | 'failed'. Výjimky
+                        codex_cmd: list, backup_state: dict) -> dict:
+    """Vrací JEDEN report `dict` za kapitolu. Výjimky
     NEchytá (kromě `stylist.StylistError` → `"failed"` a záloha/DB zápisu
     → `FatalRunError`, viz níže) - volající (_cmd_polish) rozhoduje, co je
     per-kapitolové (chytit, pokračovat) a co ukončuje celý běh
     (FatalRunError).
 
-    `report` je akumulátor (předává ho `_cmd_polish`) - tahle funkce do
-    něj APPENDNE jeden záznam za kapitolu: `{"idx", "outcome"}` vždy, a
-    navíc u `rejected` `{"reasons": [...], "findings": [...], "styled":
-    <zamítnutý text od Codexu>}`, u `failed` `{"error": "<hláška>"}`
-    (kolo 27 - měřicí přístroj pro v1, viz `_write_polish_report`).
+    NÁVRATOVÁ HODNOTA (kolo 34 IMPORTANT - dřív funkce mutovala sdílený
+    `report`, což vedlo k dvojím/chybějícím záznamům při výjimce z
+    `print()` apod.): vrací PRÁVĚ JEDEN `dict` záznam za kapitolu.
+    NEMUTUJE `report` - `_cmd_polish` appendne PRÁVĚ JEDNOU ZA ITERACI
+    smyčky (má tři `report.append` větve - `fatal`, `interrupted`,
+    společný bottom - ale na každé cestě smyčkou proběhne jen jedna;
+    invariant je STRUKTURNÍ, ne dohlídaný dedupem). Tvary:
+      - `{"idx", "outcome": "polished"|"unchanged"}`
+      - `{"idx", "outcome": "failed", "error": <hláška>}` - `error` z
+        `stylist.StylistError` je už u zdroje (`polish()`) zbavená
+        Codexem-řízených hodnot, když `STYLIST_REPORT_REJECTED_TEXT`
+        není `True` (kolo 29-33).
+      - `{"idx", "outcome": "rejected", "reason_types": [...]}` +
+        (za `STYLIST_REPORT_REJECTED_TEXT is True`) `reasons`/`findings`/
+        `styled`.
+    `FatalRunError` (selhání commitu, NEBO fatální chyba klienta z kritika
+    / meaning-checku - kolo 37) se NEobaluje do záznamu tady - propaguje
+    ven a `_cmd_polish` si `fatal` záznam postaví sám (zná `c`). Hláška
+    je VŽDY REDIGOVANÁ U ZDROJE (`stylist._redact_detail`, kolo 35/37).
+    `KeyboardInterrupt` taky propaguje - `_cmd_polish` po něm porovná
+    `translated_text` kapitoly v DB se vstupním `c` (kolo 35 - NE marker,
+    ten je u `--force` z dřívějšího běhu) a zapíše `polished` nebo
+    `interrupted`.
 
     `codex_cmd` je JIŽ rozřešený (`_cmd_polish` ho spočítal jednou v
     preflightu) - `stylist.polish` ho díky tomu nemusí znovu hledat přes
@@ -1373,14 +1504,12 @@ def _polish_one_chapter(c, glossary_rows, cf, db, model: str, guide_block: str,
                                 guide_block=guide_block,
                                 timeout=config.STYLIST_TIMEOUT_SECONDS)
     except stylist.StylistError as e:
-        print(f"Kapitola {idx}: stylista selhal ({e}), ponechávám původní.")
-        report.append({"idx": idx, "outcome": "failed", "error": str(e)})
-        return "failed"
+        _say(f"Kapitola {idx}: stylista selhal ({e}), ponechávám původní.")
+        return {"idx": idx, "outcome": "failed", "error": str(e)}
 
     if styled == cz:
-        print(f"Kapitola {idx}: beze změny (Codex nenavrhl žádnou úpravu).")
-        report.append({"idx": idx, "outcome": "unchanged"})
-        return "unchanged"
+        _say(f"Kapitola {idx}: beze změny (Codex nenavrhl žádnou úpravu).")
+        return {"idx": idx, "outcome": "unchanged"}
 
     # Předchozí mentions JAKO rendered_terms (kolo 5 BLOCKING) - termín
     # zachycený translatorem VÝHRADNĚ přes vlastní hlášení (žádná přesná EN
@@ -1410,36 +1539,62 @@ def _polish_one_chapter(c, glossary_rows, cf, db, model: str, guide_block: str,
     # (žádné LLM volání), takže dvojí přepočet nic nestojí navíc.
     baseline_concordance = concordance.check_chapter(en, cz, glossary_rows, rendered_terms)
     findings = concordance.check_chapter(en, styled, glossary_rows, rendered_terms)
-    critic_findings, critic_failed = pipeline._run_critic(en, styled, cf("critic"))
-    findings += critic_findings
     # Kolo 9 NIT: `check_meaning_preserved` je DALŠÍ placené volání
     # (Anthropic request) - když konkordance nebo kritik SAMY o sobě
     # zamítnutí už zaručují, nemá smysl za něj platit. `_rejection_
     # reasons` se volá DVAKRÁT (žádná duplicitní rozhodovací logika, jen
-    # fail-fast dřív) - poprvé nad tím, co je zadarmo/už stejně
-    # zaplaceno, podruhé (jen když první nezamítlo) i s meaning-check
-    # nálezy. Kolo 27: bereme SEZNAM důvodů (ne jen bool), ať se dá
-    # vypsat a zalogovat CO PŘESNĚ zamítnutí způsobilo.
-    reasons = _rejection_reasons(baseline_concordance, findings, cz, styled, glossary_rows)
-    if critic_failed:
-        reasons = [{"source": "critic", "type": "critic_failed",
-                    "severity": "critical", "action": "revise", "term_id": None,
-                    "expected": None, "actual": None, "cz_excerpt": None,
-                    "suggestion": None,
-                    "issue": "kritik nevrátil platnou odpověď ani po retry "
-                             "- bereme jako selhání kontroly"}] + reasons
-    if not reasons:
-        findings += stylist.check_meaning_preserved(cz, styled, cf("stylist_check"))
+    # fail-fast dřív). Kolo 27: bereme SEZNAM důvodů (ne jen bool).
+    #
+    # Kolo 37 IMPORTANT: `pipeline._run_critic` i `check_meaning_
+    # preserved` volají Anthropic klienta S TEXTEM `styled`; klientův
+    # `FatalRunError` (400, cost guard) může do hlášky pojmout část
+    # requestu = obsah `styled`. Proto se `FatalRunError` z týhle sekce
+    # zabalí s hláškou REDIGOVANOU U ZDROJE (`stylist._redact_detail`) -
+    # `str(fe)` je pak bezpečné v `fatal` záznamu, `run_error` i výpisu
+    # (stejný princip jako commitová `FatalRunError`, kolo 35).
+    try:
+        critic_findings, critic_failed = pipeline._run_critic(en, styled, cf("critic"))
+        findings += critic_findings
         reasons = _rejection_reasons(baseline_concordance, findings, cz, styled, glossary_rows)
+        if critic_failed:
+            reasons = [{"source": "critic", "type": "critic_failed",
+                        "severity": "critical", "action": "revise", "term_id": None,
+                        "expected": None, "actual": None, "cz_excerpt": None,
+                        "suggestion": None,
+                        "issue": "kritik nevrátil platnou odpověď ani po retry "
+                                 "- bereme jako selhání kontroly"}] + reasons
+        if not reasons:
+            findings += stylist.check_meaning_preserved(cz, styled, cf("stylist_check"))
+            reasons = _rejection_reasons(baseline_concordance, findings, cz, styled, glossary_rows)
+    except FatalRunError as fe:
+        raise FatalRunError(
+            f"Kontrola stylizace kapitoly {idx} selhala fatálně "
+            f"({stylist._redact_detail(str(fe))}) - cost guard / chyba LLM "
+            "klienta, celý běh `polish` se zastavuje.") from fe
     if reasons:
-        print(f"Kapitola {idx}: stylizace zamítnuta kontrolou "
-              f"({len(reasons)}x), ponechávám původní:")
-        for r in reasons:
-            print(f"    - [{r.get('source', '?')}/{r.get('type', '?')}] "
-                  f"{r.get('issue') or '(bez popisu)'}")
-        report.append({"idx": idx, "outcome": "rejected", "reasons": reasons,
-                       "findings": findings, "styled": styled})
-        return "rejected"
+        # `reason_types` = deduplikovaný seznam `"source/type"` řetězců.
+        # Tohle je BEZPEČNÁ agregační metrika (kolo 28 IMPORTANT) - žádný
+        # volný text, jde do reportu VŽDY. Volná pole (`issue`,
+        # `cz_excerpt`, celý `styled`) jdou jen za `STYLIST_REPORT_
+        # REJECTED_TEXT` (kolo 28 - i `issue`/`cz_excerpt` můžou
+        # zopakovat exfiltrovaný úryvek, ne jen `styled`).
+        reason_types = sorted({f"{r.get('source', '?')}/{r.get('type', '?')}"
+                               for r in reasons})
+        # `is True` (kolo 32) - `1`/`"False"`/`None` NEsmí plný detail
+        # (perzistence potenciálně exfiltrovaného textu) aktivovat.
+        full = config.STYLIST_REPORT_REJECTED_TEXT is True
+        _say(f"Kapitola {idx}: stylizace zamítnuta kontrolou "
+             f"({', '.join(reason_types)}), ponechávám původní.")
+        if full:
+            for r in reasons:
+                _say(f"    - [{r.get('source', '?')}/{r.get('type', '?')}] "
+                     f"{r.get('issue') or '(bez popisu)'}")
+        rec = {"idx": idx, "outcome": "rejected", "reason_types": reason_types}
+        if full:
+            rec["reasons"] = reasons
+            rec["findings"] = findings
+            rec["styled"] = styled
+        return rec
 
     findings.append(_stylist_marker(cz, model))
     # Mentions se přepočítají se STEJNÝM rendered_terms jako `findings`
@@ -1465,55 +1620,127 @@ def _polish_one_chapter(c, glossary_rows, cf, db, model: str, guide_block: str,
             notes_json=json.dumps(findings, ensure_ascii=False), status="done",
             new_candidates=[], mentions=mentions, questions=[])
     except Exception as e:
+        # `FatalRunError` propaguje ven, `_cmd_polish` si `fatal` záznam
+        # postaví sám (kolo 34). Hláška je REDIGOVANÁ U ZDROJE (kolo 35
+        # IMPORTANT) přes `stylist._redact_detail` - `str(e)` commitové
+        # výjimky může nést data; `str(fe)` pak jde do `fatal` záznamu,
+        # `run_error` I `_say(e)` výpisu bez dalšího řešení.
         raise FatalRunError(
-            f"Zápis výsledku kapitoly {idx} selhal ({type(e).__name__}: {e}) "
-            "- záloha/DB zápis je infrastrukturní selhání, ne per-kapitolová "
+            f"Zápis výsledku kapitoly {idx} selhal "
+            f"({stylist._redact_detail(f'{type(e).__name__}: {e}')}) - "
+            "záloha/DB zápis je infrastrukturní selhání, ne per-kapitolová "
             "chyba, celý běh `polish` se zastavuje.") from e
-    print(f"Kapitola {idx}: vylepšeno.")
-    report.append({"idx": idx, "outcome": "polished"})
-    return "polished"
+    _say(f"Kapitola {idx}: vylepšeno.")
+    return {"idx": idx, "outcome": "polished"}
 
 
-def _write_polish_report(db: str, rid: int, report: list) -> None:
+_REPORT_SCHEMA_VERSION = 1
+
+
+_REPORT_OUTCOMES = ("polished", "unchanged", "rejected", "failed", "fatal",
+                    "interrupted")
+
+
+def _write_polish_report(db: str, rid: int, report: list, *, codex_model: str,
+                         planned_count: int, batch_completed: bool,
+                         run_status: str, run_error: "str | None" = None,
+                         finalization_error: "str | None" = None) -> None:
     """JSON report běhu `polish` - VEDLE DB (soubor), NE do DB (žádná
-    změna schématu). Kolo 27: vědomá revize kola-1 rozhodnutí "jen
-    konzole". Smysl v1 je ZMĚŘIT, jestli stylista funguje - k tomu je
-    tohle měřicí přístroj: per kapitola `outcome`, a u `rejected`/
-    `failed` PLNÝ seznam nálezů + u `rejected` i ZAMÍTNUTÝ text od
-    Codexu (ať jde očima ověřit, jestli byl reject oprávněný, nebo
-    falešný poplach).
+    změna schématu). Kolo 27-28: vědomá revize kola-1 "jen konzole".
+    Smysl v1 je ZMĚŘIT, jestli stylista funguje.
 
-    `polish-reports/run-<rid>-<timestamp>.json` - jeden soubor za běh,
-    historie zůstává (další běh, co zkouší zamítnuté kapitoly znovu,
-    nepřepíše ten předchozí). Atomický zápis (tmp + `os.replace`) jako
-    `guide.py`.
+    Volá se z `finally` v `_cmd_polish` VŽDY, když existuje `rid` (kolo
+    28 - i běh, co po `create_run` spadl PŘED první kapitolou, je data:
+    "spustil se, neudělal nic"). `if not report` se NEkontroluje.
 
-    Best-effort jako `state.finish_run` (kolo 13) - selhání zápisu
-    reportu (plný disk, práva) se jen VYPÍŠE, NEshodí běh ani nepřepíše
-    jeho výsledek/návratový kód. Report nese text knihy (stylizované
-    verze) - žije vedle DB, co UŽ všechen text knihy má, takže žádná
-    nová třída expozice (bezpečnostní detaily v `stylist.polish` řeší
-    NEZAPISOVÁNÍ VSTUPNÍHO promptu, ne tenhle diagnostický artefakt,
-    který si uživatel výslovně vyžádal)."""
-    out_dir = os.path.join(os.path.dirname(db) or ".", "polish-reports")
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    path = os.path.join(out_dir, f"run-{rid}-{stamp}.json")
-    payload = {
-        "run_id": rid,
-        "summary": {k: sum(1 for r in report if r.get("outcome") == k)
-                    for k in ("polished", "unchanged", "rejected", "failed")},
-        "chapters": report,
-    }
+    Kontrakt záznamu kapitoly - viz `_polish_one_chapter` docstring.
+    Klíčové: `rejected` nese `reason_types` VŽDY (deduplikované
+    `"src/type"` řetězce, bezpečná agregační metrika); `reasons`/
+    `findings`/`styled` jen za `config.STYLIST_REPORT_REJECTED_TEXT`.
+    `failed` nese jen `error`.
+
+    Hlavička (kompletní výčet):
+      - `schema_version`, `run_id`, `generated_at` (ISO čas zápisu)
+      - `codex_model` - SKUTEČNĚ použitý model (kolo 30: předává ho
+        `_cmd_polish` jako `codex_model=model`, ne re-read `config.
+        CODEX_MODEL` - auditní údaj svázaný s během). Codex volání NENÍ v
+        `llm_calls`, bez modelu nejde reject rate porovnat mezi
+        konfiguracemi.
+      - `planned_count` (kolik kapitol se mělo zpracovat),
+        `attempted_count` (= `len(report)`), `batch_completed` (smyčka
+        prošla VŠECHNY kapitoly - kolo 28 IMPORTANT: samostatný příznak,
+        NE odvozený z `run_status`; dávka, kde všechny kapitoly `failed`,
+        DOběhla celá, i když `run_status="fatal"`)
+      - `run_status` ("ok"/"fatal"/"interrupted"), `run_error` (hláška
+        top-level výjimky, když běh spadl mimo per-kapitolovou smyčku),
+        `finalization_error` (když `state.finish_run` selhal - kolo 28:
+        report se píše AŽ PO `finish_run`, aby tohle mohl zaznamenat)
+      - `summary` - dict s počty pro každý outcome v `_REPORT_OUTCOMES`
+        (polished/unchanged/rejected/failed/fatal/interrupted)
+
+    `polish-reports/run-<rid>-<timestamp>-<8 hex>.json` - jeden soubor za běh,
+    historie zůstává. Atomický zápis (tmp + `os.replace`).
+
+    Best-effort: CELÉ sestavení i zápis v `except Exception` (ne jen
+    `OSError` - `json.dump` neserializovatelné hodnoty hodí `TypeError`;
+    volá se z `finally`, nová výjimka by přebila skutečný výsledek).
+    Selhání jen VYPÍŠE a uklidí `.tmp`.
+
+    BEZPEČNOST (kolo 27-32): s `config.STYLIST_REPORT_REJECTED_TEXT is
+    True` report u `rejected` PERZISTENTNĚ ukládá zamítnutý text od
+    Codexu + volná pole nálezů (`issue`, `cz_excerpt`, ...), co můžou
+    nést exfiltrovaný obsah (dřív se po zamítnutí zahodilo). To je
+    SAMOSTATNÉ riziko (trvalá perzistence potenciálně exfiltrovaného
+    obsahu, navíc do často synchronizované složky) - NENÍ pokryté
+    přijetím `STYLIST_ACCEPT_FS_RISK` (to je jen o čtení disku BĚHEM
+    běhu), proto SAMOSTATNÝ explicitní opt-in (kolo 31 IMPORTANT). DEFAULT
+    je `False` → záznam `rejected` nese JEN `reason_types` (normalizované
+    kategorie, žádný volný text), per-kapitolový konzolový výpis vynechá
+    `issue` řádky, a `polish()` nepřipojí Codex stderr do `StylistError`.
+    Kontrola `is True` (kolo 32) - `1`/`"False"`/`None` plný detail
+    NEaktivují. Retence/práva souborů `polish-reports/` jsou na uživateli."""
+    tmp = None
     try:
+        now = _dt.datetime.now(_dt.timezone.utc).astimezone()
+        payload = {
+            "schema_version": _REPORT_SCHEMA_VERSION,
+            "run_id": rid,
+            "codex_model": codex_model,
+            "generated_at": now.isoformat(),   # timezone-aware ISO 8601 (kolo 34)
+            "planned_count": planned_count,
+            "attempted_count": len(report),
+            "batch_completed": batch_completed,
+            "run_status": run_status,
+            "run_error": run_error,
+            "finalization_error": finalization_error,
+            "summary": {k: sum(1 for rec in report if rec.get("outcome") == k)
+                        for k in _REPORT_OUTCOMES},
+            "chapters": report,
+        }
+        out_dir = os.path.join(os.path.dirname(db) or ".", "polish-reports")
         os.makedirs(out_dir, exist_ok=True)
+        # `run-<rid>-<čas>-<8 hex>.json` - `rid` je unikátní sám o sobě
+        # (autoincrement), časové razítko a náhodný suffix (kolo 34 NIT)
+        # jen kdyby se `_write_polish_report` volalo pro týž run vícekrát.
+        stamp = now.strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(out_dir,
+                            f"run-{rid}-{stamp}-{os.urandom(4).hex()}.json")
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
-        print(f"Report běhu: {path}")
-    except OSError as e:
-        print(f"POZOR: zápis reportu selhal ({type(e).__name__}: {e}) - "
-              "výsledek běhu výš je platný, chybí jen diagnostický soubor.")
+        _say(f"Report běhu: {path}")
+    except Exception as e:
+        # `_say` (nevyhazující, kolo 36 IMPORTANT) - `_write_polish_
+        # report` se volá z `finally`, výjimka z `print` v tomhle
+        # `except` by unikla ven a přebila skutečný výsledek běhu.
+        _say(f"POZOR: zápis reportu selhal ({type(e).__name__}: {e}) - "
+             "výsledek běhu výš je platný, chybí jen diagnostický soubor.")
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def _cmd_polish(args) -> int:
@@ -1526,7 +1753,7 @@ def _cmd_polish(args) -> int:
     # injection z textu knihy může exfiltrovat citlivý soubor dřív, než
     # výstupní kontroly proběhnou. Kontrola JAKO PRVNÍ (před `CODEX_MODEL`).
     if config.STYLIST_ACCEPT_FS_RISK is not True:
-        print(
+        _say(
             "polish je vypnutý: spouští agentní `codex exec`, který má "
             "ČTECÍ přístup k CELÉMU disku (ověřeno). Prompt injection z "
             "textu knihy tak MŮŽE exfiltrovat citlivý soubor jako součást "
@@ -1538,7 +1765,7 @@ def _cmd_polish(args) -> int:
         return 1
     model = (config.CODEX_MODEL or "").strip()
     if not model:
-        print("Chybí config.CODEX_MODEL - nastav ho (audit stylizace musí "
+        _say("Chybí config.CODEX_MODEL - nastav ho (audit stylizace musí "
               "vědět, jaký model se skutečně použil).")
         return 1
     try:
@@ -1552,7 +1779,7 @@ def _cmd_polish(args) -> int:
         # každou kapitolu.
         codex_cmd = stylist._resolve_codex_cmd(["codex"])
     except stylist.StylistError as e:
-        print(f"Codex CLI není použitelné: {e}")
+        _say(f"Codex CLI není použitelné: {e}")
         return 1
 
     # `rid`/`backup_state` PŘEDEM na `None` (kolo 14 IMPORTANT, rozšiřuje
@@ -1568,6 +1795,11 @@ def _cmd_polish(args) -> int:
     rid = None
     status = "fatal"
     backup_state = None
+    report = []          # kolo 27 - akumulátor; PŘED try, ať ho `finally` vidí
+    planned_count = 0    # kolik kapitol se mělo zpracovat (kolo 28)
+    batch_completed = False   # smyčka prošla všechny kapitoly? (kolo 28 -
+                              # NE odvozovat z `status`)
+    run_error = None     # hláška top-level výjimky, když běh spadl mimo smyčku
     try:
         all_done = state.chapters_by_status(db, ("done",))
         chapters = all_done
@@ -1578,19 +1810,20 @@ def _cmd_polish(args) -> int:
             # ne tiché "nic se nestalo" pro číslo, co není 'done'/už existuje.
             chybi = sorted(wanted - {c["idx"] for c in chapters})
             if chybi:
-                print("Přeskočeno (nejsou 'done', nebo neexistují): "
+                _say("Přeskočeno (nejsou 'done', nebo neexistují): "
                      + ", ".join(str(i) for i in chybi))
         if not args.force:
             pred_force = len(chapters)
             chapters = [c for c in chapters if not _already_styled(c["notes"])]
             preskoceno_stylizovane = pred_force - len(chapters)
             if preskoceno_stylizovane:
-                print(f"Přeskočeno (už stylizováno, zkus --force): "
+                _say(f"Přeskočeno (už stylizováno, zkus --force): "
                      f"{preskoceno_stylizovane}")
         if not chapters:
-            print("Žádné kapitoly ke stylizaci.")
+            _say("Žádné kapitoly ke stylizaci.")
             status = "ok"
             return 0
+        planned_count = len(chapters)
 
         # Záloha CELÉ DB (kolo 7 IMPORTANT, časování upřesněno kolo 8, ZDROJ
         # dat zpřesněn kolo 9 BLOCKING). Snapshot se pořizuje HNED TADY -
@@ -1629,58 +1862,98 @@ def _cmd_polish(args) -> int:
         guide_block = guide_mod.guide_as_prompt_block(guide_mod.load_guide(config.GUIDE_PATH))
         rid = state.create_run(db, "polish")
         counts = {"polished": 0, "unchanged": 0, "rejected": 0, "failed": 0}
-        report = []   # kolo 27 - akumulátor pro `_write_polish_report`
         cf = _client_factory(rid, interactive=True)
         for c in chapters:
+            # Kolo 34 IMPORTANT: PRÁVĚ JEDEN `report.append` za iteraci -
+            # invariant je STRUKTURNÍ (jediná `append` větev pro každý
+            # výstup). `_polish_one_chapter` `report` NEmutuje, vrací
+            # záznam; výjimky si záznam staví tento blok. Žádný dedup.
             try:
-                outcome = _polish_one_chapter(c, glossary_rows, cf, db, model,
-                                              guide_block, codex_cmd, backup_state,
-                                              report)
-            except FatalRunError:
+                rec = _polish_one_chapter(c, glossary_rows, cf, db, model,
+                                          guide_block, codex_cmd, backup_state)
+            except FatalRunError as fe:
+                # KAŽDÝ `FatalRunError`, co se sem dostane, má hlášku
+                # REDIGOVANOU U ZDROJE: commit (kolo 35), kontroly kritik/
+                # meaning-check (kolo 37), `_snapshot_db` je pre-Codex.
+                # `str(fe)` je tedy VŽDY bezpečné - `fatal` záznam,
+                # `run_error` i výpis beze změny.
+                report.append({"idx": c["idx"], "outcome": "fatal",
+                               "error": str(fe)})
+                raise
+            except KeyboardInterrupt:
+                # Ctrl+C během zpracování. STAV DB je zdroj pravdy: commit
+                # SKUTEČNĚ proběhl <=> `translated_text` kapitoly v DB se
+                # liší od vstupního `c["translated_text"]` (kolo 35 - NE
+                # marker `_already_styled`; ten je u `--force` z DŘÍVĚJŠÍHO
+                # běhu, ne z tohoto pokusu; commit se navíc dělá JEN když
+                # `styled != cz`, takže úspěšný commit `translated_text`
+                # VŽDY změní). Čtení DB je best-effort.
+                try:
+                    row = state.get_chapter(db, c["idx"])
+                    committed = (row is not None
+                                 and row["translated_text"] != c["translated_text"])
+                except Exception:
+                    committed = False
+                rec = ({"idx": c["idx"], "outcome": "polished"} if committed
+                       else {"idx": c["idx"], "outcome": "interrupted",
+                             "stage": "processing"})
+                report.append(rec)
                 raise
             except Exception as e:
-                # Neočekávaná chyba u JEDNÉ kapitoly nesmí shodit zbytek
-                # dávky - `run` má stejnou filozofii (`_cmd_run` dělá totéž
-                # kolem `pipeline.process_chapter`).
-                print(f"Kapitola {c['idx']}: neočekávaná chyba "
-                      f"({type(e).__name__}: {e}), ponechávám původní.")
-                report.append({"idx": c["idx"], "outcome": "failed",
-                               "error": f"{type(e).__name__}: {e}"})
-                outcome = "failed"
-            counts[outcome] += 1
+                # Neočekávaná chyba u JEDNÉ kapitoly nesmí shodit dávku.
+                # (Diagnostické `print` jsou přes `_say`, takže sem se
+                # `BrokenPipeError` z výpisu už nedostane - kolo 35.)
+                # `str(e)` může nést Codexem-odvozený obsah → `_redact_
+                # detail` (kolo 34).
+                _say(f"Kapitola {c['idx']}: neočekávaná chyba "
+                     f"({type(e).__name__}), ponechávám původní.")
+                rec = {"idx": c["idx"], "outcome": "failed",
+                       "error": f"{type(e).__name__}: "
+                                f"{stylist._redact_detail(str(e))}"}
+            report.append(rec)
+            counts[rec["outcome"]] += 1
+        batch_completed = True   # smyčka prošla VŠECHNY kapitoly (kolo 28)
 
-        print(f"Vylepšeno: {counts['polished']}, beze změny: {counts['unchanged']}, "
+        _say(f"Vylepšeno: {counts['polished']}, beze změny: {counts['unchanged']}, "
               f"zamítnuto kontrolou: {counts['rejected']}, selhalo: {counts['failed']}")
-        # Report PŘED `_print_usage`/status logikou - ať vznikne i když
-        # `_print_usage` selže. Best-effort, vlastní `except` uvnitř.
-        _write_polish_report(db, rid, report)
         _print_usage(db, rid)
+        # Report se NEzapisuje tady - přesunuto do `finally` (kolo 27-28),
+        # ať vznikne i po `FatalRunError`/`KeyboardInterrupt`/top-level
+        # výjimce, a AŽ PO `finish_run` (kolo 28 - ať umí zaznamenat i
+        # `finalization_error`).
         # Kolo 5 IMPORTANT (opravuje kolo-4 rozpor): "všechno selhalo" musí
         # znamenat status="fatal", ne "ok" - "mechanismus doběhl do konce"
         # neobstálo, protože DB audit (`runs` tabulka) by pak hlásil úspěch
         # u běhu, který fakticky nic neudělal. Nenulový exit kód JDE ruku v
         # ruce se `status="fatal"`, ne místo něj.
         if counts["failed"] == len(chapters) and counts["failed"] > 0:
-            print("POZOR: všechny kapitoly selhaly - zkontroluj Codex CLI "
+            _say("POZOR: všechny kapitoly selhaly - zkontroluj Codex CLI "
                   "(přihlášení, config.CODEX_MODEL, síť).")
             status = "fatal"
             return 1
         status = "ok"
         return 0
     except FatalRunError as e:
-        print(e)
+        # `str(e)` je bezpečné: KAŽDÝ `FatalRunError`, co může nést obsah
+        # `styled` (commit; kritik/meaning-check - kolo 37), má hlášku
+        # REDIGOVANOU U ZDROJE v `_polish_one_chapter` (`stylist._redact_
+        # detail`). `_snapshot_db` `FatalRunError` běží PŘED stylizací.
+        # `run_error` i výpis proto můžou být plné.
+        run_error = str(e)
+        _say(str(e))
         return 1
     except KeyboardInterrupt:
         status = "interrupted"
+        run_error = "KeyboardInterrupt"
         raise
     except Exception as e:
         # Kolo 14 IMPORTANT: cokoli neočekávané MIMO per-kapitolovou smyčku
-        # (ta má vlastní `except` výš, viz `_polish_one_chapter` volání) je
-        # infrastrukturí/programová chyba (výběr kapitol, glosář, návod,
-        # založení runu, výpis spotřeby), ne obsahová - zastavit celý
-        # příkaz čistě (`return 1`), ne propadnout jako nezachycený
-        # traceback.
-        print(f"Neočekávaná chyba: {type(e).__name__}: {e}")
+        # (výběr kapitol, glosář, návod, založení runu, výpis spotřeby) je
+        # infrastrukturní/programová chyba, ne obsahová - `str(e)` tam
+        # Codexův obsah nemá jak nést (žádný `styled` ještě neexistuje).
+        # Zastavit čistě (`return 1`), ne propadnout jako traceback.
+        run_error = f"{type(e).__name__}: {e}"
+        _say(f"Neočekávaná chyba: {type(e).__name__}: {e}")
         return 1
     finally:
         # Snapshot, co nikdy nebyl promován (nic se nezapsalo - všechny
@@ -1708,17 +1981,28 @@ def _cmd_polish(args) -> int:
             # `finally` - kdyby selhal (STEJNÁ třída chyby, co nás sem
             # často přivedla - plný disk, poškozená DB), NOVÁ výjimka by
             # PŘEBILA tu původní (nebo právě dokončovaný `return`), co
-            # `finally` blok zrovna zpracovává (standardní Python chování
-            # - výjimka ve `finally` nahradí tu, co propaguje). Volající
-            # by tak dostal MATOUCÍ/JINOU chybu a ztratil skutečnou
-            # příčinu. Selhání finalizace se jen VYPÍŠE (best-effort),
-            # nepřepíše výsledek/chybu, co `finally` právě dokončuje.
+            # `finally` blok zrovna zpracovává. Selhání finalizace se jen
+            # VYPÍŠE (best-effort) + zaznamená do reportu (kolo 28).
+            finalization_error = None
             try:
                 state.finish_run(db, rid, status)
             except Exception as e:
-                print(f"POZOR: zápis konečného stavu běhu selhal "
-                      f"({type(e).__name__}: {e}) - run zůstává "
-                      "nedokončený v DB, ale výsledek/chyba výš je platná.")
+                finalization_error = f"{type(e).__name__}: {e}"
+                # `_say` (kolo 36 IMPORTANT) - výjimka z `print` v tomhle
+                # `finally` bloku by unikla a přebila výsledek; navíc by
+                # zabránila zápisu reportu o pár řádků níž.
+                _say(f"POZOR: zápis konečného stavu běhu selhal "
+                     f"({finalization_error}) - run zůstává nedokončený "
+                     "v DB, ale výsledek/chyba výš je platná.")
+            # Report běhu (kolo 27-28) - AŽ PO `finish_run`, ať zaznamená
+            # i `finalization_error`. Vlastní `except Exception`
+            # (best-effort). `batch_completed`/`planned_count` jdou
+            # dovnitř SAMOSTATNĚ (ne odvozené z `status`).
+            _write_polish_report(db, rid, report, codex_model=model,
+                                 planned_count=planned_count,
+                                 batch_completed=batch_completed, run_status=status,
+                                 run_error=run_error,
+                                 finalization_error=finalization_error)
 ```
 
 Registrace v `_build_parser()`:
@@ -2298,6 +2582,11 @@ text/prázdný seznam nálezů) a `pipeline._run_critic`/
   zápisu, kapitola 3 se vůbec NEZPRACUJE - fronta se nezpracovává dál po
   `FatalRunError`). Předtím zapsané kapitoly zůstávají zapsané (žádný
   automatický rollback) - k tomu slouží `.pre-polish-backup`.
+- `_backup_db_once`: `os.replace` uspěje, ALE `main.print` VŽDY zvedá
+  `BrokenPipeError` (kolo 36 IMPORTANT) → promoce SE DOKONČÍ,
+  `backup_state["done"] == True` (nastaveno HNED po `os.replace`, PŘED
+  `_say`), commit kapitoly PROBĚHNE, `outcome == "polished"`. Dřív by
+  `print` po `os.replace` udělal z úspěšné promoce `FatalRunError`.
 - SAMOSTATNĚ (kolo 13 IMPORTANT): mock `state.finish_run` tak, aby SÁM
   vyhodil výjimku (nezávisle na úspěchu/selhání `commit_chapter_result`)
   → `_cmd_polish` vypíše varovnou hlášku o selhání finalizace, ale VRÁTÍ
@@ -2411,26 +2700,147 @@ text/prázdný seznam nálezů) a `pipeline._run_critic`/
   běhu), a `status == "fatal"` po `FatalRunError` NEBO po tom, co VŠECHNY
   kapitoly v dávce vyšly `failed` (kolo 5/6 - "všechno selhalo" je
   `"fatal"`, ne `"ok"`, viz tabulka chybových stavů níže).
-- **report soubor (kolo 27):** smíšená dávka (1 `polished`, 1 `rejected`,
-  1 `failed`) → v `polish-reports/` vznikne PRÁVĚ JEDEN `run-<rid>-*.json`.
-  Ověřit: `summary` má správné počty; záznam `rejected` kapitoly nese
-  neprázdné `reasons` (aspoň jeden s `source`/`type`/`issue`), plné
-  `findings` a `styled` == text, co vrátil fake Codex (zamítnutý originál
-  se NEUKLÁDÁ do DB, ale DO reportu ano); záznam `failed` nese `error`
-  s hláškou z `StylistError`; záznam `polished` má jen `idx`/`outcome`.
-- **`_rejection_reasons` vrací nálezy, ne bool:** `check_meaning_
-  preserved` vrátí `register_drift` → `_rejection_reasons` vrátí seznam
-  DÉLKY 1, jehož prvek má `type == "register_drift"`. `_polish_rejected`
-  (bool wrapper) nad týmiž vstupy vrátí `True`. Čistý vstup → `[]` resp.
-  `False`.
+- **report soubor - kontrakt záznamu (kolo 27-28):** smíšená dávka
+  (1 `polished`, 1 `unchanged`, 1 `rejected`, 1 `failed`) → v
+  `polish-reports/` vznikne PRÁVĚ JEDEN `run-<rid>-*.json`. Ověřit
+  hlavičku: `schema_version == 1`, `run_id`, `codex_model ==` hodnota,
+  co `_cmd_polish` SKUTEČNĚ použil (= `model` proměnná, ne re-read
+  `config.CODEX_MODEL` - test to ověří tak, že `config.CODEX_MODEL`
+  MEZI `_cmd_polish` startem a zápisem reportu monkeypatchne na JINOU
+  hodnotu a čeká PŮVODNÍ), `generated_at` neprázdné, `planned_count ==
+  4`, `attempted_count == 4`, `batch_completed == True`, `run_status ==
+  "ok"`, `run_error is None`, `finalization_error is None`, `summary`
+  přes všech 6 outcomes. Záznam `rejected` s `STYLIST_REPORT_REJECTED_
+  TEXT` monkeypatchnutým na `True`: `reason_types` neprázdný, `reasons`/
+  `findings` plné, `styled` == text z fake Codexu. (Default `False` má
+  vlastní bullet níž.) Záznam `failed`: JEN `idx`/`outcome`/`error`.
+  `polished`/`unchanged`: jen `idx`/`outcome`.
+- **`batch_completed` je SAMOSTATNÝ příznak, ne odvozený ze `status`
+  (kolo 28 IMPORTANT):** dávka, kde VŠECHNY kapitoly skončí `failed` →
+  `run_status == "fatal"` (kolo 5/6), ale `batch_completed == True`,
+  `attempted_count == planned_count` (smyčka prošla všechny). Report to
+  nesmí hlásit jako nedoběhlou dávku.
+- **INVARIANT 1 záznam/kapitolu je STRUKTURNÍ (kolo 34-38 IMPORTANT):**
+  `_polish_one_chapter` už `report` NEPŘIJÍMÁ ani nemutuje - test volá
+  `_polish_one_chapter(...)` (bez `report` argumentu) a ověří, že
+  NÁVRATOVÁ HODNOTA je správný `dict` (`{"idx", "outcome", ...}`) pro
+  každý outcome (polished/unchanged/rejected/failed). Samostatný test
+  nad `_cmd_polish` s dávkou N kapitol ověří `len(report) == N` (přesně
+  jeden append za iteraci) pro smíšenou dávku.
+- **výpis nemůže změnit outcome (kolo 34-36 IMPORTANT):** monkeypatch
+  `main.print` tak, aby VŽDY zvedlo `BrokenPipeError`. Jediná kapitola
+  projde celým úspěšným průchodem (Codex vrátí platnou stylizaci) →
+  `outcome == "polished"`, `run_status == "ok"`, `return 0`, DB má
+  přijatou stylizaci, report VZNIKNE. (`_say` `BrokenPipeError` spolkne
+  všude: `_polish_one_chapter`, `_backup_db_once`, `_cmd_polish` smyčka,
+  `finally`, `_write_polish_report`.)
+- **report z `finally`, přežije `FatalRunError` při COMMITU (kolo 27-34
+  IMPORTANT):** kapitola 2 z 3 zvedne `FatalRunError` při commitu (mock
+  `commit_chapter_result`) → `_cmd_polish` vrátí 1, report VZNIKNE:
+  záznam kapitoly 1 (`polished`), záznam kapitoly 2 `outcome == "fatal"`
+  + `error` (hláška obsahuje "Zápis výsledku kapitoly"), kapitola 3 v
+  reportu NENÍ. Hlavička: `run_status == "fatal"`, `run_error` neprázdné,
+  `batch_completed == False`, `attempted_count == 2 < planned_count == 3`.
+- **`FatalRunError` z KONTROL, redigovaná (kolo 29-37 IMPORTANT):** mock
+  `pipeline._run_critic` (nebo `check_meaning_preserved`) zvedne
+  `FatalRunError("SECRET123")` u kapitoly 2 → `_polish_one_chapter` to
+  zabalí s `_redact_detail`, `_cmd_polish`'s `except FatalRunError`
+  postaví záznam `outcome == "fatal"` + `error` = "Kontrola stylizace
+  kapitoly 2 selhala fatálně (...)" - u `False` BEZ `SECRET123`, u `True`
+  se `SECRET123` objeví. `run_error` I `_say` výpis stejně redigované.
+  `attempted_count == 2`.
+- **`KeyboardInterrupt` během kapitoly (kolo 30-35 IMPORTANT):** mock
+  `stylist.polish` zvedne `KeyboardInterrupt` u kapitoly 2 z 3, DB
+  `translated_text` kapitoly 2 SE NEZMĚNIL → `_cmd_polish` re-raisne
+  `KeyboardInterrupt` ven, ale report VZNIKNE (z `finally`): záznam
+  kapitoly 2 `outcome == "interrupted"` + `stage == "processing"`,
+  `run_status == "interrupted"`, `attempted_count == 2`. Druhá varianta:
+  interrupt během kontrol (mock `check_meaning_preserved`).
+- **`KeyboardInterrupt` PO úspěšném commitu (kolo 33-35 IMPORTANT):**
+  wrapper kolem `state.commit_chapter_result`, co PO commitu (skutečně
+  zapíše) zvedne `KeyboardInterrupt` → `_cmd_polish`'s
+  `except KeyboardInterrupt` přes `state.get_chapter(...)["translated_
+  text"] != c["translated_text"]` zjistí commit → záznam kapitoly
+  `outcome == "polished"` (NE `interrupted`), PRÁVĚ JEDEN.
+- **`--force` + `KeyboardInterrupt` PŘED novým commitem (kolo 35
+  IMPORTANT):** kapitola UŽ MÁ `stylist` marker z dřívějšího běhu,
+  spuštěno `--force`, `KeyboardInterrupt` padne PŘED novým
+  `commit_chapter_result` → commit-detekce přes `translated_text` (NE
+  marker) → `row["translated_text"] == c["translated_text"]` → `outcome
+  == "interrupted"` (SPRÁVNĚ, tenhle pokus nic nezapsal), ne `polished`.
+  Druhá strana: interrupt PO novém commitu (nový styled text) →
+  `translated_text` se liší → `polished`.
+- **selhávající stdout + selhání `json.dump`/`finish_run` (kolo 36
+  IMPORTANT):** `main.print` VŽDY `BrokenPipeError` A ZÁROVEŇ (a) mock
+  `main.json.dump` → `TypeError`, nebo (b) mock `state.finish_run` →
+  `Exception` → `_cmd_polish` DOběhne, vrátí správný kód, `finally`
+  NEpropadne žádnou výjimkou z `_say`. U (b) report PŘESTO vznikne
+  (`finish_run` selhání blokovalo report jen dokud jeho varovný `print`
+  mohl vyhodit - teď `_say`).
+- **report vznikne i po pádu PŘED první kapitolou (kolo 28-29
+  IMPORTANT):** `create_run` uspěje, pak `_client_factory(rid, ...)`
+  (voláno PŘED smyčkou) zvedne výjimku (mock) → funkčně-úrovňový
+  `except Exception` → report VZNIKNE z `finally` s prázdným `chapters`,
+  `attempted_count == 0`, `planned_count == <n>`, `run_error` neprázdné.
+  (`if not report: return` se NEkontroluje.) POZN: obecná výjimka z
+  prvního `_polish_one_chapter` volání by se naopak zachytila UVNITŘ
+  smyčky jako `failed` - proto se pro tenhle scénář musí použít selhání
+  `_client_factory`, ne `_polish_one_chapter`.
+- **`STYLIST_REPORT_REJECTED_TEXT = False` (DEFAULT):** `rejected` záznam
+  v reportu má JEN `reason_types`, ŽÁDNÝ `reasons`/`findings`/`styled`;
+  secret vložený do `styled` / `issue` / `cz_excerpt` fake nálezu se
+  v reportu ANI v zachyceném stdout NEobjeví. `True` (nutno explicitně
+  zapnout) → plný detail + secret se objeví (očekávané).
+- **`STYLIST_REPORT_REJECTED_TEXT = False` + secret na Codex STDERR (kolo
+  29-35 IMPORTANT):** fake Codex napíše `SECRET123` na stderr a skončí
+  exit kódem 1 → `False`: `StylistError` hláška, `failed.error` v reportu
+  I zachycený stdout NEobsahují `SECRET123` (`_redact_detail` vrátí
+  `stylist._REDACTED` = "(hodnoty potlačeny - config.STYLIST_REPORT_
+  REJECTED_TEXT není True)"). `True`: `SECRET123` v hlášce/reportu.
+- **`FatalRunError("SECRET123")` z commitu (kolo 35 IMPORTANT):** mock
+  `commit_chapter_result` zvedne `Exception("SECRET123")` (simuluje
+  chybu nesoucí obsah). `False`: `fatal` záznam, `run_error` I `_say`
+  výpis obsahují "Zápis výsledku kapitoly N selhal (...)" ale NE
+  `SECRET123` (redigováno u zdroje). `True`: `SECRET123` přítomen.
+- **`STYLIST_REPORT_REJECTED_TEXT` truthiness ≠ `is True` (kolo 32
+  IMPORTANT):** hodnoty `1`, `"False"`, `None` se chovají JAKO `False`
+  (default) - `rejected` záznam má jen `reason_types`, konzole vynechá
+  popisy, `polish()` nepřipojí stderr. JEN literál `True` aktivuje plný
+  detail. Test pro každou z těch hodnot + stderr větev.
+- **`_redact_detail` gate na VŠECH strukturálních chybách (kolo 33-34
+  IMPORTANT):** pro `STYLIST_REPORT_REJECTED_TEXT` != `True` test ověří,
+  že hláška `StylistError` (a `failed.error` v reportu + zachycený
+  stdout) NEobsahuje konkrétní hodnoty pro KAŽDOU z: číselná sekvence
+  (`before_nums`/`after_nums`), počet odstavců, poměr délky, Codex
+  stderr, `str(e)` neočekávané výjimky - jen `_REDACTED` náhradu. `True`:
+  hodnoty přítomné (očekávané).
+- **`_rejection_reasons` vrací nálezy, ne bool + dedup (kolo 28-31):**
+  `check_meaning_preserved` vrátí `register_drift` → `_rejection_reasons`
+  vrátí seznam DÉLKY 1, prvek má `type == "register_drift"`.
+  `_polish_rejected` (bool wrapper) → `True`. Čistý vstup → `[]` / `False`.
+  DEDUP TESTY (kolo 31 IMPORTANT - dedup na `_finding_key`, ne na celý
+  termín): (a) týž povrch A je NOVÝ klíč I mu narostl výskyt → v `reasons`
+  JEN JEDNOU. (b) termín má NOVÝ chybný povrch B (nový klíč) A SOUČASNĚ
+  narostl výskyt UŽ EXISTUJÍCÍHO povrchu A (stejný baseline klíč) → v
+  `reasons` jsou OBA (B jako nový klíč, A jako "nárůst výskytu") - dedup
+  na celý termín by A ztratil.
 - **`critic_failed` je v reportu jako důvod:** `pipeline._run_critic`
-  vrátí `critic_failed=True` (druhý prvek tuple) → kapitola `rejected`,
-  `reasons[0]["type"] == "critic_failed"`, a `check_meaning_preserved`
-  se NEVOLÁ (fail-fast, neplatíme za meaning-check, když už kritik shodil).
-- **`_write_polish_report` selže best-effort:** monkeypatch `main.
-  os.makedirs` (nebo `open`) tak, aby zvedlo `OSError` → `_cmd_polish`
-  vypíše varování, ale vrátí PŮVODNÍ `return`/`status` (0 při úspěšné
-  dávce), `runs.status` zůstává `"ok"` - selhání reportu není selhání běhu.
+  vrátí `critic_failed=True` → kapitola `rejected`,
+  `"critic/critic_failed"` v `reason_types`, `check_meaning_preserved`
+  se NEVOLÁ (fail-fast).
+- **`_write_polish_report` best-effort na VÍC než `OSError` (kolo 27-28
+  IMPORTANT):** (a) monkeypatch `main.json.dump` → `TypeError` →
+  `_cmd_polish` vypíše varování, vrátí PŮVODNÍ `return`/`status`,
+  `runs.status` zůstává `"ok"`, žádný `.json` ani `.tmp` v
+  `polish-reports/`. (b) totéž pro `os.makedirs` → `OSError`.
+- **report AŽ PO `finish_run` (kolo 28 IMPORTANT):** mock `state.finish_
+  run` zvedne výjimku → report VZNIKNE a jeho `finalization_error` je
+  neprázdné (`run_status` beze změny, návratový kód beze změny).
+- **all-failed dávka: `batch_completed == True` (kolo 28 IMPORTANT):**
+  3 kapitoly, všechny `failed` (mock `stylist.polish` vždy `StylistError`)
+  → `run_status == "fatal"`, `return 1`, ale report: `batch_completed ==
+  True`, `attempted_count == planned_count == 3`, `summary["failed"] ==
+  3`. NEsmí vypadat jako přerušená dávka.
 
 ## Chybové stavy a jejich zpracování
 
@@ -2460,12 +2870,18 @@ text/prázdný seznam nálezů) a `pipeline._run_critic`/
 | Kapitola už má `stylist` záznam v `notes`, bez `--force` | HLÁŠENO (počet přeskočených), kapitola se nezpracuje |
 | `notes` je platný JSON, ale ne seznam (poškozený/cizí tvar) | `_parse_findings` vrátí `[]` (jen ovlivní `_already_styled` - konkordanční baseline se počítá čerstvě, ne z `notes`) |
 | Odpověď obalená v markdown bloku (```) | `StylistError` (deterministická kontrola v `stylist.polish`), kapitola beze změny |
-| JAKÉKOLI zamítnutí kontrolou (`rejected`) | kromě per-kapitolového výpisu důvodů se do `polish-reports/run-<rid>-<čas>.json` zapíše záznam: `outcome`, `reasons` (co přesně zamítlo), `findings` (všechny nálezy), `styled` (zamítnutý text od Codexu). Kolo 27 - měřicí přístroj pro v1 |
-| Selhání zápisu report souboru (`_write_polish_report`, plný disk/práva) | jen varovná hláška, běh doběhne, návratový kód beze změny (best-effort jako `finish_run`) |
+| JAKÉKOLI zamítnutí kontrolou (`rejected`) | do report záznamu VŽDY `reason_types` (deduplikované `"src/type"` řetězce); `reasons` + `findings` + `styled` + konzolové popisy nálezů JEN za `config.STYLIST_REPORT_REJECTED_TEXT` (kolo 27-28) |
+| `failed` (StylistError / neočekávaná výjimka v kterékoli fázi) | do report záznamu JEN `outcome` + `error`. Kontrakt (kolo 28): `failed` = vždy jen `error`, částečné `findings` z pádu uprostřed kontrol se VĚDOMĚ nezachovávají. `error` z Codexova nenulového exit kódu NEnese raw stderr, když `STYLIST_REPORT_REJECTED_TEXT=False` (kolo 29 - potlačeno v `polish()` u zdroje) |
+| `FatalRunError` u TÉHLE kapitoly (commit i kritik/cost guard) | `_cmd_polish`'s in-loop `except FatalRunError` přidá záznam `outcome == "fatal"` + `error` (`str(fe)` - REDIGOVÁN U ZDROJE, kolo 35; text hlášky rozliší commit vs cost guard), pak re-raise (kolo 34 - `_polish_one_chapter` už `report` nemutuje). Odlišitelné od "nezpracováno" |
+| `KeyboardInterrupt` (Ctrl+C) během zpracování kapitoly | `_cmd_polish`'s in-loop `except KeyboardInterrupt` ZKONTROLUJE STAV DB (`state.get_chapter(...)["translated_text"] != c["translated_text"]` - kolo 35, NE marker, ten je u `--force` z dřívějšího běhu) - commit proběhl → `outcome == "polished"`, jinak `"interrupted"` + `stage == "processing"`. Pak re-raise. `run_status == "interrupted"`, zbylé kapitoly nezpracované |
+| INVARIANT: 1 report záznam / iteraci smyčky | STRUKTURNÍ (kolo 34) - `_polish_one_chapter` vrací `dict`, `report` nemutuje; přesně jedna `report.append` větev za iteraci (normální/generic `Exception` = společný bottom append; `FatalRunError`/`KeyboardInterrupt` = ve svém handleru + re-raise). Žádný dedup. VŠECHNY diagnostické výpisy přes `_say()` (kolo 35-36) - `BrokenPipeError` z výpisu nemůže změnit `outcome` ani stav běhu |
+| Report soubor (`_write_polish_report`) | píše se z `finally` v `_cmd_polish` VŽDY, když existuje `rid` (i po pádu před první kapitolou), AŽ PO `finish_run`. Jeden `polish-reports/run-<rid>-<čas>-<8 hex>.json`. Hlavička: `schema_version`, `run_id`, `generated_at` (timezone-aware ISO 8601), `codex_model` (skutečně použitý), `planned_count`/`attempted_count`/`batch_completed` (kolo 28 - úplnost NE odvozená ze `status`), `run_status`, `run_error`, `finalization_error`, `summary`. Výpisy v report/cleanup cestě přes `_say()` (kolo 36) |
+| Selhání zápisu report souboru (plný disk, `TypeError` z `json.dump`, cokoli) | `except Exception`, varovná hláška, uklidí `.tmp`, běh doběhne, návratový kód i `runs.status` beze změny (best-effort jako `finish_run`) |
 
-## Rozhodnutí z kol 1-26 (plan-consensus)
+## Rozhodnutí z kol 1-26 + dodatek 27-38 (plan-consensus)
 
-Otázky z draftu, teď rozhodnuté (viz `plan-consensus/round-{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26}-claude.md`
+Otázky z draftu, teď rozhodnuté (viz `plan-consensus/round-{1..38}-claude.md`,
+konkrétně `round-{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38}-claude.md`
 pro plné zdůvodnění):
 
 - **Idempotence:** ano, přes marker v `notes` (`_already_styled`), ne přes
@@ -2474,17 +2890,25 @@ pro plné zdůvodnění):
   `interactive=True` jako `run`, ne `interactive=False` jako
   `scan`/`reference` - `polish` je taky smyčka přes víc kapitol.
 - **Plný audit každého pokusu (i zamítnutých/selhaných):** REVIDOVÁNO
-  kolo 27 (dřív "jen konzole"). Pořád ŽÁDNÁ perzistentní DB tabulka
-  pokusů (zamítnutá/selhaná stylizace nic v DB nemění, není co
-  dohledávat kvůli konzistenci). ALE: `_cmd_polish` na konci běhu zapíše
-  JSON **report soubor** (`polish-reports/run-<rid>-<čas>.json`, viz
-  `_write_polish_report`) - per kapitola `outcome`, a u `rejected`/
-  `failed` PLNÝ seznam nálezů + u `rejected` ZAMÍTNUTÝ text od Codexu.
-  Důvod změny: v1 je experiment "funguje stylista?", a bez tohohle se
-  reject rate ani DŮVODY zamítnutí nedají po dávce spolehlivě přečíst
-  (konzole odroluje). Best-effort zápis (selhání jen vypíše, běh
-  neshodí). Přijatá stylizace SVŮJ audit (model, hash, délka) dál
-  dostává v `notes` markeru.
+  kolo 27-28 (dřív "jen konzole"). Pořád ŽÁDNÁ perzistentní DB tabulka
+  pokusů (zamítnutá/selhaná stylizace nemění STAV ani TEXT kapitoly -
+  `runs` a případně `llm_calls` řádky vzniknou, ale konzistence kapitoly
+  je zaručená, není co dohledávat). ALE: `_cmd_polish` ve `finally`
+  zapíše (vždy, když existuje `rid`, AŽ PO `finish_run`) JSON **report
+  soubor** (`polish-reports/run-<rid>-<čas>-<8 hex>.json`, viz
+  `_write_polish_report`) - per kapitola `outcome`; u `rejected` VŽDY
+  `reason_types` (normalizované kategorie), plný detail
+  (`reasons`/`findings`/`styled` + konzolové popisy) jen za
+  `config.STYLIST_REPORT_REJECTED_TEXT`; u `failed` jen `error`; u
+  `fatal` jen `error` (bez `stage`, kolo 34), u `interrupted` jen `stage`. Hlavička: `schema_version`,
+  `run_id`, `generated_at`, `codex_model` (skutečně použitý, kolo 30),
+  `planned_count`/`attempted_count`/`batch_completed` (úplnost NE
+  odvozená ze `status`), `run_status`, `run_error`, `finalization_error`,
+  `summary`. Důvod změny: v1 je experiment
+  "funguje stylista?", a bez tohohle se reject rate ani DŮVODY zamítnutí
+  nedají po dávce spolehlivě přečíst (konzole odroluje).
+  Best-effort zápis (selhání jen vypíše, běh neshodí). Přijatá stylizace
+  SVŮJ audit (model, hash, délka) dál dostává v `notes` markeru.
 - **Granulární přijetí / opravná smyčka (kritik označí, překladatel
   opraví, nebo rozhodne uživatel):** kolo 27 zvažováno, ODLOŽENO za v1.
   Codex vrací souvislý přepsaný text, ne rozlišitelné zásahy - "vrátit
@@ -2533,8 +2957,11 @@ pro plné zdůvodnění):
   nestylizovalo) (kolo 3 IMPORTANT).
 - **Preflight** - `_resolve_codex_cmd(["codex"])` se zavolá JEDNOU na
   začátku `_cmd_polish`, ne až uvnitř smyčky - chybějící/nenalezitelné
-  CLI je systémový problém, ne N per-kapitolových selhání, co by run
-  přesto označila `status="ok"` (kolo 3 IMPORTANT).
+  CLI je systémový problém, ne N per-kapitolových selhání. Bez preflightu
+  by běh sice dnes správně skončil `status="fatal"` (všechny kapitoly
+  `failed`, kolo 5/6), ale drahou/matoucí cestou (N stejných hlášek
+  místo jedné jasné hned na začátku) (kolo 3 IMPORTANT, upřesněno
+  kolo 26/29).
 - **`tempfile.TemporaryDirectory()` jako context manager** místo ručního
   `mkdtemp()` + `finally`-cleanup - chrání i samotné VYTVOŘENÍ adresáře,
   ne jen fázi po něm (kolo 3 IMPORTANT; od kola 4 už žádný vstupní soubor
@@ -3170,25 +3597,161 @@ pro plné zdůvodnění):
 **Po kole 26 vydali Codex i Claude CONSENSUS ve stejném kole - plán je
 hotov. Viz `plan-consensus/final-verdict.md`.**
 
-### Kolo 27 - post-consensus doplnění (na žádost vlastníka projektu)
+### Kolo 27+ - post-consensus doplnění (na žádost vlastníka projektu)
 
-Po dosažení konsensu vlastník projektu vznesl dva požadavky. Zapracováno
-MIMO plan-consensus smyčku:
+Po dosažení konsensu (kolo 26) vlastník projektu vznesl dva požadavky
+(pozorovatelnost zamítnutí + zvážit opravnou smyčku) a nechal na dodatek
+proběhnout další review kola. Zapracováno:
 
 - **Pozorovatelnost zamítnutí.** Dřív zamítnutá kapitola vypsala jen
   `stylizace zamítnuta kontrolou` bez detailu; zamítnutý text od Codexu
   se nikde neuložil. Teď: `_rejection_reasons` vrací SEZNAM nálezů (ne
-  jen bool; `_polish_rejected` je tenký bool wrapper, testy platí dál),
-  per-kapitola výpis je vyjmenuje, a `_write_polish_report` zapíše na
-  konci běhu JSON report (`polish-reports/run-<rid>-<čas>.json`) s per-
-  kapitola `outcome` + u `rejected`/`failed` plnými nálezy + u `rejected`
-  zamítnutým textem. Bez zásahu do DB schématu. Best-effort zápis.
+  jen bool; `_polish_rejected` je tenký bool wrapper, testy platí dál).
+  Cíleně dedupuje JEN překryv dvou konkordančních větví na úrovni
+  KONKRÉTNÍHO POVRCHU (`_finding_key` = `(type, term_id, actual)`, kolo
+  31 - ne celý termín, jinak by nový chybný povrch zamaskoval nárůst
+  jiného); kritikovy a meaning-check nálezy se ZÁMĚRNĚ nededupují (dva
+  `fidelity` = dvě informace). Per-kapitola výpis nálezy vyjmenuje, a `_write_polish_report`
+  zapíše z `finally` v `_cmd_polish` (vždy, když existuje `rid`, AŽ PO
+  `finish_run`) JSON report: per kapitola `outcome`; u `rejected` VŽDY
+  `reason_types` (normalizované kategorie), plný detail
+  (`reasons`/`findings`/`styled` + konzolové popisy) jen za
+  `config.STYLIST_REPORT_REJECTED_TEXT`; u `failed` jen `error`; u
+  `fatal` jen `error` (bez `stage`, kolo 34), u `interrupted` jen `stage`. Hlavička: `schema_version`,
+  `run_id`, `generated_at`, `codex_model` (skutečně použitý),
+  `planned_count`/`attempted_count`/`batch_completed`, `run_status`,
+  `run_error`, `finalization_error`, `summary`. Bez zásahu do DB
+  schématu, best-effort zápis.
 - **Granulární přijetí / opravná smyčka:** zváženo, ODLOŽENO za v1 s
-  odůvodněním (viz "Mimo rozsah" - Codex nevrací rozlišitelné zásahy,
-  opravná smyčka je další placené volání bez dat o úspěšnosti, halucinace
-  se surgicky neřeší). v1 = all-or-nothing + report soubor jako měřicí
+  odůvodněním (viz bod "Granulární přijetí / opravná smyčka" v sekci
+  "Rozhodnutí z kol 1-26 + dodatek 27-38" - Codex nevrací rozlišitelné zásahy, opravná
+  smyčka je další placené volání bez dat o úspěšnosti, halucinace se
+  surgicky neřeší). v1 = all-or-nothing + report soubor jako měřicí
   přístroj; podle naměřeného reject rate a rozpadu se rozhodne dál.
 
-Tyhle změny konsensus NEpřezkoumal (přišly po něm). Jsou aditivní
-(nový report soubor, bool wrapper zachovává staré chování) a nezasahují
-do bezpečnostního jádra.
+Kolo 27 (review): Codex 5 IMPORTANT - report se zahazoval při
+`FatalRunError` (→ `finally`), best-effort chytal jen `OSError` (→
+`except Exception`), próza "u failed plné nálezy" nepravdivá (kontrakt:
+`failed` = jen `error`), report bez `codex_model`/`schema` (doplněno), a
+ukládání zamítnutého textu JE nová perzistence exfiltrovatelného obsahu,
+ne "žádná nová expozice" (přiznáno, `STYLIST_REPORT_REJECTED_TEXT`).
+
+Kolo 28 (review): Codex dalších 6 IMPORTANT - `STYLIST_REPORT_REJECTED_
+TEXT=False` netěsnilo (volná pole `issue`/`cz_excerpt` + konzolový výpis
+pořád nesly text → `False` teď ukládá i tiskne JEN `reason_types`);
+`incomplete = run_status != "ok"` chybná odvozenina (→ samostatný
+`batch_completed` + `planned_count`/`attempted_count`); "report vždy po
+Fatal" neplatilo pro pád před 1. kapitolou (→ `if not report` zrušeno) a
+pro fatální commit aktuální kapitoly (→ `outcome=="fatal"` záznam);
+duplicitní důvod (nový klíč + syntetický nárůst) se dvakrát agregoval
+(→ dedup v `_rejection_reasons`); "failed = žádné findings" nepravdivé
+pro pád uprostřed kontrol (→ kontrakt: `failed` vždy jen `error`, bez
+ohledu na fázi); report se psal PŘED `finish_run` (→ přehozeno,
+`finalization_error`). Vše zapracováno.
+
+Kolo 29 (review): Codex 2 IMPORTANT + 3 NITS - `FatalRunError` z kritika/
+cost guardu (PŘED commitem) se přehodil bez `fatal` záznamu kapitoly
+(→ `_cmd_polish`'s `except FatalRunError` ho doplní, `stage=="pre-
+commit"`); `STYLIST_REPORT_REJECTED_TEXT=False` pořád netěsnilo přes
+Codex STDERR v `StylistError` hlášce (→ potlačeno u zdroje v `polish()`).
+NITs: stale `status="ok"` u preflightu (→ `fatal`), "deduplikovaný
+seznam" nepřesné (dedup jen konkordanční překryv), test scénář prázdného
+reportu má cílit `_client_factory`, ne `_polish_one_chapter`.
+
+Kolo 30 (review): Codex 1 IMPORTANT + 3 NITS (konverguje: 5→6→2→1).
+`KeyboardInterrupt` během kapitoly nepřidal záznam (stejná třída bugu
+jako kolo-29 `FatalRunError`) → in-loop `except KeyboardInterrupt` s
+`outcome=="interrupted"`, `_REPORT_OUTCOMES` rozšířeno. NITs: report
+re-readoval `config.CODEX_MODEL` místo předání skutečně použitého
+`model` (→ `codex_model` kwarg); prozaický výčet hlavičky vynechával
+`run_id`/`generated_at`/`summary` (doplněno); "nic v DB nemění" nepřesné
+(`runs`/`llm_calls` vzniknou) → "nemění stav/text kapitoly".
+
+Kolo 31 (review): Codex 2 IMPORTANT + 3 NITS. (1)
+`STYLIST_REPORT_REJECTED_TEXT=True` byl nebezpečný DEFAULT - "je to
+uvnitř už přijatého FS rizika" NEOBSTÁL: opt-in ke čtení disku ≠ souhlas
+s TRVALÝM uložením exfiltrovaného obsahu do (často synchronizované)
+složky. → default `False`, plný text = samostatný explicitní opt-in.
+(2) kolo-29/30 dedup v `_rejection_reasons` skákal celý `(type,
+term_id)` - nový chybný povrch B by zamaskoval SOUČASNÝ nárůst povrchu A
+(report by ztratil jednu z příčin). → dedup na úrovni `_finding_key`
+(`(type, term_id, actual)`). NITs: úvodní shrnutí "zahodí se" (→
+"nepřijme se; report jen za opt-inem"); próza "vnější `KeyboardInterrupt`
+handler stačí sám" (kolo 30 to vyvrátilo pro report); nadpis "Kolo
+27-29" → "Kolo 27+".
+
+Kolo 32 (review): Codex 2 IMPORTANT + 3 NITS - obojí fallout z kola 31.
+(1) `STYLIST_REPORT_REJECTED_TEXT` se testoval obecnou truthiness (`1`/
+`"False"`/`None` by aktivovaly plný detail) → `is True` na obou místech
+(`polish()` stderr větev, `_polish_one_chapter`), stejný vzor jako
+`STYLIST_ACCEPT_FS_RISK is not True`. (2) `_write_polish_report`
+docstring pořád opakoval "uvnitř přijatého FS rizika" - rationale
+odmítnutý v kole 31 → přepsáno. NITs: komentář "za opt-outem" →
+"opt-in"; sekce "Kolo 27+" pořád popisovala dedup přes `(type,
+term_id)`; chybová tabulka vynechávala `run_id` v hlavičce.
+
+Kolo 33 (review): Codex 2 IMPORTANT + 2 NITS. (1) "stderr je JEDINÝ
+Codexem-řízený text v chybové cestě" bylo nepravdivé - číselný guard dá
+do `StylistError` celý `after_nums` (ze stylizovaného textu) → konzole +
+`failed.error` i za `False`. → hodnoty číselných sekvencí jen za `is
+True`, jinak obecná hláška. (2) kolo-30 `KeyboardInterrupt` fix
+nezaručoval JEDEN pravdivý záznam za kapitolu - interrupt po commitu
+před appendem = jen `interrupted` (přestože DB má přijatou stylizaci);
+interrupt po appendu = DVA záznamy → `attempted_count` přeteče. → (kolo
+33 dílčí oprava, plně vyřešeno až strukturním přepisem kola 34-35 -
+`_polish_one_chapter` vrací `dict`, `KeyboardInterrupt` handler
+detekuje commit přes `translated_text`). NITs: próza tvrdila `interrupted`
+= `stage`+`error` (kód má jen `stage`); config komentář "žádný volný
+text" moc obecný (`run_error`/`failed.error` v reportu zůstávají -
+to jsou hlášky programu, ne Codexův obsah).
+
+Kolo 34 (review): Codex 3 IMPORTANT + 1 NIT - STRUKTURNÍ přepis
+report-append cesty. (1) redakční hranice pořád netěsnila - i počet
+odstavců/poměr délky nesou hodnoty ze `styled`, a obecný `except`
+ukládal libovolné `str(e)`. → JEDEN helper `stylist._redact_detail`,
+aplikovaný na VŠECHNY hodnoty odvozené z Codexova výstupu v chybových
+hláškách. (2)+(3) invariant "1 záznam / kapitolu" držel jen dedupem a
+padal na výjimce z `print()` (`BrokenPipeError` po commitu → druhý
+záznam `failed`) a na commit-then-interrupt okně. → `_polish_one_
+chapter` už `report` NEMUTUJE, vrací `dict`; `_cmd_polish` appendne
+přesně jednou za iteraci (invariant STRUKTURNÍ); `KeyboardInterrupt`
+handler zjistí stav DB a zapíše `polished`/`interrupted` podle
+skutečnosti. `fatal` `stage` zrušen (hláška `str(fe)` rozliší commit vs
+cost guard). NIT: `generated_at` timezone-aware ISO 8601 (`datetime`
+import), filename + náhodný suffix.
+
+Kolo 35 (review): Codex 3 IMPORTANT + 1 NIT - fallout z kola 34.
+(1) commit-detekce v `KeyboardInterrupt` handleru přes `_already_styled`
+je špatná pro `--force` (marker je z DŘÍVĚJŠÍHO běhu) → detekce přes
+`translated_text != c["translated_text"]` (úspěšný commit text VŽDY
+změní). (2) `print("...vylepšeno.")` po commitu mohl hodit → generic
+`except` → `failed`/`fatal` navzdory zapsané stylizaci → VŠECHNY
+per-kapitolové výpisy přes `_say()` (best-effort, `try/except pass`).
+(3) `_redact_detail(str(fe))` v in-loop handleru redigoval, ale
+top-level `run_error`/`print(e)` uložily/vytiskly STEJNOU výjimku
+nezměněnou → `FatalRunError` z commitu redigovaná U ZDROJE (v
+`_polish_one_chapter`), pak `str(fe)` bezpečné všude. NIT: test próza
+"stderr Codexu potlačen" → aktuální `_REDACTED` string.
+
+Kolo 36 (review): Codex 2 IMPORTANT + prose-vs-code sweep. Oba IMPORTANT
+= "tenhle `print` v cleanup/report cestě ještě není `_say`":
+(1) `_backup_db_once` má `print` po `os.replace` PŘED `done = True` →
+`BrokenPipeError` udělá z úspěšné promoce `FatalRunError` → `done = True`
+HNED po `os.replace`, pak `_say`. (2) `_write_polish_report` úspěchový
+`print` + jeho `except`-warning `print` + `finish_run`-failure warning
+`print` můžou vyhodit a uniknout z `finally` → všechny `_say`. Navíc
+VŠECHNY zbylé raw `print` v `main.py` runtime kódu převedeny na `_say`
+(preflight, výběr kapitol, "všechno selhalo"). Stale próza (marker vs
+`translated_text`, `print("...vylepšeno.")`, redakce v in-loop vs
+u zdroje, filename bez hex suffixu) sjednocena s kódem.
+
+Kolo 37 (review): Codex 1 IMPORTANT + 5 prose NITs. IMPORTANT:
+`FatalRunError` z KONTROL (kritik / meaning-check) NEbyl redigovaný -
+moje kolo-35 tvrzení "z kritika/cost guardu Codexův obsah nenese"
+neplatilo: `_run_critic`/`check_meaning_preserved` volají Anthropic
+klienta S `styled`, klientův `FatalRunError` (400, cost guard) může
+pojmout část requestu. → `_polish_one_chapter` zabalí `FatalRunError`
+z týhle sekce s hláškou redigovanou u zdroje (`_redact_detail`), stejně
+jako commitovou. `str(fe)` je pak bezpečné všude. NITs: KeyboardInterrupt
+prose "vždy interrupted" (může být polished), 3× stale marker-vs-
+translated_text, filename bez hex suffixu, config tag "27-35"→"27-37".

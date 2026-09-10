@@ -40,10 +40,41 @@ Plán je připraven k převedení na implementační plán (writing-plans).
 
 ---
 
-## Dodatek (kolo 27, po konsensu)
+## Dodatek (kola 27-38, druhá konsensuální smyčka)
 
-Vlastník projektu po konsensu přidal 2 požadavky (zapracováno do specu,
-nepřezkoumáno smyčkou): (1) report soubor s detailem zamítnutí +
-zamítnutým textem od Codexu jako měřicí přístroj pro v1; (2) granulární
-opravná smyčka zvážena a odložena za v1. Aditivní, mimo bezpečnostní
-jádro.
+Vlastník projektu po konsensu (kolo 26) přidal 2 požadavky a nechal na
+dodatek proběhnout DALŠÍCH 12 review kol (27-38):
+
+1. **Pozorovatelnost zamítnutí** - report soubor
+   (`polish-reports/run-<rid>-<čas>-<hex>.json`) jako měřicí přístroj
+   pro v1: per kapitola `outcome`, u `rejected` `reason_types` (vždy) +
+   plný detail (`reasons`/`findings`/`styled`) jen za samostatným
+   opt-inem `config.STYLIST_REPORT_REJECTED_TEXT is True` (default
+   `False`).
+2. **Granulární opravná smyčka** - zvážena, ODLOŽENA za v1. v1 =
+   all-or-nothing + report jako měřicí přístroj; podle naměřeného reject
+   rate se rozhodne dál.
+
+Dodatek se ukázal jako netriviální subsystém (ne "aditivní próza") -
+12 review kol vygenerovalo mj.:
+- **Bezpečnost:** report u `rejected` PERZISTENTNĚ ukládá zamítnutý text
+  od Codexu + volná pole nálezů - potenciálně exfiltrovaný obsah, navíc
+  do synchronizované složky. Rozhodnutí (kolo 31): NENÍ pokryté přijetím
+  `STYLIST_ACCEPT_FS_RISK`, proto SAMOSTATNÝ explicitní opt-in
+  `STYLIST_REPORT_REJECTED_TEXT` (default `False`). Za `False` jdou
+  VŠECHNY Codexem-odvozené hodnoty v chybových hláškách (stderr, čísla,
+  odstavce, ratio, `str(e)`, `FatalRunError` z LLM klienta) přes
+  `stylist._redact_detail` - redakce U ZDROJE.
+- **Robustnost:** `_polish_one_chapter` vrací `dict`, `report` nemutuje -
+  invariant "1 report záznam / iteraci smyčky" je STRUKTURNÍ. VŠECHNY
+  diagnostické výpisy přes `_say()` (`try/print/except pass`) - výpis
+  nemůže shodit ani přebít výsledek běhu. `KeyboardInterrupt` handler
+  určí outcome podle stavu DB (`translated_text`), ne podle toho kam
+  dorazil kód. Report z `finally` vždy když existuje `rid`, AŽ PO
+  `finish_run`, s `run_status`/`batch_completed`/`planned_count`/
+  `attempted_count`/`run_error`/`finalization_error`.
+
+**Kolo 38: Codex i Claude CONSENSUS ve stejném kole.** Dodatek hotový.
+
+Plán (jádro i dodatek) je připraven k převedení na implementační plán
+(writing-plans).

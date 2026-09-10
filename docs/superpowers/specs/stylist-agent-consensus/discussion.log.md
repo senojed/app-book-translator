@@ -575,3 +575,288 @@ přímo do specu, plan-consensus smyčka to nepřezkoumala:
 
 Změny jsou aditivní, nezasahují do bezpečnostního jádra. Detaily v spec
 sekci "Kolo 27 - post-consensus doplnění".
+
+## Kolo 27 (review kola-27 dodatku)
+
+Codex: CHANGES_NEEDED (0 BLOCKING, 5 IMPORTANT, 1 NIT).
+Claude: CHANGES_NEEDED (po aplikaci).
+
+Všech 5 IMPORTANT bylo ve vlastním kolo-27 dodatku, všechny platné:
+1. Report ukládá zamítnutý text = NOVÁ PERZISTENCE potenciálně
+   exfiltrovaného obsahu (dřív se zahodil). "Žádná nová expozice" bylo
+   nepravdivé. → přiznáno, `config.STYLIST_REPORT_REJECTED_TEXT` opt-out
+   (default True), stale próza o dočasnosti výstupu opravena, doplněna
+   sekce "Bezpečnostní rozhodnutí (kolo 19)".
+2. Report vznikal jen po normálním doběhnutí smyčky - `FatalRunError`/
+   `KeyboardInterrupt` ho zahodil i s už nasbíranými zamítnutými texty.
+   → `report=[]` před `try`, `_write_polish_report` z `finally`,
+   hlavička + `run_status`/`incomplete`.
+3. Best-effort chytal jen `OSError` - `json.dump` `TypeError` by unikl,
+   shodil běh na fatal. → `except Exception` + `.tmp` cleanup.
+4. Próza "u failed plné nálezy" nepravdivá - `failed` je PŘED
+   kontrolami, žádné findings. → kontrakt sjednocen: rejected =
+   reasons/findings/styled; failed = jen error.
+5. Report bez `codex_model`/`schema_version`/timestamp - nejde porovnat
+   reject rate mezi konfiguracemi (Codex volání není v `llm_calls`).
+   → doplněno.
+
+NIT: "viz Mimo rozsah" odkaz → přesměrován na rozhodovací bod.
+
+ast.parse sweep: 9 bloků, 0 chyb.
+Soubory: round-27-codex.md, round-27-claude.md.
+
+## Kolo 28 (2. review kola-27 dodatku)
+
+Codex: CHANGES_NEEDED (0 BLOCKING, 6 IMPORTANT).
+Claude: CHANGES_NEEDED (po aplikaci).
+
+6 IMPORTANT v report subsystému (dodatek je reálný subsystém, ne
+"aditivní próza"):
+1. `STYLIST_REPORT_REJECTED_TEXT=False` netěsnil - volná pole nálezů
+   (`issue`, `cz_excerpt`) + konzolový výpis pořád nesly text. →
+   `False` teď ukládá/tiskne JEN `reason_types`.
+2. `incomplete = run_status != "ok"` chybné - all-failed dávka doběhla
+   celá. → `batch_completed` + `planned_count`/`attempted_count`
+   samostatně.
+3. "report vždy po Fatal" neplatilo pro pád před 1. kapitolou
+   (`if not report: return` zrušeno) ani pro fatální commit aktuální
+   kapitoly (→ `outcome=="fatal"` záznam + `run_error`).
+4. "failed = žádné findings" nepravdivé pro pád uprostřed kontrol. →
+   kontrakt: `failed` vždy jen `error`, bez ohledu na fázi.
+5. Duplicitní důvod (nový klíč + syntetický nárůst) se agregoval
+   dvakrát. → cílený skip v `_rejection_reasons`.
+6. Report psán PŘED `finish_run` - `finalization_error` nešel
+   zaznamenat. → přehozeno.
+
+ast.parse sweep: 9 bloků, 0 chyb.
+Soubory: round-28-codex.md, round-28-claude.md.
+
+## Kolo 29 (3. review kola-27 dodatku)
+
+Codex: CHANGES_NEEDED (0 BLOCKING, 2 IMPORTANT, 3 NITS). Konverguje (5→6→2).
+Claude: CHANGES_NEEDED (po aplikaci).
+
+IMPORTANT:
+1. `FatalRunError` z kritika / cost guardu padne PŘED commitem →
+   `_polish_one_chapter` svůj `fatal` záznam (jen commit-větev) nepřidá →
+   `attempted_count` kapitolu chybně počítá jako nezpracovanou. Oprava:
+   `_cmd_polish`'s `except FatalRunError` záznam doplní se
+   `stage=="pre-commit"` (dedup proti commit-větvi).
+2. `STYLIST_REPORT_REJECTED_TEXT=False` netěsnil přes Codex STDERR -
+   `polish()` ho dával do `StylistError` (`stderr[:500]`) → konzole +
+   `failed.error` v reportu. stderr je jediný Codexem-řízený text v
+   chybové cestě `polish()`. Oprava: raw stderr se připojí jen za
+   `STYLIST_REPORT_REJECTED_TEXT=True` (u zdroje).
+
+NITs: stale `status="ok"` u preflight bulletu (→ `fatal`); "deduplikovaný
+seznam" nepřesné (dedup jen konkordanční překryv); test scénář prázdného
+reportu má cílit `_client_factory`, ne `_polish_one_chapter`.
+
+ast.parse sweep: 9 bloků, 0 chyb.
+Soubory: round-29-codex.md, round-29-claude.md.
+
+## Kolo 30 (4. review kola-27 dodatku)
+
+Codex: CHANGES_NEEDED (0 BLOCKING, 1 IMPORTANT, 3 NITS). Konverguje: 5→6→2→1.
+Claude: CHANGES_NEEDED (po aplikaci).
+
+IMPORTANT: `KeyboardInterrupt` (Ctrl+C) během zpracování kapitoly nepřidal
+žádný záznam → `attempted_count` kapitolu počítá jako nezpracovanou
+(stejná třída bugu jako kolo-29 `FatalRunError`). `KeyboardInterrupt`
+není `Exception`, propadne oběma in-loop `except`. Oprava: in-loop
+`except KeyboardInterrupt` přidá `outcome=="interrupted"` +
+`stage=="processing"`, pak re-raise. `_REPORT_OUTCOMES` rozšířeno.
+
+NITs: (1) report re-readoval `config.CODEX_MODEL` místo skutečně použité
+`model` proměnné → `codex_model` kwarg, `_cmd_polish` předá `model`;
+(2) prozaický výčet hlavičky reportu vynechával `run_id`/`generated_at`/
+`summary` → doplněno; (3) "zamítnutá/selhaná stylizace nic v DB nemění"
+nepřesné (`runs`/`llm_calls` vzniknou) → "nemění stav/text kapitoly".
+
+ast.parse sweep: 9 bloků, 0 chyb.
+Soubory: round-30-codex.md, round-30-claude.md.
+
+## Kolo 31 (5. review kola-27 dodatku)
+
+Codex: CHANGES_NEEDED (0 BLOCKING, 2 IMPORTANT, 3 NITS).
+Claude: CHANGES_NEEDED (po aplikaci).
+
+IMPORTANT:
+1. `STYLIST_REPORT_REJECTED_TEXT=True` byl nebezpečný DEFAULT. "Je to
+   uvnitř už přijatého FS rizika" NEOBSTÁL: `STYLIST_ACCEPT_FS_RISK` =
+   "agent smí číst disk během běhu", NE "exfiltrovaný obsah se smí TRVALE
+   uložit do souboru" (navíc `polish-reports/` je vedle repa v
+   synchronizované složce - Nextcloud - takže by to teklo dál). Oprava:
+   default `False`, plný text = samostatný explicitní opt-in.
+   POZN: vlastník projektu si `True` původně přál - teď je to informovaná
+   volba (default bezpečný, plný text jedním řádkem).
+2. Dedup v `_rejection_reasons` (kolo 29/30) byl na úrovni celého
+   `(type, term_id)`. Nový chybný povrch B (nový klíč) by zamaskoval, že
+   SOUČASNĚ narostl výskyt povrchu A → report ztratí jednu z příčin.
+   Oprava: dedup na `_finding_key` (`(type, term_id, actual)`), per-povrch.
+
+NITs: úvodní shrnutí "zahodí se" (→ "nepřijme se; report jen za
+opt-inem"); próza "vnější KeyboardInterrupt handler stačí sám o sobě"
+(kolo 30 to vyvrátilo pro report); nadpis "Kolo 27-29" → "Kolo 27+".
+
+ast.parse sweep: 9 bloků, 0 chyb.
+Soubory: round-31-codex.md, round-31-claude.md.
+
+## Kolo 32 (6. review kola-27 dodatku)
+
+Codex: CHANGES_NEEDED (0 BLOCKING, 2 IMPORTANT, 3 NITS). Obojí fallout z kola 31.
+Claude: CHANGES_NEEDED (po aplikaci).
+
+IMPORTANT:
+1. `STYLIST_REPORT_REJECTED_TEXT` se testoval obecnou truthiness - `1`/
+   `"False"`/`None` by aktivovaly plný detail (perzistenci potenciálně
+   exfiltrovaného textu), přestože kontrakt žádá explicitní `True`.
+   Oprava: `is True` na obou kódových místech (`polish()` stderr větev,
+   `_polish_one_chapter`). Stejný vzor jako `STYLIST_ACCEPT_FS_RISK is
+   not True`.
+2. `_write_polish_report` docstring pořád opakoval "uvnitř přijatého FS
+   rizika" - rationale výslovně odmítnutý v kole 31. Přepsáno na
+   "samostatné riziko, samostatný opt-in".
+
+NITs: komentář "za opt-outem" → "opt-in" (default `False`); sekce
+"Kolo 27+" pořád popisovala dedup přes `(type, term_id)` → `_finding_
+key`; chybová tabulka vynechávala `run_id` v hlavičce reportu.
+
+ast.parse sweep: 9 bloků, 0 chyb.
+Soubory: round-32-codex.md, round-32-claude.md.
+
+## Kolo 33 (7. review kola-27 dodatku)
+
+Codex: CHANGES_NEEDED (0 BLOCKING, 2 IMPORTANT, 2 NITS).
+Claude: CHANGES_NEEDED (po aplikaci).
+
+IMPORTANT:
+1. Tvrzení "stderr je JEDINÝ Codexem-řízený text v chybové cestě
+   polish()" bylo nepravdivé - číselný guard vloží celý `after_nums`
+   (čísla ze STYLIZOVANÉHO textu) do `StylistError` → konzole +
+   `failed.error` i za `False`. Prompt injection by přes to
+   exfiltrovala číselný obsah. Oprava: hodnoty číselných sekvencí jen
+   za `STYLIST_REPORT_REJECTED_TEXT is True`, jinak obecná hláška.
+2. Kolo-30 `KeyboardInterrupt` fix nezaručoval JEDEN pravdivý záznam:
+   interrupt po commitu ALE před `report.append({polished})` → jen
+   `interrupted` (DB má přijatou stylizaci); interrupt po appendu → DVA
+   záznamy → `attempted_count` přeteče. Oprava: `polished` append HNED
+   po commitu (před `print`) + in-loop `except KeyboardInterrupt` dedup
+   podle `idx`.
+
+NITs: próza `interrupted` = `stage`+`error` (kód má jen `stage`);
+config komentář "žádný volný text" moc obecný.
+
+ast.parse sweep: 9 bloků, 0 chyb.
+Soubory: round-33-codex.md, round-33-claude.md.
+
+## Kolo 34 (8. review kola-27 dodatku)
+
+Codex: CHANGES_NEEDED (0 BLOCKING, 3 IMPORTANT, 1 NIT). STRUKTURNÍ přepis.
+Claude: CHANGES_NEEDED (po aplikaci).
+
+IMPORTANT:
+1. Redakční hranice `STYLIST_REPORT_REJECTED_TEXT=False` pořád netěsnila
+   - i počet odstavců / poměr délky nesou hodnoty ze `styled`, obecný
+   `except` ukládal libovolné `str(e)` do `failed.error`. Oprava: jeden
+   helper `stylist._redact_detail(detail)` (`detail` jen za `is True`,
+   jinak `_REDACTED`), aplikovaný na VŠECHNY Codexem-odvozené hodnoty v
+   chybových hláškách.
+2+3. Invariant "1 report záznam / kapitolu" byl křehký - držel jen
+   dedupem a padal na výjimce z `print()` po commitu (`BrokenPipeError`
+   → dva záznamy) a na commit-then-interrupt okně. Oprava (Codexův
+   návrh): `_polish_one_chapter` `report` NEMUTUJE, vrací jeden `dict`;
+   `_cmd_polish` appendne přesně jednou za iteraci (invariant
+   STRUKTURNÍ). `KeyboardInterrupt` handler zjistí STAV DB (marker
+   `_already_styled`) a zapíše `polished`/`interrupted` podle
+   skutečnosti. `fatal` `stage` zrušen (hláška rozliší commit vs guard).
+
+NIT: `generated_at` timezone-aware ISO 8601 (`import datetime as _dt`),
+filename + `os.urandom(4).hex()` suffix.
+
+ast.parse sweep: 9 bloků, 0 chyb.
+Soubory: round-34-codex.md, round-34-claude.md.
+
+## Kolo 35 (9. review kola-27 dodatku)
+
+Codex: CHANGES_NEEDED (0 BLOCKING, 3 IMPORTANT, 1 NIT). Fallout z kola 34.
+Claude: CHANGES_NEEDED (po aplikaci).
+
+IMPORTANT:
+1. Commit-detekce v `KeyboardInterrupt` handleru přes `_already_styled`
+   je špatná pro `--force` (marker z DŘÍVĚJŠÍHO běhu). Oprava: detekce
+   přes `state.get_chapter(...)["translated_text"] != c["translated_
+   text"]`.
+2. `print("...vylepšeno.")` po commitu může hodit → generic `except` →
+   `failed`/`fatal` navzdory zapsané stylizaci. Oprava: helper `_say()`
+   = `try: print except Exception: pass` pro VŠECHNY per-kapitolové
+   výpisy.
+3. `_redact_detail(str(fe))` v in-loop handleru redigoval, ale top-level
+   `run_error`/`print(e)` uložily/vytiskly STEJNOU výjimku nezměněnou.
+   Oprava: `FatalRunError` z commitu redigovaná U ZDROJE
+   (`_polish_one_chapter`), pak `str(fe)` bezpečné všude.
+
+NIT: test próza "stderr Codexu potlačen" → aktuální `_REDACTED` string.
+
+ast.parse sweep: 9 bloků, 0 chyb.
+Soubory: round-35-codex.md, round-35-claude.md.
+
+## Kolo 36 (10. review kola-27 dodatku)
+
+Codex: CHANGES_NEEDED (0 BLOCKING, 2 IMPORTANT, prose-vs-code sweep).
+Claude: CHANGES_NEEDED (po aplikaci).
+
+IMPORTANT (oba = dokončení kolo-35 `_say` změny):
+1. `_backup_db_once` má `print` po `os.replace` PŘED `done = True` →
+   `BrokenPipeError` udělá z úspěšné promoce `FatalRunError`. Oprava:
+   `done = True` HNED po `os.replace`, pak `_say`.
+2. `_write_polish_report` úspěchový `print` + jeho `except`-warning +
+   `finish_run`-failure warning můžou vyhodit a uniknout z `finally`.
+   Oprava: všechny `_say`. + VŠECHNY zbylé raw `print` v main.py runtime
+   kódu (preflight, výběr kapitol, "všechno selhalo") → `_say`.
+
+Stale próza: commit-detekce marker→`translated_text`; `print("...
+vylepšeno.")` → obecně; redakce "in-loop"→"u zdroje"; filename hex suffix.
+
+ast.parse sweep: 9 bloků, 0 chyb. Jediný raw `print` je uvnitř `_say`.
+Soubory: round-36-codex.md, round-36-claude.md.
+
+## Kolo 37 (11. review kola-27 dodatku)
+
+Codex: CHANGES_NEEDED (0 BLOCKING, 1 IMPORTANT, 5 prose NITs). Klesá 3→2→1.
+Claude: CHANGES_NEEDED (po aplikaci).
+
+IMPORTANT: `FatalRunError` z KONTROL (kritik / meaning-check) nebyl
+redigovaný. Kolo-35 tvrzení "z kritika/cost guardu Codexův obsah nenese"
+NEPLATILO - `_run_critic`/`check_meaning_preserved` volají Anthropic
+klienta S `styled`, klientův `FatalRunError` (400, cost guard) může
+pojmout část requestu = obsah `styled`. Oprava: `_polish_one_chapter`
+obalí `try/except FatalRunError` kolem kontrolní sekce, re-raise s
+hláškou redigovanou u zdroje (`_redact_detail`). Teď VŠECHNY
+`FatalRunError` nesoucí `styled` jsou redigované u zdroje.
+
+NITs: KeyboardInterrupt prose "vždy interrupted" → podle DB; 3× stale
+marker→`translated_text`; filename bez hex suffixu; config tag.
+
+ast.parse sweep: 9 bloků, 0 chyb.
+Soubory: round-37-codex.md, round-37-claude.md.
+
+## Kolo 38 (12. review kola-27 dodatku)
+
+Codex: CONSENSUS (0 BLOCKING, 0 IMPORTANT, 3 prose NITs).
+Claude: CONSENSUS.
+
+NITs (vše prozaické, opraveno):
+- komentář u top-level `except FatalRunError` pořád tvrdil "cost guard
+  běží před/mimo stylizaci" - kolo 37 to vyvrátilo → "redakce u zdroje".
+- "jediné místo pro `report.append`" → "PRÁVĚ JEDNOU ZA ITERACI" (3
+  větve, ale na každé cestě jedna).
+- test bullet s "patchnutým `report`" na starou signaturu → test
+  návratového `dict` + `len(report) == N` nad `_cmd_polish`.
+
+ast.parse sweep: 9 bloků, 0 chyb.
+Soubory: round-38-codex.md, round-38-claude.md.
+
+=== SHODA (CONSENSUS) na kolo-27+ dodatku po 12 review kolech ===
+Oba recenzenti CONSENSUS ve stejném kole (38). Report subsystém pro
+pozorovatelnost zamítnutí je hotový. Aktualizace final-verdict.md.
