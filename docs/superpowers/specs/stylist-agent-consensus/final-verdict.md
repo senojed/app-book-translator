@@ -37,3 +37,13 @@ neshledali žádný BLOCKING ani IMPORTANT bod.
   recovery), ne automatizovaný CLI příkaz.
 
 Plán je připraven k převedení na implementační plán (writing-plans).
+
+---
+
+## Dodatek (kolo 27, po konsensu)
+
+Vlastník projektu po konsensu přidal 2 požadavky (zapracováno do specu,
+nepřezkoumáno smyčkou): (1) report soubor s detailem zamítnutí +
+zamítnutým textem od Codexu jako měřicí přístroj pro v1; (2) granulární
+opravná smyčka zvážena a odložena za v1. Aditivní, mimo bezpečnostní
+jádro.

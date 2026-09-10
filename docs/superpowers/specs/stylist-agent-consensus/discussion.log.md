@@ -556,3 +556,22 @@ Soubory: round-26-codex.md, round-26-claude.md.
 === SHODA (CONSENSUS) po 26 kolech ===
 Oba recenzenti vydali CONSENSUS ve stejném kole. Plán je hotov ke
 spuštění. Viz final-verdict.md.
+
+## Post-consensus doplnění (kolo 27, mimo smyčku)
+
+Po dosažení konsensu vlastník projektu vznesl 2 požadavky. Zapracováno
+přímo do specu, plan-consensus smyčka to nepřezkoumala:
+
+1. **Pozorovatelnost zamítnutí.** `_rejection_reasons` vrací seznam
+   nálezů (ne bool; `_polish_rejected` = tenký bool wrapper, staré testy
+   platí). Per-kapitola výpis vyjmenuje důvody. `_write_polish_report`
+   zapíše na konci běhu JSON (`polish-reports/run-<rid>-<čas>.json`):
+   per kapitola outcome, u rejected/failed plné nálezy, u rejected i
+   zamítnutý text od Codexu. Bez zásahu do DB schématu, best-effort.
+2. **Granulární přijetí / opravná smyčka:** zváženo, odloženo za v1
+   (Codex nevrací rozlišitelné zásahy; opravná smyčka = další placené
+   volání bez dat o úspěšnosti; halucinace se surgicky neřeší). v1 =
+   all-or-nothing + report jako měřicí přístroj.
+
+Změny jsou aditivní, nezasahují do bezpečnostního jádra. Detaily v spec
+sekci "Kolo 27 - post-consensus doplnění".
