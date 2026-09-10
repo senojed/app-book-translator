@@ -1,0 +1,10 @@
+## IMPORTANT
+
+- **Task 12 Step 3 / spec 1871–1914 — invariant jednoho záznamu stále má mezeru.** `report.append(rec)` na řádku 1913 leží mimo vnitřní `try`. Ctrl+C po návratu `_polish_one_chapter`, před appendem, přeskočí kapitolu v reportu, přestože commit proběhl. Dosavadní test přerušuje uvnitř `commit_chapter_result`, takže tuto cestu neověřuje. **Oprava:** zahrnout dokončení záznamu do ochrany celé iterace, evidovat již provedený append a doplnit deterministický test přerušení mezi návratem helperu a appendem.
+
+- **Task 5, Task 12 / Self-review „executor doplní“ — chybí testy skutečného zapojení redakce.** Test `_redact_detail` dokazuje pouze funkci helperu. Test nenulového exitu neposílá žádný secret na stderr; strukturální testy kontrolují jen kategorii chyby. Odstranění `_redact_detail` ze všech čtyř produkčních větví tak může projít. **Oprava:** explicitně přidělit Tasku 5 parametrizované testy stderr, čísel, odstavců a poměru délky pro `False`, `1`, `"False"`, `None`, `True`; Tasku 12 průchod skutečné `stylist.polish` s fake procesem až do reportu a zachyceného stdout. Požadavky spec 2794–2816 nenechávat jako neurčité doplnění.
+
+- **Task 13 Step 3 — postup neposkytuje důkazy pro požadovanou ruční kontrolu.** Produkční `polish()` zachytí a zahodí stdout/stderr; zamítnutý text při výchozí konfiguraci smaže bez uložení. Skript tedy neposkytuje Codex log pro kontrolu MCP/configu ani zamítnutý výstup pro posouzení kvality. Navíc `force=False` může vybranou již stylizovanou kapitolu přeskočit. **Oprava:** konkretizovat dočasné zachycení diagnostiky a kontrolu výsledku ještě před úklidem, explicitně vyřešit opt-in pro uchování zamítnutého textu a ověřit, že vybraná kapitola skutečně prošla voláním Codexu; přeskočený běh nesmí splnit manuální ověření.
+
+## VERDICT
+CHANGES_NEEDED
