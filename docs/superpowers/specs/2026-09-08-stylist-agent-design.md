@@ -2500,6 +2500,29 @@ ověřit:
       rizikem `polish` nasadit, patří uživateli/vlastníkovi projektu
       (viz "Bezpečnostní rozhodnutí" níže).
 
+      **VÝSLEDEK na cílovém nasazení (implementace, 2026-09-11, Codex CLI
+      0.153.4, Windows 11, `codex.cmd` z npm, ChatGPT-účet auth, model
+      `gpt-5.6-terra` - `gpt-5-codex` tenhle typ účtu odmítl s `400
+      invalid_request_error`, takže `config.CODEX_MODEL` v produkci musí
+      být model, co ChatGPT-auth podporuje, ne libovolný Codex model
+      string):** spuštěno přesně přes `stylist._codex_argv`, argv
+      obsahovalo `--ephemeral`, `--ignore-user-config`, `-m gpt-5.6-terra`,
+      koncové `-`, `--ignore-rules` NEBYLO přítomno. `codex exec` PŘEČÍST
+      soubor mimo `-C` ODMÍTL ("Nemám k tomuto souboru přístup.",
+      returncode 0) - NA TÉHLE verzi/platformě/účtu se teoretické riziko z
+      kola 18 NEPOTVRDILO. Jeden běh nad jedním promptem, ne formální
+      důkaz nemožnosti - jde o chování TOHOTO modelu/verze v tuhle chvíli,
+      ne garantovanou vlastnost `--sandbox read-only`; canary se má
+      opakovat při update Codex CLI nebo změně `CODEX_MODEL`.
+      `--ignore-user-config` nezpůsobilo hang na MCP serverech z
+      uživatelova `~/.codex/config.toml`. Následný reálný běh `polish`
+      nad kopií produkční DB (kapitola 1, Turn Coat pilot) proběhl celým
+      řetězcem (Codex → strukturální kontrola → kritik → rozhodnutí) a
+      skončil `rejected` (kritik vrátil `verdict:"revise"` bez
+      odpovídajícího nálezu - přesně scénář, co řeší Task 2/kolo-3
+      syntetický `revise` finding), `run_status="ok"`, cena běhu
+      $0.0275. Živá `data/state.sqlite3` zůstala nedotčená (ověřeno).
+
 `_cmd_polish` se testuje monkeypatchnutím `stylist.polish`,
 `stylist.check_meaning_preserved` (fake funkce vracející pevný
 text/prázdný seznam nálezů) a `pipeline._run_critic`/
