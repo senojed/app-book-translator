@@ -121,6 +121,159 @@ def _finding_key(f: dict) -> tuple:
     return (f.get("type"), f.get("term_id"), f.get("actual"))
 
 
+def _rejection_reasons(baseline_concordance: list, after_findings: list,
+                       cz_before: str, cz_after: str, glossary_rows: list) -> list:
+    """Vrací SEZNAM nálezů, co odůvodňují zamítnutí stylizace (prázdný
+    seznam = nezamítat). `_polish_rejected` je tenký bool wrapper nad
+    tímhle - rozhodovací logika je JEDNA, tady. Volající
+    (`_polish_one_chapter`) tenhle seznam LOGUJE do report souboru
+    (kolo 27 - viz `_write_polish_report`), ať jde po v1 změřit nejen
+    reject RATE, ale i DŮVODY (který ze tří kontrol, jaký typ nálezu).
+
+    Srovnává konkordanci PROTI ČERSTVĚ PŘEPOČÍTANÉMU stavu PŘED stylizací
+    (kolo 4 IMPORTANT - ne proti uloženým `notes`, které mohly zastarat
+    vůči AKTUÁLNÍMU glosáři; volající spočítá `baseline_concordance` přes
+    `concordance.check_chapter(en, cz, glossary_rows, rendered_terms)`
+    těsně předtím, se STEJNÝM `glossary_rows` i `rendered_terms` jako pro
+    `after_findings` - obě strany tak vždy měří proti stejným pravidlům.
+    `rendered_terms` NENÍ prázdný seznam - kolo 10 IMPORTANT, opravuje
+    zastaralý docstring: prázdný seznam by byl přesně ta slepá skvrna,
+    co kolo 5 BLOCKING opravilo přes `state.chapter_mentions`, viz níže).
+    Absolutní odmítání (bez baseline)
+    by kapitolu s jakýmkoli, byť neškodným, pre-existujícím nálezem nikdy
+    nešlo stylizovat (kolo 3 IMPORTANT).
+
+    Tři pravidla, každé pro jiný zdroj nálezu:
+    1. `meaning_drift`/`register_drift` (zdroj `stylist_check`) - odmítá
+       VŽDY, když se objeví. `register_drift` přidán v kole 7 (tykání/
+       vykání, hlas vypravěče) - deterministicky nové signály, PŘED
+       stylizací nemohly existovat (ta kontrola PŘED tímhle během vůbec
+       neexistovala).
+    2. Kritikův nález s `action == "revise"` (`severity == "critical"`) -
+       odmítá VŽDY. Kapitola má `status == "done"`, což už samo o sobě
+       znamená, že v PŮVODNÍM stavu žádný takový nález neměla (jinak by
+       `done` nebyla) - cokoli nové je tedy vždy NOVÉ zhoršení. Kritikovy
+       `minor` nálezy (action=='note') se ignorují - subjektivní/stylové,
+       to je přesně doména stylisty, ne důvod k zamítnutí.
+    3. Konkordance (`leak`/`omission`/`inconsistency`) - deterministické,
+       klíčované přes `_finding_key` (type, term_id, actual). Srovná se
+       MNOŽINA těchto klíčů PŘED a PO - odmítá se jen kapitola, kde se
+       objevil klíč, co v PŮVODNÍM stavu nebyl (skutečně NOVÝ nebo JINAK
+       špatný problém), ne kapitola, která identický konkordanční nález
+       měla furt.
+
+       Kolo 16 navrhlo `Counter`-based srovnání POČTŮ nálezů, kolo 17-18
+       ho vrátilo na množinu (`check_chapter()` sama dedupuje). Kolo 20-22
+       ale ukázalo, že množina ani Counter-na-nálezech nezachytí regresi,
+       kde stylista PŘIDÁ výskyt problému, co v baseline UŽ byl (stejný
+       klíč). Proto DRUHÁ kontrola nad TEXTEM: pro každý PRE-EXISTUJÍCÍ
+       `leak`/`inconsistency` nález se počítá výskyt zakázaných povrchů v
+       `cz_before` vs. `cz_after` přes `find_form_occurrences`:
+       - `inconsistency`: konkrétní chybný CZ tvar (`actual`);
+       - `leak`: VŠECHNY zakázané EN povrchy termínu (canonical + aliasy,
+         kolo 22 - ne jen `actual`=`leaked[0]`, jinak by nový leak JINÉHO
+         aliasu prošel), ale JEN u termínů, co se mají překládat (keep-
+         untranslated termín má EN povrch správně).
+       Nárůst kteréhokoli → odmítnuto. `omission` (actual None, termín v
+       textu vůbec chybí) tudy neprochází.
+
+       VĚDOMĚ NEPŘIJATO (kolo 22 druhá půlka návrhu): "pokles počtu
+       SCHVÁLENÝCH CZ forem → odmítnout". Pokles je nejednoznačný -
+       legitimní stylistické sloučení dvou vět s opakovaným termínem
+       ("Bílá rada rozhodla. Bílá rada pak..." → "Bílá rada rozhodla a
+       pak...") sníží počet z 2 na 1 bez jakékoli regrese. Odmítat to by
+       falešně blokovalo běžnou práci stylisty. Skutečná regrese
+       "správný tvar → JINÝ CHYBNÝ CZ tvar" je pokrytá jinak: `check_
+       chapter()` ten nový chybný tvar ohlásí jako NOVOU inconsistency
+       (nový `cz_form` klíč → množinová kontrola výš), a pokud kolize s
+       existujícím klíčem, chytne to `inconsistency`-větev počtu `actual`
+       výš. Zbytkovou skulinu (nový chybný CZ tvar kolidující s
+       existujícím klíčem A lišící se od `actual` A neviditelný pro
+       kritika i meaning-check) hodnotím jako přijatelně úzkou proti ceně
+       falešných zamítnutí.
+    """
+    reasons = []
+    reasons += [f for f in after_findings
+                if f.get("type") in ("meaning_drift", "register_drift")]
+    reasons += [f for f in after_findings
+                if f.get("source") == "critic" and f.get("action") == "revise"]
+    baseline_keys = {_finding_key(f) for f in baseline_concordance}
+    reasons += [f for f in after_findings
+                if f.get("source") == "concordance"
+                and _finding_key(f) not in baseline_keys]
+    # Pre-existující leak/inconsistency, co PO stylizaci v textu PŘIBYL
+    # (stejný klíč, `check_chapter()` ho dedupuje na jeden nález, takže
+    # množina výš to nevidí). Kolo 20-22 IMPORTANT - výskyty se počítají
+    # PŘES `concordance.find_form_occurrences` (ne `str.count` - kolo 21;
+    # `find_form_occurrences` stemuje + lowercasuje obě strany STEJNĚ,
+    # takže přidaný výskyt s jinou velikostí písmen / v jiném pádu se
+    # zachytí; absolutní nepřesnost počtu nevadí, porovnává se relativní
+    # rozdíl touž funkcí). Kolo 22 IMPORTANT rozšiřuje z "počet `actual`"
+    # na "počet KTERÉHOKOLI zakázaného EN povrchu termínu" - nový leak
+    # JINÉHO aliasu, když `actual` (= `leaked[0]`) zůstane stejný, by
+    # jinak prošel.
+    by_id = {t.get("term_id"): t for t in glossary_rows}
+    # Dedup pro případ z kola 28 IMPORTANT: týž problém se může objevit
+    # v NOVÝ-klíč větvi výš I v počet-výskytů větvi níž - report by pak
+    # tutéž regresi započetl dvakrát. Kolo 31 IMPORTANT: dedup je
+    # NA ÚROVNI KONKRÉTNÍHO POVRCHU (`_finding_key` = `(type, term_id,
+    # actual)`), NE celého termínu - jinak by nový chybný povrch B
+    # zamaskoval, že SOUČASNĚ narostl i výskyt povrchu A (report by ztratil
+    # jednu ze skutečných příčin). Nekonkordanční důvody
+    # (meaning/register drift, kritik) se NEdedupují - dva kritikovy
+    # `fidelity` nálezy jsou dvě informace.
+    seen_keys = {_finding_key(r) for r in reasons
+                 if r.get("source") == "concordance"}
+    for f in after_findings:
+        if f.get("source") != "concordance":
+            continue
+        ftype = f.get("type")
+        if ftype not in ("leak", "inconsistency"):
+            continue
+        tid = f.get("term_id")
+        # inconsistency: sleduj konkrétní chybný CZ tvar (`actual`).
+        surfaces = []
+        if f.get("actual"):
+            surfaces.append(f["actual"])
+        # leak: sleduj VŠECHNY zakázané EN povrchy termínu (canonical +
+        # aliasy), ne jen ohlášený `actual` - ale JEN u termínů, co se
+        # SKUTEČNĚ mají překládat (keep-untranslated termín má EN povrch
+        # SPRÁVNĚ, jeho přibývání není leak).
+        if ftype == "leak":
+            term = by_id.get(tid) or {}
+            canonical = (term.get("canonical_en") or "").strip().lower()
+            cz = (term.get("cz") or "").strip().lower()
+            if canonical and cz != canonical:
+                surfaces += [s for s in ([term.get("canonical_en", "")]
+                             + list(term.get("aliases") or [])) if s]
+        for s in set(surfaces):
+            if (ftype, tid, s) in seen_keys:
+                continue   # týž povrch už nahlášen (nový klíč / dřív tady)
+            before_n = len(concordance.find_form_occurrences(cz_before, s))
+            after_n = len(concordance.find_form_occurrences(cz_after, s))
+            if after_n > before_n:
+                reasons.append({
+                    "source": "concordance", "type": ftype,
+                    "severity": "critical", "action": "revise",
+                    "term_id": tid, "expected": None,
+                    "actual": s, "cz_excerpt": None, "suggestion": None,
+                    "issue": (f"po stylizaci PŘIBYL výskyt zakázaného "
+                              f"povrchu {s!r} ({before_n} -> {after_n})")})
+                seen_keys.add((ftype, tid, s))
+    return reasons
+
+
+def _polish_rejected(baseline_concordance: list, after_findings: list,
+                     cz_before: str, cz_after: str, glossary_rows: list) -> bool:
+    """Tenký bool wrapper nad `_rejection_reasons` (kolo 27) - zpětně
+    kompatibilní rozhodovací brána, aby existující volání/testy
+    (`if _polish_rejected(...)`, "vrátí `True`/`False`") platily beze
+    změny. Rozhodovací logika i její zdůvodnění jsou v `_rejection_
+    reasons` výš."""
+    return bool(_rejection_reasons(baseline_concordance, after_findings,
+                                   cz_before, cz_after, glossary_rows))
+
+
 # --- příkazy ----------------------------------------------------------------
 
 def _cmd_init(args) -> int:

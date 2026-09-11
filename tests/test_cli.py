@@ -330,3 +330,149 @@ def test_stylist_marker_shape_and_hash():
 def test_finding_key_includes_actual():
     f = {"type": "inconsistency", "term_id": "t/a", "actual": "špatně"}
     assert main._finding_key(f) == ("inconsistency", "t/a", "špatně")
+
+
+# --- Task 8: main._rejection_reasons / _polish_rejected ---------------------
+
+def _term(tid="t/wc", canonical="White Council", cz="Bílá rada", aliases=None):
+    return {"term_id": tid, "canonical_en": canonical, "cz": cz,
+            "aliases": aliases or []}
+
+
+def test_rejection_meaning_drift_always_rejects():
+    after = [{"source": "stylist_check", "type": "meaning_drift", "issue": "x"}]
+    r = main._rejection_reasons([], after, "A", "B", [])
+    assert len(r) == 1 and r[0]["type"] == "meaning_drift"
+    assert main._polish_rejected([], after, "A", "B", []) is True
+
+
+def test_rejection_register_drift_standalone_rejects():
+    after = [{"source": "stylist_check", "type": "register_drift", "issue": "ty->vy"}]
+    assert main._polish_rejected([], after, "A", "B", []) is True
+
+
+def test_rejection_clean_input_is_not_rejected():
+    assert main._rejection_reasons([], [], "A", "A", []) == []
+    assert main._polish_rejected([], [], "A", "A", []) is False
+
+
+def test_rejection_preexisting_concordance_key_not_rejected():
+    base = [{"source": "concordance", "type": "omission", "term_id": "t/x",
+             "actual": None}]
+    after = [dict(base[0])]
+    assert main._polish_rejected(base, after, "A", "A", []) is False
+
+
+def test_rejection_new_concordance_key_rejected():
+    base = [{"source": "concordance", "type": "omission", "term_id": "t/x",
+             "actual": None}]
+    after = base + [{"source": "concordance", "type": "inconsistency",
+                     "term_id": "t/y", "actual": "špatný tvar"}]
+    assert main._polish_rejected(base, after, "A", "A", []) is True
+
+
+def test_rejection_critic_minor_note_accepted_revise_rejected():
+    minor = [{"source": "critic", "action": "note", "severity": "minor",
+              "type": "fluency"}]
+    assert main._polish_rejected([], minor, "A", "A", []) is False
+    revise = [{"source": "critic", "action": "revise", "severity": "critical",
+               "type": "fluency"}]
+    assert main._polish_rejected([], revise, "A", "A", []) is True
+
+
+def test_rejection_leak_occurrence_increase_in_text_rejected():
+    # stejný klíč v baseline i after, ale povrch přibyl v cz_after
+    key = {"source": "concordance", "type": "leak", "term_id": "t/wc",
+           "actual": "White Council"}
+    base, after = [dict(key)], [dict(key)]
+    before = "Byla to White Council."
+    a = "Byla to White Council a pak zas White Council."
+    assert main._polish_rejected(base, after, before, a, [_term()]) is True
+    # opačný směr - výskytů míň - není odmítnuto
+    assert main._polish_rejected(base, after, a, before, [_term()]) is False
+
+
+def test_rejection_new_alias_leak_rejected():
+    key = {"source": "concordance", "type": "leak", "term_id": "t/wc",
+           "actual": "White Council"}
+    base, after = [dict(key)], [dict(key)]
+    before = "Byla to White Council."
+    a = "Byla to White Council, totiž the Council."
+    assert main._polish_rejected(base, after, before, a,
+                                 [_term(aliases=["the Council"])]) is True
+
+
+def test_rejection_keep_untranslated_term_no_leak_finding_not_rejected():
+    """keep-untranslated termín (cz == canonical_en): `concordance.check_chapter`
+    pro něj `leak` nález neemituje (ověř `src/concordance.py` - `leak` větev je
+    pod `if cz != canonical`), takže `after_findings` žádný leak pro "Mouse"
+    neobsahuje - přidaný výskyt "Mouse" není důvod k zamítnutí. Scénář spec
+    2631-2633; `_rejection_reasons` kód by leak ZAMÍTL, kdyby dorazil - test to
+    odráží tím, že leak v `after_findings` NENÍ."""
+    t = _term(tid="t/mouse", canonical="Mouse", cz="Mouse")
+    assert main._polish_rejected([], [], "Mouse tu byl.",
+                                 "Mouse tu byl, Mouse zas.", [t]) is False
+
+
+def test_rejection_added_occurrence_in_different_case_or_declension_rejected():
+    """find_form_occurrences stemuje + lowercasuje - přidaný výskyt s jinou
+    velikostí písmen se počítá (str.count by ho minul). Spec 2617-2622.
+    (Konkrétně jiná VELIKOST PÍSMEN, ne skloňování - naivní stemmer (chop
+    posledních 2-3 znaků, viz src/concordance.py:24-31) na "Council"→"councilu"
+    dá jiný kmen kvůli hranici délky slova; ověřeno přímo, viz plán Task 8
+    Step 4. Test proto zůstává u case-change, co spolehlivě demonstruje
+    stejnou mechaniku - find_form_occurrences, ne str.count.)"""
+    key = {"source": "concordance", "type": "leak", "term_id": "t/wc",
+           "actual": "White Council"}
+    base, after = [dict(key)], [dict(key)]
+    before = "Byla to White Council."
+    a = "Byla to White Council a pak jeste white council pravila."
+    assert main._polish_rejected(base, after, before, a, [_term()]) is True
+
+
+def test_rejection_dedup_new_bad_surface_B_and_grown_surface_A_both_kept(monkeypatch):
+    """Spec 2821-2826: termín má NOVÝ chybný povrch B (nový klíč) A SOUČASNĚ
+    narostl výskyt UŽ EXISTUJÍCÍHO povrchu A. V `reasons` musí být OBA (dedup je
+    na _finding_key, ne na celý termín)."""
+    # A: pre-existující leak povrch "White Council" (baseline klíč), naroste 1->2
+    # B: nový leak povrch aliasu "the Council" (nový klíč)
+    a_key = {"source": "concordance", "type": "leak", "term_id": "t/wc",
+             "actual": "White Council"}
+    b_key = {"source": "concordance", "type": "leak", "term_id": "t/wc",
+             "actual": "the Council"}
+    base = [dict(a_key)]
+    after = [dict(a_key), dict(b_key)]
+    before = "White Council byla tam."
+    a = "White Council a White Council, totiz the Council."
+    r = main._rejection_reasons(base, after, before, a,
+                                [_term(aliases=["the Council"])])
+    actuals = sorted(x.get("actual") for x in r if x.get("type") == "leak")
+    assert actuals == ["White Council", "the Council"]
+
+
+def test_rejection_integration_real_check_chapter_occurrence_increase(tmp_path):
+    """Spec 2638-2642: sama množina findings NESTAČÍ. Reálný `check_chapter`
+    vrátí JEDEN `leak` nález i pro termín leaklý 2×; `_polish_rejected` musí
+    přes find_form_occurrences rozdíl v počtu zachytit."""
+    from src import concordance, glossary
+    db = str(tmp_path / "g.sqlite3"); state.init_db(db)
+    with state.connect(db) as conn:
+        conn.execute("INSERT INTO glossary (term_id,canonical_en,aliases,cz,"
+                     "accepted_alt,type,status) VALUES "
+                     "('t/wc','White Council','[]','Bílá rada','[]','term','approved')")
+    grows = glossary.all_terms(db)
+    en = "The White Council met again."
+    cz_before = "Sešla se White Council."
+    cz_after = "Sešla se White Council a znovu se sešla White Council."
+    base = concordance.check_chapter(en, cz_before, grows, [])
+    after = concordance.check_chapter(en, cz_after, grows, [])
+    # předpoklad testu: check_chapter DEDUPUJE - baseline i after mají PRÁVĚ
+    # JEDEN leak se SHODNÝM _finding_key. `_polish_rejected` True tak může
+    # přijít JEN z počtu výskytů, ne z nového klíče (spec 2638-2642).
+    base_leaks = [f for f in base if f.get("type") == "leak"]
+    after_leaks = [f for f in after if f.get("type") == "leak"]
+    assert len(base_leaks) == 1 and len(after_leaks) == 1
+    assert {main._finding_key(f) for f in base_leaks} == {main._finding_key(f) for f in after_leaks}
+    assert main._polish_rejected(base, after, cz_before, cz_after, grows) is True
+    # bez nárůstu (stejný text před i po) -> nezamítnuto
+    assert main._polish_rejected(base, base, cz_before, cz_before, grows) is False
