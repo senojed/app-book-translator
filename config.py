@@ -82,3 +82,60 @@ REFERENCE_MIN_HITS = 5          # výskytů pro `confirmed`
 REFERENCE_MIN_BOOKS = 2         # dílů pro `confirmed`
 REFERENCE_MIN_CORPUS_BOOKS = 3  # pod tímhle se `confirmed` netvrdí vůbec
 REFERENCE_COOCCUR_RATIO = 0.5   # podíl dílů, kde musí sedět souvýskyt
+
+# --- stylistický průchod přes Codex --------------------------------------
+# Prázdné = `polish` odmítne běžet (auditní záznam potřebuje vědět, JAKÝ
+# model se skutečně použil - "necháme na výchozím CLI" by časem přestalo
+# být dohledatelné, viz kolo 2 plan-consensus review).
+CODEX_MODEL = ""
+# Timeout na jedno volání `codex exec` (kolo 17 IMPORTANT). `stylist.
+# polish`'s parametr `timeout` je od kola 22 `= None` a bez explicitní
+# hodnoty spadne SEM (dřív byl natvrdo `= 180`, veřejné volání config
+# obcházelo). Dlouhá kapitola může legitimně potřebovat víc času -
+# hodnota jde upravit BEZ zásahu do kódu.
+STYLIST_TIMEOUT_SECONDS = 180
+# Hrubý bezpečnostní strop na délku kapitoly pro stylistický průchod
+# (kolo 17 IMPORTANT) - součet znaků EN+CZ. NENÍ přesný odhad tokenového
+# limitu konkrétního modelu (ten je uživatelsky konfigurovaný přes
+# CODEX_MODEL, jeho přesný kontext se odsud nedá spolehlivě zjistit) -
+# je to konzervativní, ručně nastavitelná pojistka, co dá RYCHLÉ a JASNÉ
+# "kapitola je moc dlouhá" hlášení MÍSTO čekání na timeout, co by u
+# extrémně dlouhé kapitoly stejně nikdy neuspěl. ~60 000 znaků je hrubě
+# desetitisíce slov EN+CZ dohromady - běžná kapitola bezpečně projde,
+# extrémně dlouhá dostane rychlé, srozumitelné selhání.
+STYLIST_MAX_CHARS = 60_000
+# Bezpečnostní opt-in (kolo 19 BLOCKING) - `polish` volá agentní `codex
+# exec`, který má (OVĚŘENO živě, viz bezpečnostní detail 6 v `stylist.
+# polish` docstringu) NEOMEZENÉ ČTENÍ celého souborového systému. Prompt
+# injection z textu knihy tak MŮŽE nechat Codex přečíst a "vrátit" obsah
+# citlivého souboru dřív, než výstupní kontroly vůbec proběhnou.
+# `polish` proto BĚŽÍ JEN, když je tahle hodnota výslovně `True` - není
+# to default. Nastavení `True` = "rozumím, že tenhle příkaz spouští
+# agenta se čtecím přístupem k celému disku nad textem knihy, a beru to
+# riziko". Migrace na bezpečnější variantu (neagentní API bez nástrojů,
+# nebo OS/kontejnerová izolace) tohle celé nahradí - viz sekce
+# "Bezpečnostní rozhodnutí (kolo 19)" níže.
+STYLIST_ACCEPT_FS_RISK = False
+# Kolo 27-37 - report běhu `polish` (`polish-reports/run-*.json`).
+# `False` (DEFAULT) = u ZÁMÍTNUTÝCH (`rejected`) kapitol report nese JEN
+# `reason_types` (normalizované kategorie `"source/type"`), žádná volná
+# textová pole nálezů ani zamítnutý text; konzole vynechá popisy nálezů;
+# `polish()` chybové hlášky (`StylistError`) i `failed.error` v reportu
+# jdou přes `stylist._redact_detail` - žádná hodnota odvozená z Codexova
+# výstupu (stderr, sekvence čísel, počet odstavců, poměr délky,
+# `str(e)`). Hlavičkové `run_error`/`finalization_error` nesou jen
+# hlášky programu / redigované `FatalRunError` (kolo 35), `summary` a
+# `run_id`/`generated_at`/... jsou metadata - v reportu zůstávají vždy.
+# `True` (jen literál, `is True`) = PLNÝ DETAIL: zamítnutý text od
+# Codexu + volná pole nálezů (`issue`, `cz_excerpt`, ...) + konzolové
+# popisy + raw stderr/čísla/odstavce. Ať jde očima posoudit, jestli byl
+# reject oprávněný.
+# PROČ NENÍ `True` DEFAULT (kolo 31 IMPORTANT): zapnutím
+# `STYLIST_ACCEPT_FS_RISK` bereš, že agent SMÍ číst disk BĚHEM běhu - NE
+# že se případně exfiltrovaný obsah TRVALE uloží do souboru (navíc
+# `polish-reports/` je vedle repa, které bývá v synchronizované složce -
+# Nextcloud apod. - takže by to teklo dál). To je samostatné rozhodnutí,
+# proto samostatný explicitní opt-in. Report v redukovaném režimu
+# (`False`) pořád dá reject rate + rozpad podle `reason_types`; plný text
+# zapni, jen když ten konkrétní běh potřebuješ prozkoumat očima.
+STYLIST_REPORT_REJECTED_TEXT = False

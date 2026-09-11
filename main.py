@@ -11,13 +11,18 @@ Fáze běhu:
 Mutující příkazy drží zámek v data/ - druhý běh se nespustí a nerozbije stav.
 """
 import argparse
+import datetime as _dt
+import hashlib
 import json
 import os
+import sqlite3
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
+from src import concordance, glossary
 from src import guide as guide_mod
 from src import ingest, pipeline, requeue, state
 from src import reference as reference_mod

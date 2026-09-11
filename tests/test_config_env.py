@@ -44,3 +44,18 @@ def test_load_dotenv_ignores_junk_lines(tmp_path):
     env = {}
     config._load_dotenv(str(p), env=env)
     assert env == {"OK": "1"}
+
+
+def test_stylist_config_defaults_present():
+    import config
+    assert config.CODEX_MODEL == ""
+    assert config.STYLIST_TIMEOUT_SECONDS == 180
+    assert config.STYLIST_MAX_CHARS == 60_000
+    assert config.STYLIST_ACCEPT_FS_RISK is False
+    assert config.STYLIST_REPORT_REJECTED_TEXT is False
+
+
+def test_main_has_module_level_imports_for_polish():
+    import main
+    for attr in ("_dt", "hashlib", "sqlite3", "time", "concordance", "glossary"):
+        assert hasattr(main, attr), attr
