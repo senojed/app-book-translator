@@ -27,7 +27,7 @@ from src import guide as guide_mod
 from src import ingest, pipeline, requeue, state
 from src import reference as reference_mod
 from src import reference_mine, textnorm
-from src.agents import scout
+from src.agents import scout, stylist
 from src.llm.client import AnthropicClient, FatalRunError, OutputTruncated, PipelineLLMClient
 
 _MUTATING = {"init", "scan", "run", "answer", "review", "reference"}
@@ -60,8 +60,65 @@ def _print_usage(db_path: str, run_id: int) -> None:
             "SELECT COUNT(*) n, COALESCE(SUM(input_tokens),0) it, "
             "COALESCE(SUM(output_tokens),0) ot, COALESCE(SUM(cost_usd),0) c "
             "FROM llm_calls WHERE run_id = ?", (run_id,)).fetchone()
-    print(f"LLM volání: {r['n']}, vstup {r['it']} tok, výstup {r['ot']} tok, "
-          f"cena ~${r['c']:.4f}")
+    _say(f"LLM volání: {r['n']}, vstup {r['it']} tok, výstup {r['ot']} tok, "
+         f"cena ~${r['c']:.4f}")
+
+
+def _say(msg: str) -> None:
+    """Best-effort diagnostický výpis (kolo 35 IMPORTANT). Používá se
+    pro VŠECHNY per-kapitolové hlášky v `_polish_one_chapter` i
+    `_cmd_polish` smyčce - `print()` může vyhodit (`BrokenPipeError`,
+    zavřený stdout), a to NESMÍ změnit `outcome` kapitoly ani stav běhu
+    (zvlášť po úspěšném commitu). Výsledek běhu se řídí stavem DB a
+    kontrolami, ne tím, jestli hláška dorazila na terminál."""
+    try:
+        print(msg)
+    except Exception:
+        pass
+
+
+def _parse_findings(notes_json: str | None) -> list:
+    """Bezpečné čtení `notes` jako seznamu nálezů - platný JSON, co NENÍ
+    seznam (starší/cizí tvar `notes`), nebo úplně rozbitý JSON, dá prázdný
+    seznam, ne pád (kolo 2 nález). Používá `_already_styled` (hledá stylist
+    marker). Konkordanční baseline pro `_polish_rejected` se NEčte odsud -
+    ta se počítá čerstvě přes `concordance.check_chapter` (kolo 4 IMPORTANT,
+    viz `_polish_one_chapter`), aby neuvízla na starším glosáři."""
+    try:
+        findings = json.loads(notes_json or "[]")
+    except ValueError:
+        return []
+    if not isinstance(findings, list):
+        return []
+    return [f for f in findings if isinstance(f, dict)]
+
+
+def _already_styled(notes_json: str | None) -> bool:
+    return any(f.get("source") == "stylist" for f in _parse_findings(notes_json))
+
+
+def _stylist_marker(cz_before: str, model: str) -> dict:
+    """Stejný tvar jako ostatní nálezy (concordance._finding) - kód, co
+    `notes` čte jinde (review UI, budoucí nástroje), nesmí na neznámý tvar
+    spadnout. `cz_before` se ukládá jen jako hash+délka, ne celý text -
+    plná historie je záměrně mimo rozsah (viz spec výše). Celý SHA-256
+    (ne zkrácený SHA-1), ne kvůli bezpečnosti proti útoku, ale prostě
+    nemá to praktickou cenu zkracovat/slabší algoritmus (kolo 6 NIT)."""
+    return {"source": "stylist", "type": "polish", "severity": "info",
+            "action": "note", "term_id": None, "expected": None,
+            "actual": None, "cz_excerpt": None,
+            "issue": f"stylizováno přes Codex (model={model}), "
+                    f"původní délka {len(cz_before)} znaků, hash "
+                    f"{hashlib.sha256(cz_before.encode('utf-8')).hexdigest()}.",
+            "suggestion": None}
+
+
+def _finding_key(f: dict) -> tuple:
+    """Klíč pro srovnání PŘED/PO u konkordančních nálezů - kolo 4 IMPORTANT:
+    JEN `(type, term_id)` by netvrdilo, že se KONKRÉTNÍ špatná hodnota
+    nezměnila na JINOU špatnou hodnotu (pořád "stejný" nález podle typu a
+    termínu, ale fakticky jiný problém). `actual` je součástí klíče."""
+    return (f.get("type"), f.get("term_id"), f.get("actual"))
 
 
 # --- příkazy ----------------------------------------------------------------

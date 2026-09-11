@@ -295,3 +295,38 @@ def test_reference_failure_leaves_previous_file_untouched(tmp_path, monkeypatch)
     ref_dir = tmp_path / "ref"; ref_dir.mkdir()
     assert _run(["reference", "--dir", str(ref_dir)], tmp_path, monkeypatch) == 1
     assert open("data/reference.json", encoding="utf-8").read() == before
+
+
+# --- Task 7: main.py pomocné funkce pro polish -------------------------------
+
+def test_say_swallows_broken_pipe(monkeypatch):
+    def _boom(*a, **kw):
+        raise BrokenPipeError()
+    monkeypatch.setattr("builtins.print", _boom)
+    main._say("cokoli")   # nesmí vyhodit
+
+
+def test_parse_findings_tolerates_non_list_and_broken_json():
+    assert main._parse_findings("{}") == []
+    assert main._parse_findings("nonsense") == []
+    assert main._parse_findings(None) == []
+    assert main._parse_findings('[{"source":"x"},1,"y"]') == [{"source": "x"}]
+
+
+def test_already_styled_detects_marker():
+    assert main._already_styled('[{"source":"stylist","type":"polish"}]') is True
+    assert main._already_styled('[{"source":"concordance"}]') is False
+    assert main._already_styled(None) is False
+
+
+def test_stylist_marker_shape_and_hash():
+    m = main._stylist_marker("Ahoj světe", "gpt-5-codex")
+    assert m["source"] == "stylist" and m["action"] == "note" and m["severity"] == "info"
+    import hashlib
+    assert hashlib.sha256("Ahoj světe".encode("utf-8")).hexdigest() in m["issue"]
+    assert "model=gpt-5-codex" in m["issue"]
+
+
+def test_finding_key_includes_actual():
+    f = {"type": "inconsistency", "term_id": "t/a", "actual": "špatně"}
+    assert main._finding_key(f) == ("inconsistency", "t/a", "špatně")
