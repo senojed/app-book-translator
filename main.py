@@ -5,6 +5,7 @@ Fáze běhu:
     scan [--chunked]   scout projede knihu → guide.draft.json
     review             web UI: potvrdíš návod → guide.json (+ reseed glosáře)
     run [--retry-flagged [IDX...]]   překladová smyčka
+    polish [--only IDX...] [--force]   stylistický průchod přes Codex (status=="done", volitelné, za STYLIST_ACCEPT_FS_RISK)
     questions / answer QID "text"    dávkové otázky
     status / export [--only-done]
 
@@ -30,7 +31,7 @@ from src import reference_mine, textnorm
 from src.agents import scout, stylist
 from src.llm.client import AnthropicClient, FatalRunError, OutputTruncated, PipelineLLMClient
 
-_MUTATING = {"init", "scan", "run", "answer", "review", "reference"}
+_MUTATING = {"init", "scan", "run", "answer", "review", "reference", "polish"}
 
 _MARKERS = {"done": "OK", "pending": "..", "flagged": "!!", "needs_human": "??",
             "error": "XX", "processing": "~~"}
@@ -1005,6 +1006,270 @@ def _cmd_export(args) -> int:
     return 0
 
 
+def _cmd_polish(args) -> int:
+    db = config.DB_PATH
+    # Bezpečnostní opt-in - ČASNÁ HLÁŠKA (kolo 19 BLOCKING, kolo 20 -
+    # závazná brána je teď PŘÍMO v `stylist.polish()`, tohle je jen hezčí
+    # UX: jeden srozumitelný výpis místo N per-kapitolových StylistError).
+    # `codex exec` má ověřeně neomezené ČTENÍ celého disku - prompt
+    # injection z textu knihy může exfiltrovat citlivý soubor dřív, než
+    # výstupní kontroly proběhnou. Kontrola JAKO PRVNÍ (před `CODEX_MODEL`).
+    if config.STYLIST_ACCEPT_FS_RISK is not True:
+        _say(
+            "polish je vypnutý: spouští agentní `codex exec`, který má "
+            "ČTECÍ přístup k CELÉMU disku (ověřeno). Prompt injection z "
+            "textu knihy tak MŮŽE exfiltrovat citlivý soubor jako součást "
+            "stylizovaného textu, dřív než guardraily proběhnou.\n"
+            "Chceš-li to i tak spustit, nastav v config.py "
+            "`STYLIST_ACCEPT_FS_RISK = True`. Bezpečnější varianty "
+            "(neagentní API, kontejner) viz spec sekce "
+            "'Bezpečnostní rozhodnutí (kolo 19)'.")
+        return 1
+    model = (config.CODEX_MODEL or "").strip()
+    if not model:
+        _say("Chybí config.CODEX_MODEL - nastav ho (audit stylizace musí "
+              "vědět, jaký model se skutečně použil).")
+        return 1
+    try:
+        # Preflight - JEDNOU ověří a rozřeší executable (levné, žádné
+        # skutečné volání Codexu). Chybějící CLI je systémový problém, ne
+        # per-kapitolové selhání - bez tohohle by N kapitol vypsalo N
+        # stejných chyb (dnes už by run správně skončil "fatal", ne "ok" -
+        # kolo 5/6 - ale zbytečně by se to zjišťovalo N-krát). Rozřešený
+        # `codex_cmd` se posílá dál (kolo 8 NIT) - `_polish_one_chapter`/
+        # `stylist.polish` ho pak NEřeší znovu přes `shutil.which` na
+        # každou kapitolu.
+        codex_cmd = stylist._resolve_codex_cmd(["codex"])
+    except stylist.StylistError as e:
+        _say(f"Codex CLI není použitelné: {e}")
+        return 1
+
+    # `rid`/`backup_state` PŘEDEM na `None` (kolo 14 IMPORTANT, rozšiřuje
+    # kola 10/11/13) - CELÝ zbytek příkazu, VČETNĚ výběru kapitol
+    # (`chapters_by_status` apod.), je teď uvnitř JEDNOHO try/except/
+    # finally. Dřív (kolo 13) byl chráněný jen `shutil.copy2` a to, co po
+    # něm následovalo - `chapters_by_status`/`glossary.all_terms`/
+    # `load_guide`/`create_run`/`_print_usage` zůstávaly BEZ obecného
+    # `except`, takže by nezachycená výjimka propadla jako traceback
+    # (STEJNÁ třída chyby jako `_snapshot_db` níž, jen na jiných
+    # místech). `backup_state` zůstává `None`, dokud se skutečně nevytvoří
+    # (těsně před voláním `_snapshot_db`) - `finally` to zohledňuje.
+    rid = None
+    status = "fatal"
+    backup_state = None
+    report = []          # kolo 27 - akumulátor; PŘED try, ať ho `finally` vidí
+    planned_count = 0    # kolik kapitol se mělo zpracovat (kolo 28)
+    batch_completed = False   # smyčka prošla všechny kapitoly? (kolo 28 -
+                              # NE odvozovat z `status`)
+    run_error = None     # hláška top-level výjimky, když běh spadl mimo smyčku
+    try:
+        all_done = state.chapters_by_status(db, ("done",))
+        chapters = all_done
+        if args.only:
+            wanted = set(args.only)
+            chapters = [c for c in all_done if c["idx"] in wanted]
+            # Hlásit přeskočené (kolo 4 NIT) - stejný vzor jako `run --only`,
+            # ne tiché "nic se nestalo" pro číslo, co není 'done'/už existuje.
+            chybi = sorted(wanted - {c["idx"] for c in chapters})
+            if chybi:
+                _say("Přeskočeno (nejsou 'done', nebo neexistují): "
+                     + ", ".join(str(i) for i in chybi))
+        if not args.force:
+            pred_force = len(chapters)
+            chapters = [c for c in chapters if not _already_styled(c["notes"])]
+            preskoceno_stylizovane = pred_force - len(chapters)
+            if preskoceno_stylizovane:
+                _say(f"Přeskočeno (už stylizováno, zkus --force): "
+                     f"{preskoceno_stylizovane}")
+        if not chapters:
+            _say("Žádné kapitoly ke stylizaci.")
+            status = "ok"
+            return 0
+        planned_count = len(chapters)
+
+        # Záloha CELÉ DB (kolo 7 IMPORTANT, časování upřesněno kolo 8, ZDROJ
+        # dat zpřesněn kolo 9 BLOCKING). Snapshot se pořizuje HNED TADY -
+        # PŘED `state.create_run` i před jakýmkoli LLM voláním - protože
+        # obojí by jinak DB změnilo dřív, než by líná záloha vůbec proběhla
+        # (viz `_backup_db_once`). Snapshot jde do DOČASNÉHO souboru vedle
+        # DB; na kanonickou `.pre-polish-backup` cestu se PROMUJE atomicky
+        # (`os.replace`) až `_backup_db_once`, těsně před prvním skutečným
+        # zápisem výsledku - aby běh, co nakonec nic nezapíše, nepřepsal
+        # poslední UŽITEČNOU zálohu z předchozího běhu (stejný důvod jako
+        # kolo 8). Pokud se nakonec nic nezapíše (nebo cokoli spadne),
+        # dočasný snapshot se ve `finally` smaže.
+        backup_state = {"done": False, "snapshot_path": db + ".pre-polish-snapshot"}
+        # Kolo 13 BLOCKING: `_snapshot_db` (kolo 14 IMPORTANT nahradilo
+        # `shutil.copy2`, viz jeho docstring) sama může vyhodit výjimku
+        # (plný disk, práva, neprošlý integrity_check) - `except
+        # Exception` o pár řádků níž tohle teď taky pokryje, ale zabalení
+        # do `FatalRunError` HNED TADY dává přesnější hlášku (víme, že
+        # jde konkrétně o zálohu, ne o obecné "něco spadlo") a
+        # zdůrazňuje, že žádný `run` řádek v DB ještě nevznikl.
+        try:
+            _snapshot_db(db, backup_state["snapshot_path"])
+        except Exception as e:
+            raise FatalRunError(
+                f"Vytvoření zálohy DB selhalo ({type(e).__name__}: {e}) - "
+                "zastavuji se PŘED zahájením zpracování, žádný run "
+                "nevznikl.") from e
+
+        glossary_rows = glossary.all_terms(db)
+        # Stejný blok jako translator (translate_scene i revise_chapter) v
+        # pipeline.py dostává přes `_guide_block` - tykání/vykání, hlas
+        # vypravěče, rejstřík (kolo 6 IMPORTANT; kolo 17 NIT - NE kritik,
+        # `_run_critic` guide_block nedostává). Bez něj stylista neví, co
+        # NESMÍ nepozorovaně změnit - EN sám tuhle informaci nenese,
+        # kritik na to nemá signál.
+        guide_block = guide_mod.guide_as_prompt_block(guide_mod.load_guide(config.GUIDE_PATH))
+        rid = state.create_run(db, "polish")
+        cf = _client_factory(rid, interactive=True)
+        for c in chapters:
+            # Odchylka od specu (kolo 4-6 IMPORTANT) - spec drží `report.
+            # append(rec)` mimo `try` + in-loop `except KeyboardInterrupt`
+            # navázaný na už dokončený `try` + `counts` slovník. KI kdekoli
+            # v těle iterace (i během `_say` v `except Exception`, dřív než
+            # je `rec` sestavené) by tak kapitolu z reportu ztratilo, a
+            # `counts` v `else` větvi nezapočítávalo `failed` z generické
+            # výjimky. Tady: JEDEN try/except/finally, append BEZPODMÍNEČNÝ
+            # ve `finally`, `rec` se tam dopočítá z DB, když ho žádná větev
+            # nesestavila. Souhrn (`tally`) se počítá z `report` AŽ PO
+            # smyčce - jediný zdroj pravdy, DRY s `_write_polish_report`.
+            rec = None
+            try:
+                rec = _polish_one_chapter(c, glossary_rows, cf, db, model,
+                                          guide_block, codex_cmd, backup_state)
+            except FatalRunError as fe:
+                # KAŽDÝ `FatalRunError`, co se sem dostane, má hlášku
+                # REDIGOVANOU U ZDROJE: commit (kolo 35), kontroly kritik/
+                # meaning-check (kolo 37), `_snapshot_db` je pre-Codex.
+                # `str(fe)` je tedy VŽDY bezpečné - `fatal` záznam,
+                # `run_error` i výpis beze změny.
+                rec = {"idx": c["idx"], "outcome": "fatal", "error": str(fe)}
+                raise
+            except Exception as e:
+                # rec sestavíme PŘED `_say` - kdyby `_say` (jeho `print`)
+                # dostalo KeyboardInterrupt, rec už existuje. `str(e)` může
+                # nést Codexem-odvozený obsah → `_redact_detail` (kolo 34).
+                rec = {"idx": c["idx"], "outcome": "failed",
+                       "error": f"{type(e).__name__}: "
+                                f"{stylist._redact_detail(str(e))}"}
+                _say(f"Kapitola {c['idx']}: neočekávaná chyba "
+                     f"({type(e).__name__}), ponechávám původní.")
+            finally:
+                if rec is None:
+                    # KeyboardInterrupt (nebo jiná BaseException) propadla
+                    # ven z `_polish_one_chapter` dřív, než se rec sestavil.
+                    # Stav DB je zdroj pravdy: commit proběhl <=>
+                    # translated_text se změnil (kolo 35 - NE marker
+                    # `_already_styled`, ten je u `--force` z DŘÍVĚJŠÍHO
+                    # běhu; commit se navíc dělá JEN když `styled != cz`,
+                    # takže úspěšný commit `translated_text` VŽDY změní).
+                    try:
+                        row = state.get_chapter(db, c["idx"])
+                        committed = (row is not None
+                                     and row["translated_text"] != c["translated_text"])
+                    except Exception:
+                        committed = False
+                    rec = ({"idx": c["idx"], "outcome": "polished"} if committed
+                           else {"idx": c["idx"], "outcome": "interrupted",
+                                 "stage": "processing"})
+                report.append(rec)
+        batch_completed = True   # smyčka prošla VŠECHNY kapitoly (kolo 28)
+
+        tally = {k: sum(1 for rec in report if rec.get("outcome") == k)
+                 for k in _REPORT_OUTCOMES}
+        _say(f"Vylepšeno: {tally['polished']}, beze změny: {tally['unchanged']}, "
+             f"zamítnuto kontrolou: {tally['rejected']}, selhalo: {tally['failed']}")
+        _print_usage(db, rid)
+        # Report se NEzapisuje tady - přesunuto do `finally` (kolo 27-28),
+        # ať vznikne i po `FatalRunError`/`KeyboardInterrupt`/top-level
+        # výjimce, a AŽ PO `finish_run` (kolo 28 - ať umí zaznamenat i
+        # `finalization_error`).
+        # Kolo 5 IMPORTANT (opravuje kolo-4 rozpor): "všechno selhalo" musí
+        # znamenat status="fatal", ne "ok" - "mechanismus doběhl do konce"
+        # neobstálo, protože DB audit (`runs` tabulka) by pak hlásil úspěch
+        # u běhu, který fakticky nic neudělal. Nenulový exit kód JDE ruku v
+        # ruce se `status="fatal"`, ne místo něj.
+        if tally["failed"] == len(chapters) and tally["failed"] > 0:
+            _say("POZOR: všechny kapitoly selhaly - zkontroluj Codex CLI "
+                  "(přihlášení, config.CODEX_MODEL, síť).")
+            status = "fatal"
+            return 1
+        status = "ok"
+        return 0
+    except FatalRunError as e:
+        # `str(e)` je bezpečné: KAŽDÝ `FatalRunError`, co může nést obsah
+        # `styled` (commit; kritik/meaning-check - kolo 37), má hlášku
+        # REDIGOVANOU U ZDROJE v `_polish_one_chapter` (`stylist._redact_
+        # detail`). `_snapshot_db` `FatalRunError` běží PŘED stylizací.
+        # `run_error` i výpis proto můžou být plné.
+        run_error = str(e)
+        _say(str(e))
+        return 1
+    except KeyboardInterrupt:
+        status = "interrupted"
+        run_error = "KeyboardInterrupt"
+        raise
+    except Exception as e:
+        # Kolo 14 IMPORTANT: cokoli neočekávané MIMO per-kapitolovou smyčku
+        # (výběr kapitol, glosář, návod, založení runu, výpis spotřeby) je
+        # infrastrukturní/programová chyba, ne obsahová - `str(e)` tam
+        # Codexův obsah nemá jak nést (žádný `styled` ještě neexistuje).
+        # Zastavit čistě (`return 1`), ne propadnout jako traceback.
+        run_error = f"{type(e).__name__}: {e}"
+        _say(f"Neočekávaná chyba: {type(e).__name__}: {e}")
+        return 1
+    finally:
+        # Snapshot, co nikdy nebyl promován (nic se nezapsalo - všechny
+        # kapitoly 'unchanged'/'rejected'/'failed', nebo běh spadl dřív, než
+        # `_backup_db_once` proběhla - VČETNĚ selhání samotného `_snapshot_
+        # db` o pár řádků výš, kolo 11 IMPORTANT) - dočasný soubor po
+        # sobě uklidit, ať se nehromadí (kolo 9 BLOCKING oprava - viz
+        # snapshot výš). `os.remove` na neexistující/částečný soubor
+        # nevadí - `OSError` (podtřída i `FileNotFoundError`) se tiše
+        # pohltí. `backup_state is not None` (kolo 14 IMPORTANT) - selže-li
+        # něco PŘED jeho vytvořením (`chapters_by_status` apod.), proměnná
+        # ještě neexistuje, přístup k ní by `finally` sám havaroval.
+        if backup_state is not None and not backup_state["done"]:
+            try:
+                os.remove(backup_state["snapshot_path"])
+            except OSError:
+                pass
+        # `rid is not None` (kolo 10 IMPORTANT) - `create_run` sám mohl
+        # spadnout dřív, než vůbec vrátil `rid`; volat `finish_run` na
+        # neexistující/cizí run by bylo horší než ho prostě nevolat (a
+        # `NameError` na nedefinovaném `rid` by tenhle `finally` blok
+        # samotný havaroval).
+        if rid is not None:
+            # Kolo 13 IMPORTANT: `finish_run` sám NESMÍ shodit tenhle
+            # `finally` - kdyby selhal (STEJNÁ třída chyby, co nás sem
+            # často přivedla - plný disk, poškozená DB), NOVÁ výjimka by
+            # PŘEBILA tu původní (nebo právě dokončovaný `return`), co
+            # `finally` blok zrovna zpracovává. Selhání finalizace se jen
+            # VYPÍŠE (best-effort) + zaznamená do reportu (kolo 28).
+            finalization_error = None
+            try:
+                state.finish_run(db, rid, status)
+            except Exception as e:
+                finalization_error = f"{type(e).__name__}: {e}"
+                # `_say` (kolo 36 IMPORTANT) - výjimka z `print` v tomhle
+                # `finally` bloku by unikla a přebila výsledek; navíc by
+                # zabránila zápisu reportu o pár řádků níž.
+                _say(f"POZOR: zápis konečného stavu běhu selhal "
+                     f"({finalization_error}) - run zůstává nedokončený "
+                     "v DB, ale výsledek/chyba výš je platná.")
+            # Report běhu (kolo 27-28) - AŽ PO `finish_run`, ať zaznamená
+            # i `finalization_error`. Vlastní `except Exception`
+            # (best-effort). `batch_completed`/`planned_count` jdou
+            # dovnitř SAMOSTATNĚ (ne odvozené z `status`).
+            _write_polish_report(db, rid, report, codex_model=model,
+                                 planned_count=planned_count,
+                                 batch_completed=batch_completed, run_status=status,
+                                 run_error=run_error,
+                                 finalization_error=finalization_error)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="book-translator",
                                 description="Multiagentní překladač knih EN→CZ")
@@ -1037,6 +1302,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--only", nargs="+", type=int, default=None,
                        help="přelož jen tyhle kapitoly (pilot); zbytek zůstane ve frontě")
     p_run.set_defaults(func=_cmd_run)
+
+    p_pol = sub.add_parser("polish", help="stylistický průchod přes Codex (nad hotovými kapitolami)")
+    p_pol.add_argument("--only", nargs="+", type=int, default=None,
+                       help="jen tyhle kapitoly (musí být status=='done')")
+    p_pol.add_argument("--force", action="store_true",
+                       help="stylizuj i kapitoly, co už prošly (přepíše dřívější stylizaci)")
+    p_pol.set_defaults(func=_cmd_polish)
 
     sub.add_parser("status", help="přehled kapitol").set_defaults(func=_cmd_status)
     sub.add_parser("questions", help="otevřené otázky").set_defaults(func=_cmd_questions)
