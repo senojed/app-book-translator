@@ -573,3 +573,50 @@ def test_backup_db_once_promotion_survives_broken_print(tmp_path, monkeypatch):
     bs = {"done": False, "snapshot_path": snap}
     main._backup_db_once(db, bs)   # nesmí vyhodit
     assert bs["done"] is True and os.path.exists(db + ".pre-polish-backup")
+
+
+# --- Task 10: main._write_polish_report --------------------------------------
+
+def _read_only_report(dirpath):
+    import glob
+    files = glob.glob(os.path.join(dirpath, "polish-reports", "run-*.json"))
+    assert len(files) == 1, files
+    with open(files[0], encoding="utf-8") as f:
+        return json.load(f)
+
+
+def test_write_polish_report_shape(tmp_path):
+    db = str(tmp_path / "state.sqlite3"); state.init_db(db)
+    report = [{"idx": 1, "outcome": "polished"},
+              {"idx": 2, "outcome": "rejected", "reason_types": ["critic/critic_failed"]},
+              {"idx": 3, "outcome": "failed", "error": "boom"}]
+    main._write_polish_report(db, 7, report, codex_model="gpt-5-codex",
+                              planned_count=4, batch_completed=True, run_status="ok")
+    r = _read_only_report(str(tmp_path))
+    assert r["schema_version"] == 1 and r["run_id"] == 7
+    assert r["codex_model"] == "gpt-5-codex"
+    assert r["planned_count"] == 4 and r["attempted_count"] == 3
+    assert r["batch_completed"] is True and r["run_status"] == "ok"
+    assert r["run_error"] is None and r["finalization_error"] is None
+    assert r["summary"] == {"polished": 1, "unchanged": 0, "rejected": 1,
+                            "failed": 1, "fatal": 0, "interrupted": 0}
+    assert r["generated_at"]
+
+
+def test_write_polish_report_best_effort_on_json_typeerror(tmp_path, monkeypatch):
+    db = str(tmp_path / "state.sqlite3"); state.init_db(db)
+    monkeypatch.setattr(main.json, "dump",
+                        lambda *a, **k: (_ for _ in ()).throw(TypeError("x")))
+    main._write_polish_report(db, 1, [], codex_model="m", planned_count=0,
+                              batch_completed=True, run_status="ok")   # nesmí vyhodit
+    import glob
+    assert glob.glob(os.path.join(str(tmp_path), "polish-reports", "*.tmp")) == []
+    assert glob.glob(os.path.join(str(tmp_path), "polish-reports", "*.json")) == []
+
+
+def test_write_polish_report_best_effort_on_makedirs_oserror(tmp_path, monkeypatch):
+    db = str(tmp_path / "state.sqlite3"); state.init_db(db)
+    monkeypatch.setattr(main.os, "makedirs",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("x")))
+    main._write_polish_report(db, 1, [], codex_model="m", planned_count=0,
+                              batch_completed=True, run_status="ok")   # nesmí vyhodit
