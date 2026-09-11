@@ -311,3 +311,219 @@ def _kill_process_tree(proc) -> None:
             proc.kill()
         except OSError:
             pass
+
+
+def polish(en_text: str, cz_text: str, *, timeout: int | None = None,
+           codex_cmd: list[str] | None = None,
+           codex_model: str | None = None,
+           guide_block: str = "") -> str:
+    """Vrací upravený český text. Zvedá StylistError při jakémkoli selhání
+    NEBO když výstup neprojde levnou strukturální kontrolou (viz níže) -
+    volající (main.py) na to reaguje ponecháním původního textu, ne pádem.
+
+    ZÁVAZNÁ bezpečnostní brána (kolo 20 BLOCKING): bez `config.STYLIST_
+    ACCEPT_FS_RISK is True` funkce rovnou vyhodí `StylistError` - `codex
+    exec` má ověřený neomezený čtecí přístup k disku (bezpečnostní detail
+    6 v modulovém docstringu + spec sekce "Bezpečnostní rozhodnutí (kolo
+    19)"). Kontrola je TADY, ne jen v `_cmd_polish`, protože tohle je
+    veřejná funkce.
+
+    `codex_cmd` jde přepsat v testech (`[sys.executable, str(fake_script)]`)
+    - produkční výchozí je `["codex"]` (přes `shutil.which`, viz
+    `_resolve_codex_cmd`). Vždy seznam, ne string - string by `subprocess.run`
+    vzal jako JEDEN spustitelný soubor s mezerou ve jméně, ne jako "spusť
+    python se skriptem jako argumentem".
+
+    `guide_block` (kolo 6 IMPORTANT) - stejný text jako `guide_
+    as_prompt_block(guide)`, co dostává translator (`translate_scene` i
+    `revise_chapter` v `pipeline.process_chapter`) - NE kritik
+    (`pipeline._run_critic` volá `critic.review(en, cz, client)` bez
+    návodu, kolo 17 NIT opravuje dřívější nepřesné "translator/kritik",
+    ověřeno přímo v `src/pipeline.py`). Stylista bez něj NEVÍ o
+    rozhodnutích tykání/vykání, hlasu vypravěče ani rejstříku (EN samo
+    tuhle informaci nenese - kritik EN-vs-CZ na to nemá signál), takže by
+    ho mohl nepozorovaně změnit. Prázdný string,
+    když návod není k dispozici (volitelný parametr, ne tvrdý požadavek).
+
+    Levná STRUKTURÁLNÍ kontrola (počet odstavců, poměr délky, sekvence
+    čísel) běží tady, PŘED tím, než se výsledek vůbec vrátí volajícímu -
+    je zadarmo (žádné LLM volání) a odchytí hrubé selhání (uťatý/zkrácený
+    výstup, přehozená číslice) dřív, než se zaplatí za drahou kritikovu
+    kontrolu v `_cmd_polish`. Nenahrazuje kritika (ten hlídá VÝZNAM, ne
+    strukturu) - jsou to nezávislé sítě.
+
+    `config.STYLIST_MAX_CHARS` guard (kolo 17 IMPORTANT) - běží HNED, PŘED
+    `_resolve_codex_cmd`/samotným voláním Codexu. Extrémně dlouhá kapitola
+    by `timeout` (i zvýšený) stejně pravděpodobně vyčerpala, nebo by
+    Codex narazil na vlastní kontextový limit modelu - bez týhle kontroly
+    by uživatel čekal celý `timeout` nadarmo a dostal jen obecnou
+    `StylistError` o timeoutu, ne jasnou zprávu, PROČ to nešlo."""
+    # Bezpečnostní opt-in VYNUCEN PŘÍMO TADY (kolo 20 BLOCKING) - ne jen v
+    # `_cmd_polish`. `polish()` je veřejná funkce; kontrola jen v CLI
+    # obálce by šla obejít přímým voláním. `_cmd_polish` si vlastní
+    # časnou hlášku nechává (hezčí UX než N per-kapitolových StylistError),
+    # ale JEDINÁ závazná brána je tahle. Testy volající `polish()` přímo
+    # musí `config.STYLIST_ACCEPT_FS_RISK` nastavit (autouse fixture).
+    if config.STYLIST_ACCEPT_FS_RISK is not True:
+        raise StylistError(
+            "stylistický průchod je vypnutý: `codex exec` má ověřený "
+            "neomezený čtecí přístup k disku, prompt injection z textu "
+            "knihy může exfiltrovat citlivý soubor. Nastav "
+            "config.STYLIST_ACCEPT_FS_RISK = True, chceš-li to i tak "
+            "spustit (viz spec 'Bezpečnostní rozhodnutí (kolo 19)').")
+    combined_len = len(en_text) + len(cz_text)
+    if combined_len > config.STYLIST_MAX_CHARS:
+        raise StylistError(
+            f"kapitola je na stylistický průchod moc dlouhá "
+            f"({combined_len} znaků EN+CZ, limit "
+            f"config.STYLIST_MAX_CHARS={config.STYLIST_MAX_CHARS}) - "
+            "přeskakuji, aby se nečekalo na jistý timeout.")
+    # Konfigurační invarianty VYNUCENÉ přímo tady (kolo 22 IMPORTANT) -
+    # `polish()` je veřejná funkce, nesmí tiše obcházet `_cmd_polish`'s
+    # kontroly:
+    #  - `codex_cmd`: `None` = "vezmi produkční", `[]` (nebo jiný prázdný)
+    #    = chyba volajícího, ne tiché spadnutí na produkční Codex (to by
+    #    po opt-inu nečekaně spustilo agenta s přístupem k disku).
+    #  - `codex_model`: `None` → `config.CODEX_MODEL`; prázdný = chyba
+    #    (auditní záznam MUSÍ znát model, stejně jako u `_cmd_polish`).
+    #  - `timeout`: `None` → `config.STYLIST_TIMEOUT_SECONDS` (ne natvrdo).
+    if codex_cmd is None:
+        codex_cmd = ["codex"]
+    if not codex_cmd or not all(codex_cmd):
+        raise StylistError("prázdný nebo neúplný codex_cmd - to je chyba "
+                           "volajícího, ne důvod spustit produkční Codex.")
+    codex_model = ((codex_model if codex_model is not None
+                    else config.CODEX_MODEL) or "").strip()
+    if not codex_model:
+        raise StylistError("chybí model - předej `codex_model` nebo nastav "
+                           "config.CODEX_MODEL (audit musí vědět, jaký "
+                           "model se použil).")
+    # kolo 23 IMPORTANT: `.strip()` se PŘIŘADÍ (ne jen použije k validaci) -
+    # jinak by whitespace-padded model prošel a šel s mezerami do `-m`.
+    if timeout is None:
+        timeout = config.STYLIST_TIMEOUT_SECONDS
+    codex_cmd = _resolve_codex_cmd(list(codex_cmd))
+    guide_section = (f"\n--- NÁVOD PRO PŘEKLAD (tykání/vykání, hlas, "
+                     f"rejstřík - NEPORUŠUJ) ---\n{guide_block}\n"
+                     if guide_block else "")
+    prompt_text = SYSTEM_PROMPT_TEMPLATE.format(
+        en_text=en_text, cz_text=cz_text, guide_section=guide_section)
+
+    # TemporaryDirectory jako context manager (kolo 3 nález) - slouží jako
+    # izolovaný `-C` kořen a cíl pro `-o` (VÝSTUP se sem zapíše - vstup jde
+    # stdinem, viz docstring bod 1, takže PŮVODNÍ text sem jako soubor
+    # nejde; STYLIZOVANÁ verze ano, viz `out_path` níže). TENHLE soubor se
+    # po `with` bloku smaže; ZAMÍTNUTÝ výstup ale může skončit v report
+    # souboru `main._write_polish_report` (kolo 27, JEN za explicitním
+    # opt-inem `config.STYLIST_REPORT_REJECTED_TEXT is True`, default
+    # `False`) - to je MIMO tenhle modul.
+    with tempfile.TemporaryDirectory(prefix="stylist-") as work_dir:
+        out_path = os.path.join(work_dir, "out.txt")
+
+        cmd = _codex_argv(codex_cmd, work_dir, out_path, codex_model)
+
+        try:
+            # Popen+communicate, ne subprocess.run (kolo 5 IMPORTANT):
+            # subprocess.run(timeout=...) na Windows na timeoutu ukončí jen
+            # PŘÍMÉHO potomka (cmd.exe/codex.cmd wrapper) - `codex.cmd`
+            # spouští node.exe jako DALŠÍHO potomka, který by běžel dál a
+            # čerpal kvótu. `Popen` dá přístup k `.pid`, aby šlo při
+            # timeoutu ukončit CELÝ strom přes `_kill_process_tree`.
+            #
+            # `encoding="utf-8"` EXPLICITNĚ (kolo 5 BLOCKING) - bez něj
+            # `text=True` použije lokální kódování OS; na Windows to bývá
+            # cp1252, které český prompt (diakritika) nezakóduje a volání
+            # spadne na `UnicodeEncodeError` ještě PŘED spuštěním Codexu.
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, encoding="utf-8", cwd=work_dir)
+        except OSError as e:
+            # Kolo 8 IMPORTANT: `FileNotFoundError` (podtřída `OSError`)
+            # nestačí - `PermissionError` (soubor existuje, ale není
+            # spustitelný) a další `OSError` varianty by unikly jako
+            # neošetřená výjimka mimo `StylistError` kontrakt.
+            raise StylistError(
+                f"příkaz {codex_cmd!r} se nepodařilo spustit ({type(e).__name__}: "
+                f"{e}) - je Codex CLI nainstalované a přihlášené?")
+        try:
+            stdout, stderr = proc.communicate(input=prompt_text, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc)
+            try:
+                # OMEZENÝ wait (kolo 6 IMPORTANT) - i po taskkill/kill se
+                # čeká jen konečně dlouho, ne navždy, kdyby ukončení samo
+                # selhalo (proces uvízlý v nepřerušitelném stavu apod.).
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass   # udělali jsme, co šlo - nenecháme volajícího viset
+            raise StylistError(f"codex exec překročil timeout {timeout}s.")
+        except BaseException:
+            # Odchylka od specu (plan-consensus kolo 2 IMPORTANT): spec
+            # ukončí potomka JEN při TimeoutExpired. KeyboardInterrupt
+            # (Ctrl+C) z communicate() by jinak nechal codex.cmd/node.exe
+            # běžet dál a čerpat Codex kvótu - stejný problém, kvůli
+            # kterému _kill_process_tree existuje.
+            _kill_process_tree(proc)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            raise
+
+        if proc.returncode != 0:
+            # VŠECHNY chybové hlášky `polish()`, co nesou hodnotu odvozenou
+            # z Codexova výstupu (`stderr`, počet odstavců, poměr délky,
+            # sekvence čísel), jdou přes `_redact_detail` (kolo 32-34) -
+            # bez `STYLIST_REPORT_REJECTED_TEXT is True` uvedou jen
+            # generickou náhradu, ne konkrétní hodnoty (prompt injection
+            # by je jinak mohla exfiltrovat / použít jako covert channel
+            # do `failed` záznamu reportu).
+            raise StylistError(
+                f"codex exec skončil s kódem {proc.returncode}: "
+                f"{_redact_detail(stderr[:500])}")
+        if not os.path.exists(out_path):
+            raise StylistError(
+                "codex exec nevytvořil výstupní soubor (-o) - žádná "
+                "poslední zpráva k zachycení.")
+        with open(out_path, "r", encoding="utf-8") as f:
+            styled = f.read().strip()
+
+    if not styled:
+        raise StylistError("codex exec vrátil prázdnou odpověď.")
+    # Obrana proti tomu, že model přesto obalí odpověď do markdown bloku
+    # navzdory promptu (kolo 4 NIT) - deterministická kontrola, ne spoléhání
+    # jen na to, že model poslechne pokyn "žádné markdown bloky".
+    if styled.startswith("```") or styled.endswith("```"):
+        raise StylistError(
+            "odpověď je obalená v markdown bloku (```) navzdory pokynu - "
+            "podezřelý formát, radši zamítnout.")
+
+    # Levná strukturální kontrola - viz docstring. Prahy jsou schválně
+    # volné (skutečnou kontrolu obsahu dělá až kritik v _cmd_polish) -
+    # cílem je odchytit JEN hrubé selhání (uťatý výstup, smazaný obsah).
+    if _paragraph_count(styled) != _paragraph_count(cz_text):
+        raise StylistError(
+            "počet odstavců se liší "
+            f"{_redact_detail(f'({_paragraph_count(styled)} vs. {_paragraph_count(cz_text)} originál)')}"
+            " - podezření na useknutý nebo přepsaný výstup.")
+    ratio = len(styled) / max(1, len(cz_text))
+    if not (0.5 <= ratio <= 1.5):
+        raise StylistError(
+            f"délka výstupu se od originálu liší {_redact_detail(f'{ratio:.1f}x')}"
+            " - podezření na useknutý nebo přepsaný výstup.")
+    # Sekvence arabských číslic (kolo 6 IMPORTANT, revize kol 4-5, ŘAZENÍ
+    # odstraněno kolo 13 BLOCKING - viz `_number_sequence` docstring) -
+    # levné, deterministické, fail-closed. Zachytí přehození číslic
+    # ("12"→"21") I přehození DVOU RŮZNÝCH čísel mezi sebou (na rozdíl od
+    # dřívější seřazené verze), co LLM kontroly (kritik,
+    # check_meaning_preserved) mohou přehlédnout, protože oboje zůstává
+    # "čitelné". Slovně vypsaná čísla mimo rozsah.
+    before_nums, after_nums = _number_sequence(cz_text), _number_sequence(styled)
+    if before_nums != after_nums:
+        # `after_nums` pochází ze STYLIZOVANÉHO textu (Codexův výstup) -
+        # přes `_redact_detail` (kolo 33-34).
+        raise StylistError(
+            "čísla v textu se změnila "
+            f"{_redact_detail(f'({before_nums} → {after_nums})')} - "
+            "podezření na faktickou změnu, ne jen styl.")
+    return styled
