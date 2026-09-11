@@ -527,3 +527,78 @@ def polish(en_text: str, cz_text: str, *, timeout: int | None = None,
             f"{_redact_detail(f'({before_nums} → {after_nums})')} - "
             "podezření na faktickou změnu, ne jen styl.")
     return styled
+
+
+MEANING_CHECK_PROMPT = """Dostaneš dvě verze stejného českého textu - PŘED
+a PO stylistické úpravě. Posuď DVĚ VĚCI zvlášť:
+
+1. VÝZNAM - fakta, kdo co řekl/udělal, počet/pořadí událostí, jména, čísla.
+   Rozdíly ve slovosledu, synonymech nebo plynulosti věty NEJSOU význam -
+   ty ignoruj.
+2. REJSTŘÍK - tykání/vykání mezi postavami, formálnost oslovení, hlas
+   vypravěče (ironický/vážný/atd.). I drobná změna (např. "ty" → "vy" u
+   jedné repliky) se počítá.
+
+Vrať POUZE JSON:
+{{"meaning_changed": true | false,
+ "register_changed": true | false,
+ "issue": "stručně co se změnilo (když je aspoň jedno true)"}}
+
+--- PŘED ---
+{cz_before}
+
+--- PO ---
+{cz_after}"""
+
+
+def check_meaning_preserved(cz_before: str, cz_after: str, client, *,
+                            model=None, max_tokens=None) -> list:
+    """Třetí, nezávislá kontrolní síť (kolo 2 nález): `critic.review`
+    srovnává EN vs. CZ-po, což nemusí odhalit posun, který je vůči EN
+    pořád "obhajitelný", ale liší se od PŮVODNÍHO schváleného výkladu.
+    Tahle funkce srovnává přímo CZ-před vs. CZ-po - jiná otázka, jiný
+    nález. Od kola 7 kontroluje i REJSTŘÍK (tykání/vykání, hlas vypravěče)
+    - prompt sám stylistovi říká, ať registr nemění (viz `guide_block` v
+    `polish()`), ale žádná vrstva to dřív VERIFIKOVAT neuměla - kritik na
+    to nemá signál (EN sám tykání/vykání nenese) a tahle funkce dřív
+    kontrolovala jen VÝZNAM v užším smyslu. Vrací seznam nálezů ve stejném
+    tvaru jako `concordance`/`critic` (typ `"meaning_drift"` nebo
+    `"register_drift"`), prázdný seznam = beze změny.
+
+    Anthropic volání (přes standardní `client`, ne Codex) - počítá se do
+    `llm_calls`/`MAX_SPEND_USD` stejně jako kritik."""
+    def _finding(type_, issue):
+        return {"source": "stylist_check", "type": type_, "severity": "critical",
+                "action": "revise", "term_id": None, "expected": None,
+                "actual": None, "cz_excerpt": None, "issue": issue,
+                "suggestion": None}
+
+    model = model or config.MODEL_CRITIC
+    max_tokens = max_tokens or config.MAX_TOKENS_CRITIC
+    prompt = MEANING_CHECK_PROMPT.format(cz_before=cz_before, cz_after=cz_after)
+    comp = client.complete(system="Jsi přesný, střízlivý korektor významu a rejstříku.",
+                           user=prompt, max_tokens=max_tokens, model=model)
+    if comp.truncated:
+        return [_finding("meaning_drift",
+                         "kontrola zachování významu/rejstříku useknutá - bereme jako selhání.")]
+    try:
+        data = extract_json(comp.text)
+    except ValueError:
+        return [_finding("meaning_drift",
+                         "kontrola zachování významu/rejstříku vrátila nečitelnou odpověď - bereme jako selhání.")]
+    # `isinstance(..., bool)`, NE `in (True, False)` (kolo 9 IMPORTANT) -
+    # v Pythonu `0 == False` a `1 == True`, takže `0 in (True, False)` je
+    # `True`. Odpověď `{"meaning_changed": 0}` (model vrátil číslo místo
+    # JSON boolu) by tak prošla jako platné "false", i když jde o jiný typ,
+    # než jaký prompt žádá - `isinstance` tenhle gap zavírá.
+    if not isinstance(data, dict) or not isinstance(data.get("meaning_changed"), bool) \
+            or not isinstance(data.get("register_changed"), bool):
+        issue = (data.get("issue") if isinstance(data, dict) else None) or \
+                "kontrola zachování významu/rejstříku vrátila neplatný tvar - bereme jako selhání."
+        return [_finding("meaning_drift", issue)]
+    out = []
+    if data["meaning_changed"]:
+        out.append(_finding("meaning_drift", data.get("issue") or "změnil se význam."))
+    if data["register_changed"]:
+        out.append(_finding("register_drift", data.get("issue") or "změnil se rejstřík/oslovení."))
+    return out

@@ -2,6 +2,7 @@ import json, os, sys
 import pytest
 import config
 from src.agents import stylist
+from src.llm.client import Completion, FakeLLMClient
 
 
 @pytest.fixture(autouse=True)
@@ -444,3 +445,54 @@ def test_polish_kills_process_tree_on_keyboard_interrupt(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         stylist.polish("EN", "Nejaka veta tady je.", codex_cmd=[sys.executable])
     assert events == ["communicate", "kill_tree", "wait:10"]
+
+
+# --- Task 6: stylist.check_meaning_preserved() -------------------------------
+
+def _mc(d):
+    return FakeLLMClient([Completion(json.dumps(d), False, 5, 5)])
+
+
+def test_check_meaning_clean_returns_empty():
+    out = stylist.check_meaning_preserved(
+        "A", "A", _mc({"meaning_changed": False, "register_changed": False}))
+    assert out == []
+
+
+def test_check_meaning_drift_flagged():
+    out = stylist.check_meaning_preserved(
+        "A", "B", _mc({"meaning_changed": True, "register_changed": False,
+                       "issue": "změna faktu"}))
+    assert len(out) == 1 and out[0]["type"] == "meaning_drift"
+
+
+def test_check_register_drift_flagged_standalone():
+    out = stylist.check_meaning_preserved(
+        "A", "B", _mc({"meaning_changed": False, "register_changed": True,
+                       "issue": "ty -> vy"}))
+    assert len(out) == 1 and out[0]["type"] == "register_drift"
+
+
+def test_check_both_flags_yield_both_findings():
+    out = stylist.check_meaning_preserved(
+        "A", "B", _mc({"meaning_changed": True, "register_changed": True,
+                       "issue": "obojí"}))
+    assert {f["type"] for f in out} == {"meaning_drift", "register_drift"}
+
+
+def test_check_truncated_is_treated_as_drift():
+    out = stylist.check_meaning_preserved(
+        "A", "B", FakeLLMClient([Completion("{partial", True, 5, 5)]))
+    assert out and out[0]["type"] == "meaning_drift"
+
+
+def test_check_unreadable_json_is_drift():
+    out = stylist.check_meaning_preserved(
+        "A", "B", FakeLLMClient([Completion("not json", False, 5, 5)]))
+    assert out and out[0]["type"] == "meaning_drift"
+
+
+def test_check_numeric_bool_is_invalid_shape_treated_as_drift():
+    out = stylist.check_meaning_preserved(
+        "A", "B", _mc({"meaning_changed": 0, "register_changed": 0}))
+    assert out and out[0]["type"] == "meaning_drift"
