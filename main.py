@@ -274,6 +274,138 @@ def _polish_rejected(baseline_concordance: list, after_findings: list,
                                    cz_before, cz_after, glossary_rows))
 
 
+def _snapshot_db(db: str, snapshot_path: str, *, timeout: float = 30.0) -> None:
+    """Zapíše KONZISTENTNÍ snapshot DB do `snapshot_path` přes SQLite
+    vlastní `Connection.backup()` API (kolo 14 IMPORTANT), NE `shutil.
+    copy2` - prostý souborový copy může zachytit DB uprostřed cizího
+    zápisu (nekonzistentní stav) a nezná WAL/SHM sidecar soubory, kdyby
+    se žurnálovací režim někdy změnil (dnešní `state.connect()` žádný
+    explicitní `journal_mode` nenastavuje, takže je to teoretická, ne
+    aktuální hrozba - `backup()` ji ale řeší úplně obecně, bez ohledu na
+    to). `PRAGMA integrity_check` na výsledku navíc ověří, že samotný
+    backup proběhl kompletně (přerušení uprostřed by jinak dalo tiše
+    existující, ale poškozený soubor).
+
+    `timeout` (kolo 15 IMPORTANT) - `backup()` samo o sobě NEMÁ žádný
+    časový limit; při dlouhodobě zamčené DB (jiný proces drží zámek,
+    extrémně pomalý disk - síťové úložiště, antivirus) by mohlo viset
+    NEOMEZENĚ. `progress` callback (SQLite ho volá po každé zkopírované
+    dávce stránek) hlídá uplynulý čas a po `timeout` sekundách vyhodí
+    `TimeoutError`, kterou `backup()` propaguje ven místo dalšího čekání.
+
+    `pages=100` (kolo 16 IMPORTANT, opravuje kolo 15) - BEZ tohohle by
+    `backup()` použilo výchozí `pages=-1`, co zkopíruje CELOU DB v JEDNOM
+    kroku - `progress` callback by se zavolal nejvýš JEDNOU, těsně před
+    návratem, tedy AŽ PO dokončení kopírování. Deadline kontrola uvnitř
+    by tak nikdy nestihla zasáhnout UPROSTŘED pomalého/zaseknutého
+    kopírování - byla by čistě kosmetická, ne skutečný časový limit.
+    S omezeným `pages` proběhne VÍC kroků, `progress` se zavolá mezi
+    každým z nich, a deadline tak má reálnou šanci kopírování přerušit."""
+    deadline = time.monotonic() + timeout
+
+    def _check_deadline(status, remaining, total):
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"Snapshot DB přesáhl časový limit ({timeout}s) - "
+                f"zbývá {remaining}/{total} stránek, DB je pravděpodobně "
+                "dlouhodobě zamčená jiným procesem.")
+
+    src = sqlite3.connect(db)
+    try:
+        dst = sqlite3.connect(snapshot_path)
+        try:
+            src.backup(dst, pages=100, progress=_check_deadline)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    check = sqlite3.connect(snapshot_path)
+    try:
+        row = check.execute("PRAGMA integrity_check").fetchone()
+        if row is None or row[0] != "ok":
+            raise OSError(f"Snapshot DB neprošel integrity_check: {row}")
+    finally:
+        check.close()
+
+
+def _backup_db_once(db: str, backup_state: dict) -> None:
+    """Promuje PŘEDEM pořízený snapshot (viz `_cmd_polish` - vzniká PŘED
+    `state.create_run`) na kanonickou zálohu `db + ".pre-polish-backup"`,
+    ale jen JEDNOU za běh, těsně PŘED prvním skutečným zápisem výsledku
+    (kolo 8 IMPORTANT, časování zpřesněné kolo 9 BLOCKING).
+
+    Kolo 9 BLOCKING: `state.create_run` zapisuje řádek do `runs` a
+    kritik/`check_meaning_preserved` volané uvnitř `_polish_one_chapter`
+    logují přes `record_llm_call` I PRO KAPITOLY, co skončí
+    'rejected'/'failed' - tedy PŘED prvním `commit_chapter_result`. Kdyby
+    se DB kopírovala až TADY (jak to dělalo kolo 8), "záloha" by už nesla
+    tohohle běhu vlastní bookkeeping (řádek `runs` + `llm_calls` z
+    zamítnutých pokusů), ne skutečný stav PŘED spuštěním `polish`. Proto
+    se skutečná kopie dat dělá dřív (snapshot v `_cmd_polish`, PŘED
+    `create_run`) a tahle funkce jen PROMUJE už hotový snapshot na
+    kanonickou cestu - `os.replace` je atomické přejmenování na úrovni
+    souborového systému, ne stream kopie, takže staré `.pre-polish-backup`
+    (pokud existovalo) zmizí v okamžiku přejmenování a nikdy není vidět
+    částečně přepsané (kolo 9 IMPORTANT - `shutil.copy2` by ho přepisoval
+    postupně, pád/plný disk uprostřed by starou zálohu poškodil).
+
+    Obnova (mimo běžící `main.py` - DB nesmí mít otevřené spojení, což
+    zaručí zastavený `main.py`; ruční zásah do DAT, žádoucí kandidát na
+    vlastní zamykání/testovanou příkazovou obálku je mimo rozsah týhle
+    spec, viz "Mimo rozsah" výš): NE přímý `shutil.copy2(db +
+    ".pre-polish-backup", db)` na AKTIVNÍ cestu (kolo 11 IMPORTANT) -
+    stejné riziko částečného zápisu jako u vytváření zálohy výš, jen by
+    teď poškodilo přímo `db`, ne zálohu. Bezpečný postup: zkopírovat
+    zálohu do DOČASNÉHO souboru ve STEJNÉM adresáři jako `db` (`shutil.
+    copy2(backup_path, db + ".restore-tmp")`), ověřit integritu
+    (`sqlite3.connect(tmp_path).execute("PRAGMA integrity_check").
+    fetchone() == ("ok",)`), a teprve pak `os.replace(tmp_path, db)` -
+    atomické přejmenování, stejný princip jako promoce zálohy výš.
+    Sidecar soubory (`db + "-wal"`, `db + "-shm"`, `db + "-journal"`) se
+    mažou AŽ PO úspěšném `os.replace`, ne před ním (kolo 16 IMPORTANT,
+    opravuje kolo 15 - mazání PŘED přejmenováním otvíralo okno, kdy by
+    pád uprostřed mohl připravit AKTUÁLNÍ (ještě nenahrazenou) `db` o
+    její VLASTNÍ potřebný `-journal`). Po `os.replace` je smazání
+    sidecarů BEZPEČNOSTNĚ NUTNÝ krok (kolo 22 NIT - ne "kosmetický"):
+    starý `-journal`/`-wal` vázaný ke jménu `db` by SQLite při příštím
+    otevření mohl aplikovat na ČERSTVĚ obnovený soubor a změnit nebo
+    poškodit ho (viz "ZBÝVAJÍCÍ NEVYŘEŠENÉ RIZIKO" níž - právě proto
+    recept žádá i druhý `integrity_check` na finálním `db`). Dnešní `state.connect()` WAL nepoužívá
+    (viz `_snapshot_db` docstring), ale ROLLBACK journal (`-journal`)
+    ano - tenhle recept je vědomě jen dokumentovaný ruční postup pro
+    disaster recovery (main.py musí být zastavené), ne testovaná,
+    zamykaná příkazová obálka - plná automatizace obnovy je mimo rozsah
+    týhle spec o stylistickém průchodu.
+
+    ZBÝVAJÍCÍ NEVYŘEŠENÉ RIZIKO (kolo 17 IMPORTANT, přijato jako
+    zdokumentovaná mezera, ne dořešeno): i "po `os.replace`" pořadí má
+    svoje vlastní úzké okno - pád PO úspěšném `os.replace`, ale PŘED
+    smazáním starého sidecaru, nechá STARÝ (ke jménu `db`, ne k jeho
+    novému OBSAHU patřící) `-journal`/`-wal` ležet vedle ČERSTVĚ
+    obnoveného souboru. SQLite si sice hot journal ověřuje proti
+    change-counteru hlavního souboru před tím, než by ho aplikovalo (v
+    téhle relaci NEOVĚŘENO s jistotou přes dokumentaci - jen obecně
+    známá vlastnost formátu), takže nesedící journal by měl být
+    rozpoznán jako neplatný a zahozen, ne slepě aplikovaný - ale bez
+    přímého ověření tuhle záruku nelze brát jako jistotu. Praktická
+    obrana, co recept PŘIDÁVÁ (žádný nový kód, jen další krok ručního
+    postupu): PO dokončení `os.replace` i úklidu sidecarů otevřít
+    obnovenou `db` ČERSTVÝM spojením a spustit `PRAGMA integrity_check`
+    znovu (ne jen na `tmp_path` PŘED přejmenováním, ale i na FINÁLNÍM
+    `db` PO něm) - odhalí případné poškození z tohohle okna dřív, než se
+    člověk spolehne na "obnova proběhla"."""
+    if backup_state["done"]:
+        return
+    backup_path = db + ".pre-polish-backup"
+    os.replace(backup_state["snapshot_path"], backup_path)
+    # `done = True` HNED po `os.replace` (kolo 36 IMPORTANT), PŘED
+    # diagnostickým výpisem - jinak by `BrokenPipeError` z `print`
+    # udělal z úspěšné promoce `FatalRunError` a `_polish_one_chapter` by
+    # commit vůbec nezkusil. `_say` je navíc nevyhazující.
+    backup_state["done"] = True
+    _say(f"Záloha DB (stav před tímto během `polish`): {backup_path}")
+
+
 # --- příkazy ----------------------------------------------------------------
 
 def _cmd_init(args) -> int:

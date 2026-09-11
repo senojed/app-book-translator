@@ -1,4 +1,6 @@
 import os, json, sys
+import pytest
+import config
 import main
 from src import state
 
@@ -476,3 +478,98 @@ def test_rejection_integration_real_check_chapter_occurrence_increase(tmp_path):
     assert main._polish_rejected(base, after, cz_before, cz_after, grows) is True
     # bez nárůstu (stejný text před i po) -> nezamítnuto
     assert main._polish_rejected(base, base, cz_before, cz_before, grows) is False
+
+
+# --- Task 9: main._snapshot_db / _backup_db_once -----------------------------
+
+def test_snapshot_db_produces_logically_equal_copy(tmp_path):
+    src = str(tmp_path / "s.sqlite3")
+    state.init_db(src)
+    with state.connect(src) as conn:
+        conn.execute("INSERT INTO glossary (term_id,canonical_en,cz) VALUES ('t/a','A','Á')")
+    snap = str(tmp_path / "snap.sqlite3")
+    main._snapshot_db(src, snap)
+    with state.connect(snap) as conn:
+        rows = conn.execute("SELECT term_id FROM glossary").fetchall()
+    assert [r["term_id"] for r in rows] == ["t/a"]
+
+
+def test_snapshot_db_backup_called_with_pages_100(tmp_path, monkeypatch):
+    src = str(tmp_path / "s.sqlite3"); state.init_db(src)
+    seen = []
+    real_connect = main.sqlite3.connect
+
+    class _Proxy:
+        def __init__(self, real): self._real = real
+        def backup(self, dst, **kw):
+            seen.append(kw.get("pages"))
+            return self._real.backup(dst._real if isinstance(dst, _Proxy) else dst, **kw)
+        def __getattr__(self, n): return getattr(self._real, n)
+        def close(self): self._real.close()
+
+    monkeypatch.setattr(main.sqlite3, "connect", lambda p: _Proxy(real_connect(p)))
+    main._snapshot_db(src, str(tmp_path / "snap.sqlite3"))
+    assert 100 in seen
+
+
+def test_snapshot_db_deadline_interrupts(tmp_path, monkeypatch):
+    src = str(tmp_path / "s.sqlite3"); state.init_db(src)
+    real_connect = main.sqlite3.connect
+    times = iter([0.0, 100.0, 100.0, 100.0])
+    monkeypatch.setattr(main.time, "monotonic", lambda: next(times))
+
+    class _Proxy:
+        def __init__(self, real): self._real = real
+        def backup(self, dst, *, pages=None, progress=None):
+            progress(0, 5, 10)   # deadline check uvnitř vyhodí
+        def __getattr__(self, n): return getattr(self._real, n)
+        def close(self): self._real.close()
+
+    monkeypatch.setattr(main.sqlite3, "connect", lambda p: _Proxy(real_connect(p)))
+    with pytest.raises(TimeoutError):
+        main._snapshot_db(src, str(tmp_path / "snap.sqlite3"))
+
+
+def test_snapshot_db_integrity_check_failure_raises_oserror(tmp_path, monkeypatch):
+    src = str(tmp_path / "s.sqlite3"); state.init_db(src)
+    real_connect = main.sqlite3.connect
+    calls = {"n": 0}
+
+    class _Proxy:
+        def __init__(self, real): self._real = real
+        def execute(self, sql, *a):
+            if "integrity_check" in sql:
+                class _C:
+                    def fetchone(self): return ("not ok",)
+                return _C()
+            return self._real.execute(sql, *a)
+        def backup(self, dst, **kw): return self._real.backup(dst._real, **kw)
+        def __getattr__(self, n): return getattr(self._real, n)
+        def close(self): self._real.close()
+
+    monkeypatch.setattr(main.sqlite3, "connect", lambda p: _Proxy(real_connect(p)))
+    with pytest.raises(OSError):
+        main._snapshot_db(src, str(tmp_path / "snap.sqlite3"))
+
+
+def test_backup_db_once_promotes_snapshot_atomically(tmp_path):
+    db = str(tmp_path / "state.sqlite3"); state.init_db(db)
+    snap = db + ".pre-polish-snapshot"
+    main._snapshot_db(db, snap)
+    bs = {"done": False, "snapshot_path": snap}
+    main._backup_db_once(db, bs)
+    assert bs["done"] is True
+    assert os.path.exists(db + ".pre-polish-backup")
+    assert not os.path.exists(snap)
+    # druhé volání je no-op
+    main._backup_db_once(db, bs)
+
+
+def test_backup_db_once_promotion_survives_broken_print(tmp_path, monkeypatch):
+    db = str(tmp_path / "state.sqlite3"); state.init_db(db)
+    snap = db + ".pre-polish-snapshot"
+    main._snapshot_db(db, snap)
+    monkeypatch.setattr("builtins.print", lambda *a, **k: (_ for _ in ()).throw(BrokenPipeError()))
+    bs = {"done": False, "snapshot_path": snap}
+    main._backup_db_once(db, bs)   # nesmí vyhodit
+    assert bs["done"] is True and os.path.exists(db + ".pre-polish-backup")
