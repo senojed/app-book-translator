@@ -642,6 +642,24 @@ def _polish_one_chapter(c, glossary_rows, cf, db, model: str, guide_block: str,
             for r in reasons:
                 _say(f"    - [{r.get('source', '?')}/{r.get('type', '?')}] "
                      f"{r.get('issue') or '(bez popisu)'}")
+            # Kritik někdy vrátí verdict="revise", ale všechny JEDNOTLIVÉ
+            # nálezy má jako "minor" (action="note") - tenhle rozpor
+            # `critic.review()` odchytí a připojí syntetický `critical`
+            # nález (ten je výš v `reasons`), ale samotné minor nálezy do
+            # `reasons` NEJDOU (nejsou action=="revise"). Bez tohohle bloku
+            # by na konzoli zůstala jen obecná hláška "rozpor v odpovědi
+            # modelu" a skutečný DŮVOD kritikovy nespokojenosti (konkrétní
+            # věty, co ho zarazily) by byl vidět jen v JSON reportu
+            # (`findings`), ne tady - i když jde o stejně užitečnou
+            # informaci pro posouzení, jestli byl reject oprávněný.
+            context = [f for f in findings
+                      if f.get("source") == "critic" and f not in reasons]
+            if context:
+                _say("    (kontext od kritika - samo o sobě nezpůsobilo "
+                     "zamítnutí, ale vysvětluje rozpor výš):")
+                for f in context:
+                    _say(f"      - [{f.get('severity', '?')}] "
+                         f"{f.get('issue') or '(bez popisu)'}")
         rec = {"idx": idx, "outcome": "rejected", "reason_types": reason_types}
         if full:
             rec["reasons"] = reasons

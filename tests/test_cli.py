@@ -717,6 +717,30 @@ def test_polish_one_chapter_rejected_full_detail_when_opted_in(tmp_path, monkeyp
     assert "reasons" in rec and "findings" in rec
 
 
+def test_polish_one_chapter_prints_critic_minor_findings_as_context(tmp_path, monkeypatch, capsys):
+    """Kritik vrátí verdict="revise" s jen `minor`/`note` nálezy - `critic.review()`
+    to synteticky odmítne (kritický nález bez konkrétního textu), ale samotné
+    minor nálezy (konkrétní věty, co kritika zarazily) MUSÍ jít vidět na
+    konzoli jako kontext, ne jen v JSON reportu - jinak uživatel neví, co
+    kritikovi vadilo, jen že mu "něco" vadilo."""
+    from src.llm.client import Completion, FakeLLMClient
+    db = _polish_db(tmp_path)
+    monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: "Jina uplne jina veta.")
+    monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
+    monkeypatch.setattr(config, "STYLIST_REPORT_REJECTED_TEXT", True)
+    resp = json.dumps({"verdict": "revise", "findings": [
+        {"severity": "minor", "type": "fidelity", "cz_excerpt": "Harry Dresdene",
+         "issue": "PRIDANE PRIJMENI CO NENI V ORIGINALE", "suggestion": "Harry"}]})
+    def _cf(agent):
+        return FakeLLMClient([Completion(resp, False, 5, 5)])
+    rec = main._polish_one_chapter(_c(), [], _cf, db, "m", "", ["codex"], _bs(db))
+    assert rec["outcome"] == "rejected"
+    out = capsys.readouterr().out
+    assert "PRIDANE PRIJMENI CO NENI V ORIGINALE" in out
+    assert any(f.get("issue") == "PRIDANE PRIJMENI CO NENI V ORIGINALE"
+              for f in rec["findings"])
+
+
 def test_polish_one_chapter_commit_failure_is_fatal_redacted(tmp_path, monkeypatch):
     db = _polish_db(tmp_path)
     monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Vylepšená věta.")
