@@ -65,3 +65,24 @@ def test_unparseable_lock_is_treated_as_stale(tmp_path):
     lp = str(tmp_path / ".lock")
     open(lp, "w").write("{tohle neni json")
     state.acquire_lock(lp)  # nesmí spadnout na parseru
+
+
+def test_chapter_mentions_returns_only_that_chapter_in_insert_order(tmp_path):
+    db = _db(tmp_path)
+    state.seed_chapters(db, [_Ch(1), _Ch(2)])
+    # glosář musí mít term_id kvůli FK
+    with state.connect(db) as conn:
+        conn.execute("INSERT INTO glossary (term_id,canonical_en,cz) VALUES "
+                     "('t/a','A','Á'),('t/b','B','Bé')")
+    state.replace_term_mentions(db, 1, [
+        {"term_id": "t/a", "cz_form": "Áčko", "scene_idx": 0, "source": "rendered"},
+        {"term_id": "t/b", "cz_form": "Béčko", "scene_idx": 1, "source": "detected"},
+    ])
+    state.replace_term_mentions(db, 2, [
+        {"term_id": "t/a", "cz_form": "jiné", "scene_idx": 0, "source": "rendered"},
+    ])
+    rows = state.chapter_mentions(db, 1)
+    assert [r["term_id"] for r in rows] == ["t/a", "t/b"]
+    assert rows[0]["source"] == "rendered" and rows[1]["source"] == "detected"
+    assert rows[0]["cz_form"] == "Áčko"
+    assert len(state.chapter_mentions(db, 2)) == 1

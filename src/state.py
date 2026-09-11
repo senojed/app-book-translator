@@ -432,6 +432,18 @@ def chapters_mentioning_term(db_path: str, term_id: str,
     return [r["idx"] for r in rows]
 
 
+def chapter_mentions(db_path: str, chapter_idx: int) -> list:
+    """Mentions JEDNÉ kapitoly - na rozdíl od `all_term_mentions`
+    (agregátní, přes víc kapitol) tohle `polish` potřebuje jako VSTUP pro
+    `concordance.check_chapter`/`build_mentions` (rendered_terms), aby
+    nepřišel o termíny zachycené jen translatorovým vlastním hlášením."""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT term_id, cz_form, scene_idx, source FROM term_mentions "
+            "WHERE chapter_idx=? ORDER BY id", (chapter_idx,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def all_term_mentions(db_path: str, statuses=("done", "flagged")) -> list:
     """Podklad pro drift check - jen kapitoly, jejichž překlad platí."""
     marks = ",".join("?" * len(statuses))
