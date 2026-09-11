@@ -87,7 +87,10 @@ REFERENCE_COOCCUR_RATIO = 0.5   # podíl dílů, kde musí sedět souvýskyt
 # Prázdné = `polish` odmítne běžet (auditní záznam potřebuje vědět, JAKÝ
 # model se skutečně použil - "necháme na výchozím CLI" by časem přestalo
 # být dohledatelné, viz kolo 2 plan-consensus review).
-CODEX_MODEL = ""
+# Nastaveno na "gpt-5.6-terra" - uživatelův ChatGPT-auth Codex účet
+# odmítá "gpt-5-codex" (400 invalid_request_error), viz ověření v
+# docs/superpowers/specs/2026-09-08-stylist-agent-design.md.
+CODEX_MODEL = "gpt-5.6-terra"
 # Timeout na jedno volání `codex exec` (kolo 17 IMPORTANT). `stylist.
 # polish`'s parametr `timeout` je od kola 22 `= None` a bez explicitní
 # hodnoty spadne SEM (dřív byl natvrdo `= 180`, veřejné volání config
@@ -115,7 +118,10 @@ STYLIST_MAX_CHARS = 60_000
 # riziko". Migrace na bezpečnější variantu (neagentní API bez nástrojů,
 # nebo OS/kontejnerová izolace) tohle celé nahradí - viz sekce
 # "Bezpečnostní rozhodnutí (kolo 19)" níže.
-STYLIST_ACCEPT_FS_RISK = False
+# Vlastníkovo vědomé rozhodnutí (2026-09-11): riziko přijato pro osobní
+# použití na tomhle stroji, po ověření canary testem (viz spec sekce
+# "Manuální ověření" - na tomhle Codex CLI/účtu čtení mimo -C odmítnuto).
+STYLIST_ACCEPT_FS_RISK = True
 # Kolo 27-37 - report běhu `polish` (`polish-reports/run-*.json`).
 # `False` (DEFAULT) = u ZÁMÍTNUTÝCH (`rejected`) kapitol report nese JEN
 # `reason_types` (normalizované kategorie `"source/type"`), žádná volná
