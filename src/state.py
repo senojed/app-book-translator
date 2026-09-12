@@ -288,14 +288,82 @@ def _lock_is_live(lock_path: str) -> bool:
     return _pid_alive(pid)
 
 
-def acquire_lock(lock_path: str) -> None:
-    import datetime
+def _write_lock_tmp(lock_path: str, payload: dict) -> str:
+    """Zapíše payload do UNIKÁTNÍHO tmp souboru (spec kolo 16 - sdílená
+    pevná tmp cesta by dva souběžní volající - heartbeat vlákno +
+    synchronní refresh requestu - mohli navzájem poškodit interleaved
+    zápisy) a vrátí jeho cestu, NEpublikuje ještě nic na `lock_path`.
+    Selže-li samotný ZÁPIS, tmp soubor se úklidí (kolo 2 plán-ping-pongu
+    IMPORTANT, stejný princip jako `_atomic_write_json`). `flush()`+
+    `os.fsync()` před uzavřením (kolo 6 plán-ping-pongu NIT, stejný
+    princip jako `_atomic_write_json`)."""
     import json as _json
+    import threading
+    import uuid
+    directory = os.path.dirname(lock_path) or "."
+    tmp = os.path.join(
+        directory, f".{os.path.basename(lock_path)}."
+                  f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(_json.dumps(payload))
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return tmp
+
+
+def _publish_lock_exclusive(lock_path: str, payload: dict) -> None:
+    """PRVOTNÍ publikace zámku - `os.rename` na Windows selže
+    (`FileExistsError`), pokud `lock_path` UŽ existuje, což je tu
+    ŽÁDOUCÍ (exkluzivita, ne jen atomicita zápisu - spec kolo 14). Tmp
+    soubor se úklidí při JAKÉMKOLI selhání publikace, ne jen očekávaném
+    `FileExistsError` (kolo 2 plán-ping-pongu IMPORTANT)."""
+    tmp = _write_lock_tmp(lock_path, payload)
+    try:
+        os.rename(tmp, lock_path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _publish_lock_overwrite(lock_path: str, payload: dict) -> None:
+    """REFRESH zámku, co UŽ vlastníme (kolo 1 BLOCKING plán-ping-pongu -
+    `os.rename` by tu VŽDY selhalo, protože `lock_path` cílevědomě
+    existuje a patří NÁM; `os.replace` je tu správně, protože
+    vlastnictví se ověřuje SAMOSTATNĚ, PŘED voláním týhle funkce). Tmp
+    soubor se úklidí i při selhání `os.replace` (kolo 2 plán-ping-pongu
+    IMPORTANT)."""
+    tmp = _write_lock_tmp(lock_path, payload)
+    try:
+        os.replace(tmp, lock_path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def acquire_lock(lock_path: str) -> None:
+    """Existence souboru jako mutex - `os.rename` na existující cíl na
+    Windows selže (`FileExistsError`), takže publikace je i exkluzivní
+    (ne jen atomická). Zbytkové riziko: dva procesy mohou NEZÁVISLE
+    vyhodnotit stejný STARÝ zámek jako mrtvý a oba se ho pokusit
+    převzít - to tenhle fix NEŘEŠÍ (spec kolo 15, mimo rozsah - vyžaduje
+    skutečný OS-level zámek nebo DB transakci)."""
+    import datetime
     os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
     for _ in range(3):
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
+        if os.path.exists(lock_path):
             if _lock_is_live(lock_path):
                 raise LockError(
                     f"Běží jiný příkaz (zámek {lock_path}). Počkej na jeho konec.")
@@ -303,16 +371,65 @@ def acquire_lock(lock_path: str) -> None:
                 os.unlink(lock_path)   # zastaralý zámek přebíráme
             except FileNotFoundError:
                 pass
-            continue
-        payload = _json.dumps({"pid": os.getpid(),
-                               "ts": datetime.datetime.now().isoformat()})
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(payload)
-        return
+        try:
+            _publish_lock_exclusive(
+                lock_path, {"pid": os.getpid(), "ts": datetime.datetime.now().isoformat()})
+            return
+        except FileExistsError:
+            continue   # někdo jiný publikoval mezitím - zkus znovu
     raise LockError(f"Zámek {lock_path} se nepodařilo získat.")
 
 
+def refresh_lock(lock_path: str) -> None:
+    """Přepíše `ts` v zámku, co UŽ vlastníme - pro dlouho běžící server
+    (`polish-review`), co potřebuje přežít `_LOCK_STALE_SECONDS` (spec
+    kolo 2/3/7). Ověří vlastnictví (PID v souboru == náš PID) PŘED
+    zápisem - jinak by refresh mohl přepsat zámek, co mezitím legitimně
+    převzal jiný proces (spec kolo 3). TOCTOU mezi čtením a zápisem
+    zůstává zdokumentované zbytkové riziko (spec kolo 4/15), ne řešeno
+    tady. Selhání zápisu (`_publish_lock_overwrite`) je ZAHRNUTÉ ve
+    STEJNÉM `try` jako čtení (kolo 11 plán-ping-pongu IMPORTANT - dřív
+    zápis běžel MIMO `try`, takže obyčejný `OSError` z `os.replace`
+    - plný disk, práva - propadl jako SUROVÝ `OSError`, ne `LockError`,
+    a heartbeat/`_require_lock`'s `except state.LockError` by ho vůbec
+    nezachytily; ztráta zámku musí být VŽDY `LockError`, ať volající
+    kód má JEDNO místo, kde ji chytit)."""
+    import datetime
+    import json as _json
+    try:
+        with open(lock_path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        owner_pid = int(data["pid"])
+        if owner_pid != os.getpid():
+            raise LockError(f"Zámek {lock_path} teď vlastní jiný proces "
+                            f"(pid={owner_pid}) - ztratili jsme vlastnictví.")
+        _publish_lock_overwrite(
+            lock_path, {"pid": os.getpid(), "ts": datetime.datetime.now().isoformat()})
+    except (OSError, ValueError, KeyError) as e:
+        raise LockError(f"Zámek {lock_path} zmizel, je nečitelný, nebo se "
+                        f"nepodařilo obnovit ({type(e).__name__}: {e}) - "
+                        "ztratili jsme vlastnictví.") from e
+
+
 def release_lock(lock_path: str) -> None:
+    """Neshoda vlastnictví (PID v souboru != náš) → NEmazat - je to teď
+    cizí, legitimní zámek (spec kolo 3). Nečitelný/poškozený OBSAH
+    existujícího souboru taky NEmazat (kolo 2 plán-ping-pongu BLOCKING -
+    dřív `except: pass` pokračovalo na `os.unlink` bez ohledu na to, co
+    se stalo výš - přesně to, co má tenhle vlastnický check zabránit,
+    obcházené vlastní chybovou větví). JEN "soubor vůbec neexistuje" je
+    legitimní no-op (nic k mazání, žádná neshoda vlastnictví se neřeší)."""
+    import json as _json
+    try:
+        with open(lock_path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        owner_pid = int(data["pid"])
+    except FileNotFoundError:
+        return   # nic tu není, nic k mazání
+    except (OSError, ValueError, KeyError):
+        return   # existuje, ale je nečitelný/poškozený - NEmazat, nemůžeme ověřit vlastnictví
+    if owner_pid != os.getpid():
+        return   # cizí, legitimní zámek
     try:
         os.unlink(lock_path)
     except FileNotFoundError:
