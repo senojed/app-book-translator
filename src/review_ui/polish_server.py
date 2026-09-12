@@ -229,11 +229,26 @@ def build_app(db_path: str, draft_path: str, history_path: str, lock_path: str) 
         if idx is not None:
             hist_out = [e for e in history if e["idx"] == idx]
         else:
-            # Řazení VŽDY podle parsovaného data, nikdy syrového řetězce
-            # (spec kolo 5/8 - `isoformat()` vynechává mikrosekundy, když
-            # jsou přesně 0, což by lexikografické řazení mohlo rozbít).
-            hist_out = sorted(history, key=lambda e: polish_store.parse_z(e["applied_at"]),
-                              reverse=True)[:20]
+            # Řazení VŽDY podle (parsovaného data, POZICE v poli), nikdy
+            # jen podle syrového řetězce (spec kolo 5/8 - `isoformat()`
+            # vynechává mikrosekundy, když jsou přesně 0, což by
+            # lexikografické řazení mohlo rozbít) ANI jen podle
+            # parsovaného data samotného (code review nález IMPORTANT -
+            # dva záznamy stejného idx mohou mít IDENTICKÝ `applied_at`
+            # string - časové rozlišení není dost jemné - a `sorted`
+            # je STABILNÍ, takže by shodné klíče nechal v PŮVODNÍM
+            # pořadí; `_annotate_history` níž ale "nejnovější" určuje
+            # přes `find_latest`, co je definuje VÝHRADNĚ podle POZICE
+            # v poli, nikdy podle času - kdyby se dvě řazení touhle
+            # tiebreak logikou rozešla, `history[0]` by ukázal STARŠÍ
+            # záznam BEZ revert tlačítek, zatímco skutečně nejnovější
+            # (anotovaný tlačítky) by skončil níž). Pozice v `history`
+            # je tak SOUČÁSTÍ klíče, ne jen záložní - `find_latest`'s
+            # "nejnovější" napodobuje přesně.
+            hist_out = sorted(enumerate(history),
+                              key=lambda p: (polish_store.parse_z(p[1]["applied_at"]), p[0]),
+                              reverse=True)
+            hist_out = [e for _, e in hist_out][:20]
         return {"chapters": chapters, "history": _annotate_history(db_path, history, hist_out)}
 
     app.state.write_lock = write_lock
@@ -267,7 +282,13 @@ def run_polish_review_server(db_path: str, draft_path: str, history_path: str,
         print(f"Polish review UI běží na {url} - zavři okno nebo Ctrl-C, až budeš hotov.")
         try:
             server.run()
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, SystemExit):
+            # `SystemExit` (code review nález IMPORTANT) - uvicorn 0.44
+            # volá `sys.exit(1)` uvnitř `Server.startup()`, když se
+            # nepodaří nabindovat port (adresa už obsazená apod.); bez
+            # tyhle větve by `SystemExit` propagoval MIMO tuhle funkci a
+            # porušil garanci "vrací VŽDY 0" ze spec (`finally` níž by
+            # sice ještě proběhl, ale samotný `return 0` už ne).
             pass
     finally:
         # Zastav heartbeat a POČKEJ, až doopravdy skončí (kolo 14

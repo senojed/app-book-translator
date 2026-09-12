@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import pytest
 from fastapi.testclient import TestClient
 from src import polish_store, state
@@ -72,6 +73,58 @@ def test_get_polish_returns_pending_and_history(tmp_path):
     body = r.json()
     assert body["chapters"][0]["idx"] == 1
     assert body["history"] == []
+
+
+def test_heartbeat_thread_calls_refresh_lock_periodically(tmp_path, monkeypatch):
+    """Code review nález IMPORTANT (Task 8 review kolo 1) - dřív nic
+    neověřovalo, že heartbeat vlákno SKUTEČNĚ volá `state.refresh_lock`
+    (jen že po ztraceném zámku existuje terminální stav, ne že se
+    zámek za normálního běhu doopravdy periodicky obnovuje). Zrychlí
+    interval na 10 ms (monkeypatch PŘED `build_app`, protože heartbeat
+    vlákno startuje UVNITŘ `build_app`) a čeká na SKUTEČNÉ volání přes
+    `threading.Event`, ne přes spánek/polling s pevnou dobou."""
+    db = _db(tmp_path, chapters=1)
+    draft_path = str(tmp_path / "polish.draft.json")
+    history_path = str(tmp_path / "polish.history.json")
+    lock_path = str(tmp_path / ".lock")
+    state.acquire_lock(lock_path)
+    monkeypatch.setattr(polish_server, "_LOCK_REFRESH_INTERVAL", 0.01)
+    real_refresh_lock = state.refresh_lock
+    called = threading.Event()
+
+    def _spy(path):
+        real_refresh_lock(path)
+        called.set()
+    monkeypatch.setattr(polish_server.state, "refresh_lock", _spy)
+
+    app = polish_server.build_app(db, draft_path, history_path, lock_path)
+    _LIVE_APPS.append(app)
+    assert called.wait(timeout=2) is True
+    assert app.state.require_lock() is True   # zámek zůstává zdravý
+
+
+def test_heartbeat_lock_error_sets_lock_lost_and_shutdown(tmp_path, monkeypatch):
+    """Code review nález IMPORTANT (Task 8 review kolo 1) - dřív žádný
+    test nepokrýval PŘECHOD do ztraceného stavu (jen stav PO něm).
+    Ověřuje, že `state.LockError` z heartbeatu skutečně nastaví
+    `lock_lost` I `shutdown` (probuzení vlákna okamžitě, kolo 14), a že
+    `_require_lock()` po tomhle přechodu vrátí `False`."""
+    db = _db(tmp_path, chapters=1)
+    draft_path = str(tmp_path / "polish.draft.json")
+    history_path = str(tmp_path / "polish.history.json")
+    lock_path = str(tmp_path / ".lock")
+    state.acquire_lock(lock_path)
+    monkeypatch.setattr(polish_server, "_LOCK_REFRESH_INTERVAL", 0.01)
+
+    def _boom(path):
+        raise state.LockError("zámek ztracen (simulováno testem)")
+    monkeypatch.setattr(polish_server.state, "refresh_lock", _boom)
+
+    app = polish_server.build_app(db, draft_path, history_path, lock_path)
+    _LIVE_APPS.append(app)
+    assert app.state.lock_lost.wait(timeout=2) is True
+    assert app.state.shutdown_heartbeat.is_set() is True
+    assert app.state.require_lock() is False
 
 
 def test_require_lock_is_terminal_after_lock_lost(tmp_path, monkeypatch):
@@ -253,10 +306,17 @@ def test_get_polish_shows_can_revert_original_at_chain_length_two(tmp_path):
     with state.connect(db) as conn:
         conn.execute("UPDATE chapters SET translated_text='B' WHERE idx=1")
     polish_store.save_history(history_path, {"schema_version": 1, "entries": [
-        {"idx": 1, "applied_at": polish_store.utc_now_z(), "cz_before": "X",
+        # Explicitně ROZDÍLNÉ `applied_at` (code review nález IMPORTANT -
+        # dva bare `utc_now_z()` volání za sebou mohou dát IDENTICKÝ
+        # string, protože časové rozlišení není dost jemné; test by pak
+        # se ~7% šancí ověřoval `history[0]` == STARŠÍ záznam místo
+        # zamýšleného nejnovějšího). Stejný princip jako sousední test
+        # `test_get_polish_idx_filter_flags_latest_regardless_of_array_
+        # position` výš.
+        {"idx": 1, "applied_at": "2026-01-01T00:00:00Z", "cz_before": "X",
          "cz_after": "A", "styled_by_codex": "A", "title": "K1", "findings": [],
          "rendered_terms": [], "source": "polish-review", "draft_id": "draft-1a"},
-        {"idx": 1, "applied_at": polish_store.utc_now_z(), "cz_before": "A",
+        {"idx": 1, "applied_at": "2026-01-02T00:00:00Z", "cz_before": "A",
          "cz_after": "B", "styled_by_codex": "B", "title": "K1", "findings": [],
          "rendered_terms": [], "source": "polish-review", "draft_id": "draft-1b"}]})
     client = TestClient(app)
@@ -360,3 +420,28 @@ def test_run_polish_review_server_stops_heartbeat_before_returning(tmp_path, mon
     rc = polish_server.run_polish_review_server(db, draft_path, history_path, lock_path)
     assert rc == 0
     assert captured["app"].state.heartbeat_thread.is_alive() is False
+
+
+def test_run_polish_review_server_returns_0_when_bind_raises_systemexit(tmp_path, monkeypatch):
+    """Code review nález IMPORTANT (Task 8 review kolo 1) - uvicorn volá
+    `sys.exit(1)` uvnitř `Server.startup()`, když selže bind (port už
+    obsazený apod.). Bez `except (KeyboardInterrupt, SystemExit)` by
+    `SystemExit` propagoval MIMO funkci a porušil garanci "vrací VŽDY
+    0" ze spec - `finally` (úklid snapshotu/heartbeatu) by sice proběhl,
+    ale `return 0` už ne."""
+    db = _db(tmp_path, chapters=1)
+    draft_path = str(tmp_path / "polish.draft.json")
+    history_path = str(tmp_path / "polish.history.json")
+    lock_path = str(tmp_path / ".lock")
+
+    class _FakeServer:
+        def __init__(self, config): pass
+        def run(self):
+            raise SystemExit(1)   # simuluje selhání bindu uvnitř uvicorn
+
+    monkeypatch.setattr("uvicorn.Server", _FakeServer)
+    monkeypatch.setattr(polish_server.threading, "Timer",
+                        lambda *a, **k: type("T", (), {"start": lambda self: None})())
+    rc = polish_server.run_polish_review_server(db, draft_path, history_path, lock_path)
+    assert rc == 0
+    assert not os.path.exists(db + ".pre-polish-review-snapshot")
