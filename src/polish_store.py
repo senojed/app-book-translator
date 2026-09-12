@@ -191,3 +191,86 @@ def save_draft(path: str, data: dict) -> None:
 
 def is_draft_pending(path: str) -> bool:
     return bool(load_draft(path)["chapters"])
+
+
+def _validate_history_payload(path: str, data) -> None:
+    """Sdílená validace pro `load_history` i `save_history` - stejný
+    princip jako `_validate_draft_payload` (kolo 1 plán-ping-pongu NIT)."""
+    if not isinstance(data, dict):
+        raise PolishStoreError(f"{path}: kořen musí být objekt.")
+    if not _is_exact_schema_version(data.get("schema_version"), HISTORY_SCHEMA_VERSION):
+        raise PolishStoreError(f"{path}: neznámý/chybějící schema_version.")
+    entries = data.get("entries")
+    if not isinstance(entries, list):
+        raise PolishStoreError(f"{path}: entries musí být pole.")
+    for e in entries:
+        _validate_record(e, _HISTORY_ENTRY_FIELDS, what=f"{path}: historický záznam")
+        # Neprázdný `draft_id` (kolo 15 plán-ping-pongu IMPORTANT, stejný
+        # princip jako draftové `draft_id` - kolo 11) - `_stale_info`
+        # matchuje `already_committed_has_history` PODLE TOHOTO pole,
+        # aby se vyhnula stejné třídě kolize jako kolo 10 (nesouvisející
+        # starší záznam se STEJNÝM textem by jinak falešně "vysvětlil"
+        # DB stav pro CIZÍ draft).
+        if not e["draft_id"]:
+            raise PolishStoreError(f"{path}: draft_id nesmí být prázdný.")
+        # Element-level typy (kolo 1 plán-ping-pongu IMPORTANT, stejná
+        # mezera jako u draftu - viz `_validate_draft_payload`):
+        _validate_dict_list(e["findings"], "findings", f"{path}: historický záznam")
+        _validate_dict_list(e["rendered_terms"], "rendered_terms", f"{path}: historický záznam")
+        if e["source"] not in _VALID_HISTORY_SOURCES:
+            raise PolishStoreError(f"{path}: neplatný source {e['source']!r}.")
+        if not _is_utc_z(e["applied_at"]):
+            raise PolishStoreError(
+                f"{path}: applied_at musí být UTC s koncovým 'Z' ({e['applied_at']!r}).")
+
+
+def load_history(path: str) -> dict:
+    if not os.path.exists(path):
+        return {"schema_version": HISTORY_SCHEMA_VERSION, "entries": []}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        raise PolishStoreError(f"{path}: neplatný JSON ({e}).") from e
+    _validate_history_payload(path, data)
+    return data
+
+
+def save_history(path: str, data: dict) -> None:
+    """Validuje STEJNÝMI pravidly jako `load_history` PŘED zápisem
+    (kolo 1 plán-ping-pongu NIT)."""
+    _validate_history_payload(path, data)
+    _atomic_write_json(path, data)
+
+
+def find_latest(entries: list, idx: int) -> "dict | None":
+    """Poslední záznam pro `idx` PODLE POZICE v poli, nikdy podle
+    `applied_at` (spec kolo 6 - zápisy jsou vždy sekvenční, srovnání času
+    může u dvou náhodně identických timestampů vybrat špatný)."""
+    for e in reversed(entries):
+        if e["idx"] == idx:
+            return e
+    return None
+
+
+def find_chain_start(entries: list, idx: int) -> "dict | None":
+    """Začátek SOUVISLÉHO řetězce končícího posledním záznamem pro `idx`
+    (spec kolo 20) - NENÍ prostě "úplně první záznam pro idx", historie
+    může mít mezery od `answer`/`run` epizod mimo `polish` workflow."""
+    idx_entries = [e for e in entries if e["idx"] == idx]
+    if not idx_entries:
+        return None
+    start = idx_entries[-1]
+    for older in reversed(idx_entries[:-1]):
+        if older["cz_after"] != start["cz_before"]:
+            break
+        start = older
+    return start
+
+
+def resolve_revert_target(entries: list, idx: int, to: str) -> "str | None":
+    if to == "original":
+        start = find_chain_start(entries, idx)
+        return start["cz_before"] if start else None
+    latest = find_latest(entries, idx)
+    return latest["cz_before"] if latest else None
