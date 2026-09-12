@@ -3,6 +3,7 @@ import pytest
 import config
 import main
 from src import state
+from src import polish_store
 
 
 def _run(argv, tmp_path, monkeypatch):
@@ -620,8 +621,8 @@ def _read_only_report(dirpath):
 
 def test_write_polish_report_shape(tmp_path):
     db = str(tmp_path / "state.sqlite3"); state.init_db(db)
-    report = [{"idx": 1, "outcome": "polished"},
-              {"idx": 2, "outcome": "rejected", "reason_types": ["critic/critic_failed"]},
+    report = [{"idx": 1, "outcome": "drafted", "reason_types": []},
+              {"idx": 2, "outcome": "unchanged"},
               {"idx": 3, "outcome": "failed", "error": "boom"}]
     main._write_polish_report(db, 7, report, codex_model="gpt-5-codex",
                               planned_count=4, batch_completed=True, run_status="ok")
@@ -631,7 +632,7 @@ def test_write_polish_report_shape(tmp_path):
     assert r["planned_count"] == 4 and r["attempted_count"] == 3
     assert r["batch_completed"] is True and r["run_status"] == "ok"
     assert r["run_error"] is None and r["finalization_error"] is None
-    assert r["summary"] == {"polished": 1, "unchanged": 0, "rejected": 1,
+    assert r["summary"] == {"drafted": 1, "unchanged": 1,
                             "failed": 1, "fatal": 0, "interrupted": 0}
     assert r["generated_at"]
 
@@ -848,7 +849,7 @@ def test_polish_one_chapter_forwards_only_rendered_mentions_as_rendered_terms(tm
     assert rec["rendered_terms"] == [{"term_id": "t/a", "cz_as_used": "Áčko", "scene_idx": 0}]
 
 
-# --- Task 12: main._cmd_polish + registrace příkazu --------------------------
+# --- main._cmd_polish + registrace příkazu ----------------------------------
 
 class _Args:
     def __init__(self, only=None, force=False):
@@ -861,6 +862,7 @@ def _polish_env(tmp_path, monkeypatch, n_done=1):
     monkeypatch.setattr(config, "STYLIST_ACCEPT_FS_RISK", True)
     monkeypatch.setattr(config, "CODEX_MODEL", "gpt-5-codex")
     monkeypatch.setattr(config, "GUIDE_PATH", str(tmp_path / "guide.json"))
+    monkeypatch.setattr(config, "POLISH_DRAFT_PATH", str(tmp_path / "polish.draft.json"))
     state.init_db(config.DB_PATH)
     with state.connect(config.DB_PATH) as conn:
         for i in range(1, n_done + 1):
@@ -875,8 +877,6 @@ def _polish_env(tmp_path, monkeypatch, n_done=1):
     monkeypatch.setattr(main.pipeline, "_run_critic", lambda *a, **k: ([], False))
     monkeypatch.setattr(main.stylist, "check_meaning_preserved", lambda *a, **k: [])
     monkeypatch.setattr(main, "_client_factory", lambda rid, *, interactive: (lambda a: object()))
-    # `_print_usage` se ZÁMĚRNĚ NEmockuje - reálná verze jen čte prázdné llm_calls
-    # z testovací DB a vypíše 0; test rozbitého stdout ji tak skutečně projede.
     return config.DB_PATH
 
 
@@ -910,23 +910,87 @@ def test_cmd_polish_preflight_failure_returns_1(tmp_path, monkeypatch):
     assert main._cmd_polish(_Args()) == 1
 
 
-def test_cmd_polish_happy_path_polishes_and_reports(tmp_path, monkeypatch):
+def test_cmd_polish_preflight_rejects_pending_draft(tmp_path, monkeypatch):
+    db = _polish_env(tmp_path, monkeypatch)
+    polish_store.save_draft(config.POLISH_DRAFT_PATH, {
+        "schema_version": 1, "generated_at": polish_store.utc_now_z(),
+        "codex_model": "m", "chapters": [{
+            "idx": 99, "title": "Old", "cz_before": "a", "styled": "b",
+            "revision_rounds": 0, "reason_types": [], "findings": [],
+            "rendered_terms": [], "draft_id": "draft-99"}]})
+    def _boom(*a, **k): raise AssertionError("polish nemá běžet s nevyřízeným draftem")
+    monkeypatch.setattr(main.stylist, "polish", _boom)
+    assert main._cmd_polish(_Args()) == 1
+
+
+def test_cmd_polish_preflight_corrupt_draft_returns_1_not_traceback(tmp_path, monkeypatch):
+    """Kolo 1 plán-ping-pongu BLOCKING - `PolishStoreError` z poškozeného
+    draftu se musí chytit v preflightu, ne propadnout jako traceback."""
+    db = _polish_env(tmp_path, monkeypatch)
+    open(config.POLISH_DRAFT_PATH, "w", encoding="utf-8").write("{not valid json")
+    def _boom(*a, **k): raise AssertionError("polish nemá běžet s poškozeným draftem")
+    monkeypatch.setattr(main.stylist, "polish", _boom)
+    assert main._cmd_polish(_Args()) == 1
+
+
+def test_cmd_polish_survives_fatal_midbatch_draft_already_has_first_chapter(tmp_path, monkeypatch):
+    """Spec kolo 1 IMPORTANT - INKREMENTÁLNÍ zápis draftu musí přežít pád
+    UPROSTŘED dávky: kapitola 1 se stihne zapsat do polish.draft.json
+    dřív, než kapitola 2 shodí celý běh přes FatalRunError."""
+    db = _polish_env(tmp_path, monkeypatch, n_done=2)
+    # Kapitola 1 projde normálně, kapitola 2 spadne přes kritika s
+    # `FatalRunError` - přesně cesta, co `_cmd_polish` propaguje ven
+    # z per-kapitolové smyčky a zastaví celou dávku.
+    from src.llm.client import FatalRunError as _FRE
+    seen = {"n": 0}
+    def _crit(*a, **k):
+        seen["n"] += 1
+        if seen["n"] == 2:
+            raise _FRE("cost guard")
+        return ([], False)
+    monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: cz + " uprav")
+    monkeypatch.setattr(main.pipeline, "_run_critic", _crit)
+    assert main._cmd_polish(_Args()) == 1
+    draft = polish_store.load_draft(config.POLISH_DRAFT_PATH)
+    assert {c["idx"] for c in draft["chapters"]} == {1}   # kapitola 1 PŘEŽILA pád na kapitole 2
+
+
+def test_cmd_polish_save_draft_non_oserror_failure_still_recorded_in_report(tmp_path, monkeypatch):
+    """Kolo 4 plán-ping-pongu IMPORTANT - `save_draft` selhání JINÉ než
+    `OSError` (např. `PolishStoreError`/`TypeError`) se musí zabalit do
+    `FatalRunError` STEJNĚ jako OSError, A kapitola musí i tak skončit
+    v reportu (jako `fatal`), ne beze stopy zmizet z attempted_count."""
+    db = _polish_env(tmp_path, monkeypatch, n_done=1)
+    monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: cz + " uprav")
+    monkeypatch.setattr(main.polish_store, "save_draft",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            main.polish_store.PolishStoreError("poškozená validace")))
+    assert main._cmd_polish(_Args()) == 1
+    r = _report(db)
+    assert r["run_status"] == "fatal"
+    assert r["attempted_count"] == 1
+    assert r["chapters"][0]["outcome"] == "fatal"
+
+
+def test_cmd_polish_happy_path_writes_draft_not_db_and_reports(tmp_path, monkeypatch):
     db = _polish_env(tmp_path, monkeypatch, n_done=2)
     monkeypatch.setattr(main.stylist, "polish",
                         lambda en, cz, **k: cz.replace("Věta", "Lepší věta"))
     assert main._cmd_polish(_Args()) == 0
-    assert state.get_chapter(db, 1)["translated_text"] == "Lepší věta 1."
+    # DB NETKNUTÁ - jen polish.draft.json nese návrh
+    assert state.get_chapter(db, 1)["translated_text"] == "Věta 1."
+    assert not os.path.exists(db + ".pre-polish-backup")
+    draft = polish_store.load_draft(config.POLISH_DRAFT_PATH)
+    assert {c["idx"] for c in draft["chapters"]} == {1, 2}
     r = _report(db)
     assert r["run_status"] == "ok" and r["batch_completed"] is True
     assert r["planned_count"] == 2 and r["attempted_count"] == 2
-    assert r["summary"]["polished"] == 2
+    assert r["summary"]["drafted"] == 2
     with state.connect(db) as conn:
         assert conn.execute("SELECT status FROM runs").fetchone()["status"] == "ok"
 
 
 def test_cmd_polish_passes_nonempty_guide_block(tmp_path, monkeypatch):
-    """spec 2520-2523 / kolo 6 IMPORTANT: když `guide.json` má pravidla,
-    `_cmd_polish` je předá jako neprázdný `guide_block` do `stylist.polish`."""
     db = _polish_env(tmp_path, monkeypatch, n_done=1)
     monkeypatch.setattr(main.guide_mod, "load_guide", lambda p: {"rules": ["vykani"]})
     monkeypatch.setattr(main.guide_mod, "guide_as_prompt_block",
@@ -951,9 +1015,6 @@ def test_cmd_polish_all_failed_is_fatal_but_batch_completed(tmp_path, monkeypatc
 
 
 def test_cmd_polish_all_generic_exceptions_is_fatal(tmp_path, monkeypatch):
-    """Kolo 6: kapitoly padnou na NEOČEKÁVANÉ výjimce (ne StylistError - tu
-    helper převádí na normální failed návrat). Souhrn se odvozuje z `report`,
-    takže 'všechno selhalo' → fatal / return 1 i tady (spec 2678-2680, 2868)."""
     db = _polish_env(tmp_path, monkeypatch, n_done=3)
     monkeypatch.setattr(main.concordance, "check_chapter",
                         lambda *a, **k: (_ for _ in ()).throw(ValueError("boom")))
@@ -963,25 +1024,6 @@ def test_cmd_polish_all_generic_exceptions_is_fatal(tmp_path, monkeypatch):
     assert r["run_status"] == "fatal" and r["batch_completed"] is True
     assert r["attempted_count"] == 3 and r["summary"]["failed"] == 3
     assert all(c["outcome"] == "failed" for c in r["chapters"])
-
-
-def test_cmd_polish_fatal_commit_midbatch_stops_and_reports(tmp_path, monkeypatch):
-    db = _polish_env(tmp_path, monkeypatch, n_done=3)
-    monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: cz + " uprav")
-    calls = {"n": 0}
-    real = main.state.commit_chapter_result
-    def _wrap(*a, **k):
-        calls["n"] += 1
-        if calls["n"] == 2:
-            raise Exception("disk full")
-        return real(*a, **k)
-    monkeypatch.setattr(main.state, "commit_chapter_result", _wrap)
-    assert main._cmd_polish(_Args()) == 1
-    r = _report(db)
-    assert r["run_status"] == "fatal" and r["batch_completed"] is False
-    assert r["attempted_count"] == 2 and r["planned_count"] == 3
-    outcomes = [c["outcome"] for c in r["chapters"]]
-    assert outcomes == ["polished", "fatal"]
 
 
 def test_cmd_polish_skips_already_styled_without_force(tmp_path, monkeypatch):
@@ -1008,16 +1050,7 @@ def test_cmd_polish_report_survives_broken_stdout(tmp_path, monkeypatch):
                         lambda *a, **k: (_ for _ in ()).throw(BrokenPipeError()))
     assert main._cmd_polish(_Args()) == 0
     r = _report(db)
-    assert r["summary"]["polished"] == 1
-
-
-def test_cmd_polish_snapshot_failure_is_fatal_no_run_row(tmp_path, monkeypatch):
-    db = _polish_env(tmp_path, monkeypatch, n_done=1)
-    monkeypatch.setattr(main, "_snapshot_db",
-                        lambda *a, **k: (_ for _ in ()).throw(OSError("no space")))
-    assert main._cmd_polish(_Args()) == 1
-    with state.connect(db) as conn:
-        assert conn.execute("SELECT COUNT(*) c FROM runs").fetchone()["c"] == 0
+    assert r["summary"]["drafted"] == 1
 
 
 def test_cmd_polish_keyboardinterrupt_during_chapter(tmp_path, monkeypatch):
@@ -1029,7 +1062,6 @@ def test_cmd_polish_keyboardinterrupt_during_chapter(tmp_path, monkeypatch):
     r = _report(db)
     assert r["run_status"] == "interrupted"
     assert r["chapters"][0]["outcome"] == "interrupted"
-    assert r["chapters"][0]["stage"] == "processing"
 
 
 def test_cmd_polish_finish_run_failure_does_not_mask_result(tmp_path, monkeypatch):
@@ -1042,24 +1074,7 @@ def test_cmd_polish_finish_run_failure_does_not_mask_result(tmp_path, monkeypatc
     assert r["finalization_error"] and r["run_status"] == "ok"
 
 
-def test_cmd_polish_backup_predates_run_bookkeeping(tmp_path, monkeypatch):
-    """Snapshot se pořizuje PŘED state.create_run (spec kolo 9 BLOCKING /
-    2524-2536) - .pre-polish-backup proto NEobsahuje 'runs' řádek tohoto běhu.
-    Test by selhal, kdyby executor snapshot omylem přesunul za create_run."""
-    db = _polish_env(tmp_path, monkeypatch, n_done=1)
-    monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: cz + " uprav")
-    with state.connect(db) as conn:
-        assert conn.execute("SELECT COUNT(*) c FROM runs").fetchone()["c"] == 0
-    assert main._cmd_polish(_Args()) == 0
-    with state.connect(db) as conn:
-        assert conn.execute("SELECT COUNT(*) c FROM runs").fetchone()["c"] == 1
-    with state.connect(db + ".pre-polish-backup") as conn:
-        assert conn.execute("SELECT COUNT(*) c FROM runs").fetchone()["c"] == 0
-
-
 def test_cmd_polish_generic_exception_is_failed_batch_continues(tmp_path, monkeypatch, capsys):
-    """Neočekávaná (ne-Fatal) výjimka u JEDNÉ kapitoly -> failed, dávka jede
-    dál (spec 2667-2669); str(e) redigované v reportu i stdout (spec 2810-2816)."""
     db = _polish_env(tmp_path, monkeypatch, n_done=3)
     monkeypatch.setattr(config, "STYLIST_REPORT_REJECTED_TEXT", False)
     monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: cz + " uprav")
@@ -1073,35 +1088,11 @@ def test_cmd_polish_generic_exception_is_failed_batch_continues(tmp_path, monkey
     r = _report(db)
     assert r["run_status"] == "ok" and r["batch_completed"] is True
     outcomes = {c["idx"]: c["outcome"] for c in r["chapters"]}
-    assert outcomes == {1: "polished", 2: "failed", 3: "polished"}
+    assert outcomes == {1: "drafted", 2: "failed", 3: "drafted"}
     assert "SECRET-boom" not in json.dumps(r) and "SECRET-boom" not in out
 
 
-def test_cmd_polish_keyboardinterrupt_after_commit_is_polished(tmp_path, monkeypatch):
-    """Interrupt PO úspěšném commitu -> commit-detekce přes translated_text ->
-    outcome 'polished', PRÁVĚ JEDEN záznam (spec 2759-2764)."""
-    db = _polish_env(tmp_path, monkeypatch, n_done=2)
-    monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: cz + " uprav")
-    real = main.state.commit_chapter_result
-    calls = {"n": 0}
-    def _wrap(*a, **k):
-        calls["n"] += 1
-        out = real(*a, **k)
-        if calls["n"] == 1:
-            raise KeyboardInterrupt()
-        return out
-    monkeypatch.setattr(main.state, "commit_chapter_result", _wrap)
-    with pytest.raises(KeyboardInterrupt):
-        main._cmd_polish(_Args())
-    r = _report(db)
-    assert r["run_status"] == "interrupted"
-    ch1 = [c for c in r["chapters"] if c["idx"] == 1]
-    assert len(ch1) == 1 and ch1[0]["outcome"] == "polished"
-
-
 def test_cmd_polish_force_interrupt_before_new_commit_is_interrupted(tmp_path, monkeypatch):
-    """--force nad už-stylizovanou kapitolou, interrupt PŘED novým commitem ->
-    translated_text nezměněn -> 'interrupted', ne 'polished' (spec 2765-2772)."""
     db = _polish_env(tmp_path, monkeypatch, n_done=1)
     with state.connect(db) as conn:
         conn.execute("UPDATE chapters SET notes=? WHERE idx=1",
@@ -1116,8 +1107,6 @@ def test_cmd_polish_force_interrupt_before_new_commit_is_interrupted(tmp_path, m
 
 
 def test_cmd_polish_client_factory_failure_after_create_run_still_reports(tmp_path, monkeypatch):
-    """Pád PŘED smyčkou (po create_run) -> report VZNIKNE z finally,
-    attempted_count 0 (spec 2780-2788)."""
     db = _polish_env(tmp_path, monkeypatch, n_done=2)
     def _boom(rid, *, interactive):
         raise RuntimeError("no client")
@@ -1129,8 +1118,6 @@ def test_cmd_polish_client_factory_failure_after_create_run_still_reports(tmp_pa
 
 
 def test_cmd_polish_critic_fatalrunerror_stops_whole_batch(tmp_path, monkeypatch):
-    """FatalRunError z kritika -> celý polish končí, zbylé kapitoly nezpracované
-    (spec 2675-2677)."""
     db = _polish_env(tmp_path, monkeypatch, n_done=3)
     monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: cz + " uprav")
     from src.llm.client import FatalRunError
@@ -1145,47 +1132,31 @@ def test_cmd_polish_critic_fatalrunerror_stops_whole_batch(tmp_path, monkeypatch
     r = _report(db)
     assert r["run_status"] == "fatal" and r["batch_completed"] is False
     assert r["attempted_count"] == 2
-    assert [c["outcome"] for c in r["chapters"]] == ["polished", "fatal"]
-
-
-def test_cmd_polish_nothing_accepted_preserves_previous_backup(tmp_path, monkeypatch):
-    """Dávka, kde nic není přijato (vše rejected) -> stará .pre-polish-backup
-    zůstane nedotčená, dočasný snapshot se uklidí (spec 2538-2543)."""
-    db = _polish_env(tmp_path, monkeypatch, n_done=2)
-    with open(db + ".pre-polish-backup", "w") as f:
-        f.write("STARA-ZALOHA")
-    monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: cz + " uprav")
-    monkeypatch.setattr(main.pipeline, "_run_critic",
-                        lambda *a, **k: ([{"source": "critic", "action": "revise",
-                                           "severity": "critical", "type": "fidelity"}], False))
-    assert main._cmd_polish(_Args()) == 0
-    with open(db + ".pre-polish-backup") as f:
-        assert f.read() == "STARA-ZALOHA"
-    assert not os.path.exists(db + ".pre-polish-snapshot")
+    assert [c["outcome"] for c in r["chapters"]] == ["drafted", "fatal"]
 
 
 def test_cmd_polish_report_records_every_iteration(tmp_path, monkeypatch):
-    """append je v `finally` (kolo 4 odchylka) - žádná iterace se z reportu
-    neztratí a žádná se nezapíše dvakrát. Mock `_polish_one_chapter` vrací
-    pevnou sekvenci; kontroluje se úplnost + pořadí."""
     db = _polish_env(tmp_path, monkeypatch, n_done=4)
-    seq = iter([{"idx": 1, "outcome": "polished"},
+
+    def _draft(idx):
+        return {"idx": idx, "title": f"K{idx}", "cz_before": "a", "styled": "b",
+                "revision_rounds": 0, "reason_types": [], "findings": [],
+                "rendered_terms": [], "draft_id": f"draft-{idx}"}
+
+    seq = iter([_draft(1),
                 {"idx": 2, "outcome": "unchanged"},
-                {"idx": 3, "outcome": "rejected", "reason_types": ["critic/fidelity"]},
+                _draft(3),
                 {"idx": 4, "outcome": "failed", "error": "x"}])
     monkeypatch.setattr(main, "_polish_one_chapter", lambda *a, **k: next(seq))
     assert main._cmd_polish(_Args()) == 0
     r = _report(db)
     assert [c["idx"] for c in r["chapters"]] == [1, 2, 3, 4]
     assert r["attempted_count"] == 4
-    assert r["summary"] == {"polished": 1, "unchanged": 1, "rejected": 1,
-                            "failed": 1, "fatal": 0, "interrupted": 0}
+    assert r["summary"] == {"drafted": 2, "unchanged": 1, "failed": 1,
+                            "fatal": 0, "interrupted": 0}
 
 
 def test_cmd_polish_ki_during_error_logging_records_exactly_once(tmp_path, monkeypatch):
-    """Kolo 5: helper vyhodí běžnou výjimku, KI padne během `_say` v
-    `except Exception` (než/když je rec sestavené). Report musí mít PRÁVĚ
-    JEDEN záznam té kapitoly, běh se zastaví."""
     db = _polish_env(tmp_path, monkeypatch, n_done=2)
     monkeypatch.setattr(main, "_polish_one_chapter",
                         lambda *a, **k: (_ for _ in ()).throw(ValueError("boom")))

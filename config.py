@@ -42,6 +42,8 @@ DB_PATH = os.path.join(DATA_DIR, "state.sqlite3")
 GUIDE_PATH = os.path.join(DATA_DIR, "guide.json")
 GUIDE_DRAFT_PATH = os.path.join(DATA_DIR, "guide.draft.json")
 LOCK_PATH = os.path.join(DATA_DIR, ".book-translator.lock")
+POLISH_DRAFT_PATH = os.path.join(DATA_DIR, "polish.draft.json")
+POLISH_HISTORY_PATH = os.path.join(DATA_DIR, "polish.history.json")
 OUTPUT_TXT = os.path.join(OUTPUT_DIR, "kniha_cz.txt")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
