@@ -19,6 +19,7 @@ import os
 import sqlite3
 import sys
 import time
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -550,40 +551,22 @@ def _write_polish_report(db: str, rid: int, report: list, *, codex_model: str,
 
 
 def _polish_one_chapter(c, glossary_rows, cf, db, model: str, guide_block: str,
-                        codex_cmd: list, backup_state: dict) -> dict:
-    """Vrací JEDEN report `dict` za kapitolu. Výjimky
-    NEchytá (kromě `stylist.StylistError` → `"failed"` a záloha/DB zápisu
-    → `FatalRunError`, viz níže) - volající (_cmd_polish) rozhoduje, co je
-    per-kapitolové (chytit, pokračovat) a co ukončuje celý běh
-    (FatalRunError).
-
-    NÁVRATOVÁ HODNOTA (kolo 34 IMPORTANT - dřív funkce mutovala sdílený
-    `report`, což vedlo k dvojím/chybějícím záznamům při výjimce z
-    `print()` apod.): vrací PRÁVĚ JEDEN `dict` záznam za kapitolu.
-    NEMUTUJE `report` - `_cmd_polish` appendne PRÁVĚ JEDNOU ZA ITERACI
-    smyčky (JEDEN `try/except/finally`, append ve `finally` - `rec` se
-    tam dopočítá z DB, když ho žádná větev nesestavila; invariant je
-    STRUKTURNÍ, ne dohlídaný dedupem). Tvary:
-      - `{"idx", "outcome": "polished"|"unchanged"}`
-      - `{"idx", "outcome": "failed", "error": <hláška>}` - `error` z
-        `stylist.StylistError` je už u zdroje (`polish()`) zbavená
-        Codexem-řízených hodnot, když `STYLIST_REPORT_REJECTED_TEXT`
-        není `True` (kolo 29-33).
-      - `{"idx", "outcome": "rejected", "reason_types": [...]}` +
-        (za `STYLIST_REPORT_REJECTED_TEXT is True`) `reasons`/`findings`/
-        `styled`.
-    `FatalRunError` (selhání commitu, NEBO fatální chyba klienta z kritika
-    / meaning-checku - kolo 37) se NEobaluje do záznamu tady - propaguje
-    ven a `_cmd_polish` si `fatal` záznam postaví sám (zná `c`). Hláška
-    je VŽDY REDIGOVANÁ U ZDROJE (`stylist._redact_detail`, kolo 35/37).
-    `KeyboardInterrupt` taky propaguje - `_cmd_polish` po něm porovná
-    `translated_text` kapitoly v DB se vstupním `c` (kolo 35 - NE marker,
-    ten je u `--force` z dřívějšího běhu) a zapíše `polished` nebo
-    `interrupted`.
-
-    `codex_cmd` je JIŽ rozřešený (`_cmd_polish` ho spočítal jednou v
-    preflightu) - `stylist.polish` ho díky tomu nemusí znovu hledat přes
-    `shutil.which` na každou kapitolu (kolo 8 NIT)."""
+                        codex_cmd: list) -> dict:
+    """Vrací JEDEN záznam za kapitolu - NEcommituje nic do DB (spec
+    2026-09-11-polish-review-design.md - `_cmd_polish`/`polish-review`
+    apply endpoint dělají commit/zálohu teď, ne tahle funkce). Tvary:
+      - `{"idx", "outcome": "unchanged"}` / `{"idx", "outcome": "failed", "error"}`
+        - beze změny oproti dřívějšku.
+      - draft dict BEZ klíče `"outcome"` (`idx`, `title`, `cz_before`,
+        `styled`, `revision_rounds`, `reason_types`, `findings`,
+        `rendered_terms`, `draft_id`) - volající (`_cmd_polish`) ho pozná podle
+        CHYBĚJÍCÍHO `"outcome"` a zapíše do `polish.draft.json`.
+        `reason_types` je JEN kontext pro člověka (prázdné = nic
+        nenamítáno, neprázdné = kritik/konkordance/meaning-check něco
+        našly) - nikdy negate ROZHODNUTÍ, to dělá teď `polish-review`.
+    `FatalRunError` z kritika/meaning-checku pořád propaguje (kolo 37) -
+    žádná DB zápisová `FatalRunError` už neexistuje, funkce nic
+    nezapisuje."""
     idx, en, cz = c["idx"], c["raw_text"], c["translated_text"]
     try:
         styled = stylist.polish(en, cz, codex_cmd=codex_cmd, codex_model=model,
@@ -597,47 +580,14 @@ def _polish_one_chapter(c, glossary_rows, cf, db, model: str, guide_block: str,
         _say(f"Kapitola {idx}: beze změny (Codex nenavrhl žádnou úpravu).")
         return {"idx": idx, "outcome": "unchanged"}
 
-    # Předchozí mentions JAKO rendered_terms (kolo 5 BLOCKING) - termín
-    # zachycený translatorem VÝHRADNĚ přes vlastní hlášení (žádná přesná EN
-    # shoda povrchu) by se s rendered_terms=[] vůbec neprozkoumal, ani v
-    # baseline, ani v `after` - úplná slepá skvrna, ne jen ztráta metadat
-    # (viz "Oprava mimo nový modul: src/state.py" výše). `_term_mentions`
-    # ověřuje `form in cz_text`/`form in styled` samo - stará forma, co ve
-    # stylizovaném textu už není, se prostě neuplatní (correctly).
-    #
-    # JEN `source == "rendered"` (kolo 20 IMPORTANT) - `concordance._term_
-    # mentions` označí VŠECHNO z `rendered_terms` jako "rendered". Kdyby
-    # sem prošla i původně "detected" mention (zachycená kódem, ne
-    # hlášená translatorem), po úspěšném průchodu by se uložila jako
-    # "rendered" - falešná provenience. "detected" termíny concordance
-    # najde sama z EN/glosáře, forwardovat je netřeba - forwarduje se jen
-    # to, co concordance sama z povrchu NEDOHLEDÁ (skutečné translatorovo
-    # hlášení).
     prior = state.chapter_mentions(db, idx)
     rendered_terms = [{"term_id": m["term_id"], "cz_as_used": m["cz_form"],
                        "scene_idx": m["scene_idx"]}
                       for m in prior
                       if m.get("cz_form") and m.get("source") == "rendered"]
 
-    # Baseline se počítá ČERSTVĚ nad PŮVODNÍM cz, se STEJNÝM (aktuálním)
-    # glossary_rows jako `findings` níže - ne z uložených `notes`, které
-    # mohly vzniknout pod STARŠÍM glosářem (kolo 4 IMPORTANT). Zdarma
-    # (žádné LLM volání), takže dvojí přepočet nic nestojí navíc.
     baseline_concordance = concordance.check_chapter(en, cz, glossary_rows, rendered_terms)
     findings = concordance.check_chapter(en, styled, glossary_rows, rendered_terms)
-    # Kolo 9 NIT: `check_meaning_preserved` je DALŠÍ placené volání
-    # (Anthropic request) - když konkordance nebo kritik SAMY o sobě
-    # zamítnutí už zaručují, nemá smysl za něj platit. `_rejection_
-    # reasons` se volá DVAKRÁT (žádná duplicitní rozhodovací logika, jen
-    # fail-fast dřív). Kolo 27: bereme SEZNAM důvodů (ne jen bool).
-    #
-    # Kolo 37 IMPORTANT: `pipeline._run_critic` i `check_meaning_
-    # preserved` volají Anthropic klienta S TEXTEM `styled`; klientův
-    # `FatalRunError` (400, cost guard) může do hlášky pojmout část
-    # requestu = obsah `styled`. Proto se `FatalRunError` z týhle sekce
-    # zabalí s hláškou REDIGOVANOU U ZDROJE (`stylist._redact_detail`) -
-    # `str(fe)` je pak bezpečné v `fatal` záznamu, `run_error` i výpisu
-    # (stejný princip jako commitová `FatalRunError`, kolo 35).
     try:
         critic_findings, critic_failed = pipeline._run_critic(en, styled, cf("critic"))
         findings += critic_findings
@@ -657,85 +607,39 @@ def _polish_one_chapter(c, glossary_rows, cf, db, model: str, guide_block: str,
             f"Kontrola stylizace kapitoly {idx} selhala fatálně "
             f"({stylist._redact_detail(str(fe))}) - cost guard / chyba LLM "
             "klienta, celý běh `polish` se zastavuje.") from fe
+
+    reason_types = sorted({f"{r.get('source', '?')}/{r.get('type', '?')}"
+                           for r in reasons}) if reasons else []
     if reasons:
-        # `reason_types` = deduplikovaný seznam `"source/type"` řetězců.
-        # Tohle je BEZPEČNÁ agregační metrika (kolo 28 IMPORTANT) - žádný
-        # volný text, jde do reportu VŽDY. Volná pole (`issue`,
-        # `cz_excerpt`, celý `styled`) jdou jen za `STYLIST_REPORT_
-        # REJECTED_TEXT` (kolo 28 - i `issue`/`cz_excerpt` můžou
-        # zopakovat exfiltrovaný úryvek, ne jen `styled`).
-        reason_types = sorted({f"{r.get('source', '?')}/{r.get('type', '?')}"
-                               for r in reasons})
-        # `is True` (kolo 32) - `1`/`"False"`/`None` NEsmí plný detail
-        # (perzistence potenciálně exfiltrovaného textu) aktivovat.
+        _say(f"Kapitola {idx}: kontrola má výhrady ({', '.join(reason_types)}) "
+             "- půjde k ručnímu review.")
         full = config.STYLIST_REPORT_REJECTED_TEXT is True
-        _say(f"Kapitola {idx}: stylizace zamítnuta kontrolou "
-             f"({', '.join(reason_types)}), ponechávám původní.")
         if full:
             for r in reasons:
                 _say(f"    - [{r.get('source', '?')}/{r.get('type', '?')}] "
                      f"{r.get('issue') or '(bez popisu)'}")
-            # Kritik někdy vrátí verdict="revise", ale všechny JEDNOTLIVÉ
-            # nálezy má jako "minor" (action="note") - tenhle rozpor
-            # `critic.review()` odchytí a připojí syntetický `critical`
-            # nález (ten je výš v `reasons`), ale samotné minor nálezy do
-            # `reasons` NEJDOU (nejsou action=="revise"). Bez tohohle bloku
-            # by na konzoli zůstala jen obecná hláška "rozpor v odpovědi
-            # modelu" a skutečný DŮVOD kritikovy nespokojenosti (konkrétní
-            # věty, co ho zarazily) by byl vidět jen v JSON reportu
-            # (`findings`), ne tady - i když jde o stejně užitečnou
-            # informaci pro posouzení, jestli byl reject oprávněný.
             context = [f for f in findings
                       if f.get("source") == "critic" and f not in reasons]
             if context:
                 _say("    (kontext od kritika - samo o sobě nezpůsobilo "
-                     "zamítnutí, ale vysvětluje rozpor výš):")
+                     "výhradu, ale vysvětluje rozpor výš):")
                 for f in context:
                     _say(f"      - [{f.get('severity', '?')}] "
                          f"{f.get('issue') or '(bez popisu)'}")
-        rec = {"idx": idx, "outcome": "rejected", "reason_types": reason_types}
-        if full:
-            rec["reasons"] = reasons
-            rec["findings"] = findings
-            rec["styled"] = styled
-        return rec
+    else:
+        _say(f"Kapitola {idx}: návrh připraven, žádné výhrady - půjde k ručnímu review.")
 
-    findings.append(_stylist_marker(cz, model))
-    # Mentions se přepočítají se STEJNÝM rendered_terms jako `findings`
-    # výš - termín rozpoznaný translatorem se tak dál vede jako "rendered"
-    # (ne "detected"), pokud jeho hlášená forma ve stylizovaném textu pořád
-    # je (kolo 5 BLOCKING, opravuje dřívější `rendered_terms=[]`).
-    mentions = concordance.build_mentions(en, styled, glossary_rows, rendered_terms)
-    # Kolo 12 IMPORTANT: záloha/DB zápis NENÍ per-kapitolová chyba, je to
-    # INFRASTRUKTURNÍ selhání (plný disk, poškozená DB, ztráta práv) - může
-    # ohrozit CELÝ běh, ne jen tuhle kapitolu. Bez tohohle zabalení by ho
-    # vnější `except Exception` v `_cmd_polish` spolykal jako obyčejné
-    # `outcome="failed"` téhle jedné kapitoly, a pokud by JINÁ kapitola v
-    # téže dávce dopadla "unchanged"/"rejected" (žádná další nedopadla
-    # `failed`), celý běh by mohl skončit `status="ok"` navzdory reálně
-    # rozbité DB/disku - přesně tenhle rozpor `_cmd_polish` už jednou řešil
-    # pro "všechno selhalo" (kolo 5), tady jde o STEJNÝ princip na jiném
-    # místě. `FatalRunError` `_cmd_polish` NEchytá per-kapitolově (`except
-    # FatalRunError: raise` stojí NAD obecným `except Exception`).
-    try:
-        _backup_db_once(db, backup_state)   # PŘED prvním skutečným zápisem - viz _backup_db_once
-        state.commit_chapter_result(
-            db, idx, translated_text=styled, revision_rounds=c["revision_rounds"],
-            notes_json=json.dumps(findings, ensure_ascii=False), status="done",
-            new_candidates=[], mentions=mentions, questions=[])
-    except Exception as e:
-        # `FatalRunError` propaguje ven, `_cmd_polish` si `fatal` záznam
-        # postaví sám (kolo 34). Hláška je REDIGOVANÁ U ZDROJE (kolo 35
-        # IMPORTANT) přes `stylist._redact_detail` - `str(e)` commitové
-        # výjimky může nést data; `str(fe)` pak jde do `fatal` záznamu,
-        # `run_error` I `_say(e)` výpisu bez dalšího řešení.
-        raise FatalRunError(
-            f"Zápis výsledku kapitoly {idx} selhal "
-            f"({stylist._redact_detail(f'{type(e).__name__}: {e}')}) - "
-            "záloha/DB zápis je infrastrukturní selhání, ne per-kapitolová "
-            "chyba, celý běh `polish` se zastavuje.") from e
-    _say(f"Kapitola {idx}: vylepšeno.")
-    return {"idx": idx, "outcome": "polished"}
+    # `draft_id` identifikuje TOHLE KONKRÉTNÍ rozhodnutí, NIKDY se
+    # neodvozuje z obsahu textu (kolo 10 plán-ping-pongu BLOCKING - dřív
+    # `_stale_info`/`post_apply`'s no-op idempotence (kolo 6/9) klíčovaly
+    # podle hashe `cz_before`/`text`; kapitola co zůstává nestylizovaná
+    # může mít STEJNÝ `cz_before` napříč VÍCE nezávislými `polish` běhy -
+    # starý `kept_original` marker by pak falešně označil ÚPLNĚ NOVÝ,
+    # nevyřízený draft jako už vyřízený).
+    return {"idx": idx, "title": c["title"], "cz_before": cz, "styled": styled,
+            "revision_rounds": c["revision_rounds"], "reason_types": reason_types,
+            "findings": findings, "rendered_terms": rendered_terms,
+            "draft_id": uuid.uuid4().hex}
 
 
 # --- příkazy ----------------------------------------------------------------

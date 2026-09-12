@@ -671,24 +671,18 @@ def _polish_db(tmp_path):
 
 
 def _c():
-    return {"idx": 1, "raw_text": "EN", "translated_text": "Původní věta.",
-            "revision_rounds": 0, "notes": None}
+    return {"idx": 1, "title": "K1", "raw_text": "EN",
+            "translated_text": "Původní věta.", "revision_rounds": 0, "notes": None}
 
 
 def _cf_stub(agent):
     return object()
 
 
-def _bs(db):
-    snap = db + ".pre-polish-snapshot"
-    main._snapshot_db(db, snap)
-    return {"done": False, "snapshot_path": snap}
-
-
 def test_polish_one_chapter_unchanged(tmp_path, monkeypatch):
     db = _polish_db(tmp_path)
     monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Původní věta.")
-    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"], _bs(db))
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"])
     assert rec == {"idx": 1, "outcome": "unchanged"}
 
 
@@ -696,28 +690,30 @@ def test_polish_one_chapter_stylist_error_is_failed(tmp_path, monkeypatch):
     db = _polish_db(tmp_path)
     def _boom(*a, **k): raise _stylist.StylistError("nope")
     monkeypatch.setattr(main.stylist, "polish", _boom)
-    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"], _bs(db))
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"])
     assert rec["outcome"] == "failed" and "nope" in rec["error"]
     assert state.get_chapter(db, 1)["translated_text"] == "Původní věta."
 
 
-def test_polish_one_chapter_accepts_and_commits(tmp_path, monkeypatch):
+def test_polish_one_chapter_returns_draft_dict_when_no_reasons(tmp_path, monkeypatch):
     db = _polish_db(tmp_path)
     monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Vylepšená věta.")
     monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
     monkeypatch.setattr(main.concordance, "build_mentions", lambda *a, **k: [])
     monkeypatch.setattr(main.pipeline, "_run_critic", lambda *a, **k: ([], False))
     monkeypatch.setattr(main.stylist, "check_meaning_preserved", lambda *a, **k: [])
-    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "gpt-5-codex", "",
-                                   ["codex"], _bs(db))
-    assert rec == {"idx": 1, "outcome": "polished"}
-    ch = state.get_chapter(db, 1)
-    assert ch["translated_text"] == "Vylepšená věta." and ch["status"] == "done"
-    assert main._already_styled(ch["notes"]) is True
-    assert os.path.exists(db + ".pre-polish-backup")
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "gpt-5-codex", "", ["codex"])
+    assert "outcome" not in rec
+    assert rec["idx"] == 1 and rec["title"] == "K1"
+    assert rec["cz_before"] == "Původní věta." and rec["styled"] == "Vylepšená věta."
+    assert rec["revision_rounds"] == 0 and rec["reason_types"] == []
+    assert isinstance(rec["findings"], list) and isinstance(rec["rendered_terms"], list)
+    # NIC se nezapsalo do DB - to teď dělá jen `polish-review` apply endpoint
+    assert state.get_chapter(db, 1)["translated_text"] == "Původní věta."
+    assert not os.path.exists(db + ".pre-polish-backup")
 
 
-def test_polish_one_chapter_rejected_default_hides_detail(tmp_path, monkeypatch):
+def test_polish_one_chapter_returns_draft_dict_with_reason_types_when_rejected(tmp_path, monkeypatch):
     db = _polish_db(tmp_path)
     monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Jiná věta se SECRET.")
     monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
@@ -726,36 +722,17 @@ def test_polish_one_chapter_rejected_default_hides_detail(tmp_path, monkeypatch)
                         lambda *a, **k: ([{"source": "critic", "action": "revise",
                                            "severity": "critical", "type": "fidelity",
                                            "issue": "SECRET"}], False))
-    monkeypatch.setattr(config, "STYLIST_REPORT_REJECTED_TEXT", False)
-    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"], _bs(db))
-    assert rec["outcome"] == "rejected"
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"])
+    assert "outcome" not in rec
     assert rec["reason_types"] == ["critic/fidelity"]
-    assert "reasons" not in rec and "findings" not in rec and "styled" not in rec
+    assert any(f.get("issue") == "SECRET" for f in rec["findings"])
     assert state.get_chapter(db, 1)["translated_text"] == "Původní věta."
 
 
-def test_polish_one_chapter_rejected_full_detail_when_opted_in(tmp_path, monkeypatch):
-    db = _polish_db(tmp_path)
-    monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Jiná věta.")
-    monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
-    monkeypatch.setattr(main.concordance, "build_mentions", lambda *a, **k: [])
-    monkeypatch.setattr(main.pipeline, "_run_critic",
-                        lambda *a, **k: ([], False))
-    monkeypatch.setattr(main.stylist, "check_meaning_preserved",
-                        lambda *a, **k: [{"source": "stylist_check",
-                                          "type": "meaning_drift", "issue": "x"}])
-    monkeypatch.setattr(config, "STYLIST_REPORT_REJECTED_TEXT", True)
-    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"], _bs(db))
-    assert rec["outcome"] == "rejected" and rec["styled"] == "Jiná věta."
-    assert "reasons" in rec and "findings" in rec
-
-
 def test_polish_one_chapter_prints_critic_minor_findings_as_context(tmp_path, monkeypatch, capsys):
-    """Kritik vrátí verdict="revise" s jen `minor`/`note` nálezy - `critic.review()`
-    to synteticky odmítne (kritický nález bez konkrétního textu), ale samotné
-    minor nálezy (konkrétní věty, co kritika zarazily) MUSÍ jít vidět na
-    konzoli jako kontext, ne jen v JSON reportu - jinak uživatel neví, co
-    kritikovi vadilo, jen že mu "něco" vadilo."""
+    # Kontextový výpis kritikových minor nálezů je pořád součástí "plného"
+    # konzolového detailu (`full`), stejně jako dřív - jen `polish.draft.json`
+    # je VŽDY plný (spec design.md:1113-1123), konzole zůstává gatovaná.
     from src.llm.client import Completion, FakeLLMClient
     db = _polish_db(tmp_path)
     monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: "Jina uplne jina veta.")
@@ -766,83 +743,34 @@ def test_polish_one_chapter_prints_critic_minor_findings_as_context(tmp_path, mo
          "issue": "PRIDANE PRIJMENI CO NENI V ORIGINALE", "suggestion": "Harry"}]})
     def _cf(agent):
         return FakeLLMClient([Completion(resp, False, 5, 5)])
-    rec = main._polish_one_chapter(_c(), [], _cf, db, "m", "", ["codex"], _bs(db))
-    assert rec["outcome"] == "rejected"
+    rec = main._polish_one_chapter(_c(), [], _cf, db, "m", "", ["codex"])
+    assert "outcome" not in rec
     out = capsys.readouterr().out
     assert "PRIDANE PRIJMENI CO NENI V ORIGINALE" in out
     assert any(f.get("issue") == "PRIDANE PRIJMENI CO NENI V ORIGINALE"
               for f in rec["findings"])
 
 
-def test_polish_one_chapter_commit_failure_is_fatal_redacted(tmp_path, monkeypatch):
+def test_polish_one_chapter_rejected_full_detail_when_opted_in(tmp_path, monkeypatch):
     db = _polish_db(tmp_path)
-    monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Vylepšená věta.")
+    monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Jiná věta.")
     monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
     monkeypatch.setattr(main.concordance, "build_mentions", lambda *a, **k: [])
     monkeypatch.setattr(main.pipeline, "_run_critic", lambda *a, **k: ([], False))
-    monkeypatch.setattr(main.stylist, "check_meaning_preserved", lambda *a, **k: [])
-    monkeypatch.setattr(main.state, "commit_chapter_result",
-                        lambda *a, **k: (_ for _ in ()).throw(Exception("SECRET123")))
-    monkeypatch.setattr(config, "STYLIST_REPORT_REJECTED_TEXT", False)
-    with pytest.raises(FatalRunError) as ei:
-        main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"], _bs(db))
-    assert "Zápis výsledku kapitoly" in str(ei.value)
-    assert "SECRET123" not in str(ei.value)
-
-
-def test_polish_one_chapter_critic_fatal_is_wrapped_redacted(tmp_path, monkeypatch):
-    db = _polish_db(tmp_path)
-    monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Vylepšená věta.")
-    monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
-    monkeypatch.setattr(main.pipeline, "_run_critic",
-                        lambda *a, **k: (_ for _ in ()).throw(FatalRunError("SECRET123")))
-    monkeypatch.setattr(config, "STYLIST_REPORT_REJECTED_TEXT", False)
-    with pytest.raises(FatalRunError) as ei:
-        main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"], _bs(db))
-    assert "Kontrola stylizace kapitoly" in str(ei.value)
-    assert "SECRET123" not in str(ei.value)
-
-
-def test_polish_one_chapter_critic_failed_skips_meaning_check(tmp_path, monkeypatch):
-    """critic_failed=True -> rejected s critic/critic_failed, meaning-check se
-    NEVOLÁ (fail-fast, spec 2827-2830)."""
-    db = _polish_db(tmp_path)
-    monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Jiná věta tady.")
-    monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
-    monkeypatch.setattr(main.pipeline, "_run_critic", lambda *a, **k: ([], True))
     monkeypatch.setattr(main.stylist, "check_meaning_preserved",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("nemá se volat")))
-    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"], _bs(db))
-    assert rec["outcome"] == "rejected"
-    assert "critic/critic_failed" in rec["reason_types"]
-
-
-def test_polish_one_chapter_real_critic_failure_redacts_by_default(tmp_path, monkeypatch, capsys):
-    """Kolo 7: SKUTEČNÝ `critic.review` + `pipeline._run_critic` (bez mocku).
-    Kritik vrátí neplatný verdikt 'SECRET123' → `critic.review` raisne
-    `ValueError` se secretem → `_run_critic` pseudo finding
-    (`issue="kritik selhal: ...SECRET123..."`). Při
-    `STYLIST_REPORT_REJECTED_TEXT=False` se secret NESMÍ objevit v `rec`
-    ani na konzoli - pseudo finding jde jen do `findings`, ne do `rec`."""
-    from src.llm.client import Completion, FakeLLMClient
-    db = _polish_db(tmp_path)
-    monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: "Jina veta uplne jinak.")
-    monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
-    monkeypatch.setattr(config, "STYLIST_REPORT_REJECTED_TEXT", False)
-    bad = json.dumps({"verdict": "SECRET123", "findings": []})
-    def _cf(agent):
-        return FakeLLMClient([Completion(bad, False, 5, 5), Completion(bad, False, 5, 5)])
-    rec = main._polish_one_chapter(_c(), [], _cf, db, "m", "", ["codex"], _bs(db))
-    assert rec["outcome"] == "rejected"
-    assert "critic/critic_failed" in rec["reason_types"]
-    assert "SECRET123" not in json.dumps(rec)
-    assert "SECRET123" not in capsys.readouterr().out
+                        lambda *a, **k: [{"source": "stylist_check",
+                                          "type": "meaning_drift", "issue": "x"}])
+    monkeypatch.setattr(config, "STYLIST_REPORT_REJECTED_TEXT", True)
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"])
+    assert "outcome" not in rec and rec["styled"] == "Jiná věta."
+    assert rec["reason_types"] == ["stylist_check/meaning_drift"]
 
 
 @pytest.mark.parametrize("flag", [False, 1, "False", None])
-def test_polish_one_chapter_rejected_detail_gated_is_true_only(tmp_path, monkeypatch, flag):
-    """STYLIST_REPORT_REJECTED_TEXT: jen literál True odemkne plný detail;
-    1/"False"/None se chovají jako False (spec 2805-2809)."""
+def test_polish_one_chapter_rejected_detail_gated_console_only(tmp_path, monkeypatch, flag):
+    """`STYLIST_REPORT_REJECTED_TEXT` teď gatuje jen KONZOLOVÝ výpis nálezů
+    (draft dict, co jde do `polish.draft.json`, je VŽDY plný - spec
+    Bezpečnost). Jen literál `True` odemkne detail na konzoli."""
     db = _polish_db(tmp_path)
     monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Jiná věta se SECRET123.")
     monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
@@ -851,57 +779,73 @@ def test_polish_one_chapter_rejected_detail_gated_is_true_only(tmp_path, monkeyp
                                            "severity": "critical", "type": "fidelity",
                                            "issue": "SECRET123"}], False))
     monkeypatch.setattr(config, "STYLIST_REPORT_REJECTED_TEXT", flag)
-    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"], _bs(db))
-    assert rec["outcome"] == "rejected"
-    assert "reasons" not in rec and "findings" not in rec and "styled" not in rec
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"])
+    assert "outcome" not in rec
+    assert any(f.get("issue") == "SECRET123" for f in rec["findings"])   # draft VŽDY plný
+
+
+def test_polish_one_chapter_real_critic_failure_redacts_console_by_default(tmp_path, monkeypatch, capsys):
+    from src.llm.client import Completion, FakeLLMClient
+    db = _polish_db(tmp_path)
+    monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: "Jina veta uplne jinak.")
+    monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
+    monkeypatch.setattr(config, "STYLIST_REPORT_REJECTED_TEXT", False)
+    bad = json.dumps({"verdict": "SECRET123", "findings": []})
+    def _cf(agent):
+        return FakeLLMClient([Completion(bad, False, 5, 5), Completion(bad, False, 5, 5)])
+    rec = main._polish_one_chapter(_c(), [], _cf, db, "m", "", ["codex"])
+    assert "outcome" not in rec and "critic/critic_failed" in rec["reason_types"]
+    assert "SECRET123" not in capsys.readouterr().out   # konzole redigovaná
+    assert any("SECRET123" in (f.get("issue") or "") for f in rec["findings"])  # draft plný
+
+
+def test_polish_one_chapter_critic_fatal_is_wrapped_redacted(tmp_path, monkeypatch):
+    db = _polish_db(tmp_path)
+    monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Vylepšená věta.")
+    monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
+    monkeypatch.setattr(main.pipeline, "_run_critic",
+                        lambda *a, **k: (_ for _ in ()).throw(FatalRunError("SECRET123")))
+    with pytest.raises(FatalRunError) as ei:
+        main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"])
+    assert "SECRET123" not in str(ei.value)
+
+
+def test_polish_one_chapter_critic_failed_skips_meaning_check(tmp_path, monkeypatch):
+    db = _polish_db(tmp_path)
+    monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Vylepšená věta.")
+    monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
+    monkeypatch.setattr(main.pipeline, "_run_critic", lambda *a, **k: ([], True))
+    called = {"n": 0}
+    def _mc(*a, **k):
+        called["n"] += 1
+        return []
+    monkeypatch.setattr(main.stylist, "check_meaning_preserved", _mc)
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"])
+    assert "outcome" not in rec and rec["reason_types"] == ["critic/critic_failed"]
+    assert called["n"] == 0
 
 
 def test_polish_one_chapter_forwards_only_rendered_mentions_as_rendered_terms(tmp_path, monkeypatch):
-    """Spec 5 BLOCKING / kolo 20 IMPORTANT / 323-329: `rendered_terms` předané
-    do check_chapter/build_mentions se staví z `state.chapter_mentions` a
-    obsahuje JEN mention se `source=='rendered'` a neprázdným `cz_form` - termín
-    zachycený jen kódem (`detected`) se NEforwarduje (jinak by se po commitu
-    uložil jako 'rendered' = falešná provenience). Protože `detected` termín B
-    není ve `rendered_terms`, `build_mentions` ho jako 'rendered' přeznačit
-    NEMŮŽE."""
+    """Kolo 7 plán-ping-pongu BLOCKING - `_polish_one_chapter` NEVOLÁ
+    `concordance.build_mentions` (to dělá teď až apply/revert endpoint,
+    viz Task 9/10) - `rendered_terms` tu počítá PŘÍMO z `state.
+    chapter_mentions`, filtrováno na `source == "rendered"`. Test dřív
+    mylně čekal volání `build_mentions`, co v týhle funkci vůbec
+    neexistuje, a nikdy by neprošel."""
     db = _polish_db(tmp_path)
     with state.connect(db) as conn:
-        conn.execute("INSERT INTO glossary (term_id,canonical_en,aliases,cz,"
-                     "accepted_alt,type,status) VALUES "
-                     "('t/a','Aterm','[]','Áčko','[]','term','approved'),"
-                     "('t/b','Bterm','[]','Béčko','[]','term','approved')")
+        conn.execute("INSERT INTO glossary (term_id,canonical_en,cz) VALUES "
+                     "('t/a','A','Á')")
     state.replace_term_mentions(db, 1, [
-        {"term_id": "t/a", "cz_form": "Áčko", "scene_idx": 3, "source": "rendered"},
-        {"term_id": "t/b", "cz_form": "Béčko", "scene_idx": 0, "source": "detected"},
-        {"term_id": "t/a", "cz_form": "", "scene_idx": 0, "source": "rendered"},  # prázdný cz_form se zahodí
+        {"term_id": "t/a", "cz_form": "Áčko", "scene_idx": 0, "source": "rendered"},
+        {"term_id": "t/a", "cz_form": "Bčko", "scene_idx": 1, "source": "detected"},
     ])
-    monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: cz + " uprav.")
+    monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Vylepšená věta.")
+    monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
     monkeypatch.setattr(main.pipeline, "_run_critic", lambda *a, **k: ([], False))
     monkeypatch.setattr(main.stylist, "check_meaning_preserved", lambda *a, **k: [])
-    seen = {"check": [], "build": []}
-    monkeypatch.setattr(main.concordance, "check_chapter",
-                        lambda en, cz, gl, rendered: seen["check"].append(list(rendered)) or [])
-    monkeypatch.setattr(main.concordance, "build_mentions",
-                        lambda en, cz, gl, rendered: seen["build"].append(list(rendered)) or [])
-    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"], _bs(db))
-    assert rec["outcome"] == "polished"
-    expected = [{"term_id": "t/a", "cz_as_used": "Áčko", "scene_idx": 3}]
-    assert seen["check"] and all(call == expected for call in seen["check"])
-    assert seen["build"] and all(call == expected for call in seen["build"])
-
-
-def test_polish_one_chapter_no_backup_promotion_on_reject(tmp_path, monkeypatch):
-    """Zamítnutá kapitola nesmí promovat snapshot na .pre-polish-backup."""
-    db = _polish_db(tmp_path)
-    monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Jiná věta tady je.")
-    monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
-    monkeypatch.setattr(main.pipeline, "_run_critic",
-                        lambda *a, **k: ([{"source": "critic", "action": "revise",
-                                           "severity": "critical", "type": "fidelity"}], False))
-    bs = _bs(db)
-    main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"], bs)
-    assert bs["done"] is False
-    assert not os.path.exists(db + ".pre-polish-backup")
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"])
+    assert rec["rendered_terms"] == [{"term_id": "t/a", "cz_as_used": "Áčko", "scene_idx": 0}]
 
 
 # --- Task 12: main._cmd_polish + registrace příkazu --------------------------
