@@ -643,15 +643,109 @@ def _polish_one_chapter(c, glossary_rows, cf, db, model: str, guide_block: str,
 
 # --- příkazy ----------------------------------------------------------------
 
+def _archive_polish_file(path: str) -> "str | None":
+    """Přejmenuje `path` na timestampovanou archivní kopii (MIKROsekundová
+    přesnost - kolo 6, dva resety ve stejné sekundě by jinak dostaly
+    STEJNÝ název a `os.rename` by na Windows selhal na kolizi, což je
+    žádoucí - NIKDY tiché přepsání). Timestamp jde PŘED příponu
+    (`polish.draft.<stamp>.json`, spec kolo 6 - NE za ni
+    `polish.draft.json.<stamp>`, kolo 1 plán-ping-pongu BLOCKING).
+    Vrátí novou cestu, nebo `None`, když `path` neexistuje (nic k
+    archivaci)."""
+    if not os.path.exists(path):
+        return None
+    stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    base, ext = os.path.splitext(path)
+    archived = f"{base}.{stamp}{ext}"
+    os.rename(path, archived)
+    return archived
+
+
+def _safe_rollback_rename(archived: "str | None", original: str) -> bool:
+    """Best-effort vrácení archivace zpět - vrátí `True` při úspěchu NEBO
+    když nebylo co vracet (`archived is None`). Kolo 2 plán-ping-pongu
+    IMPORTANT - SAMOTNÝ rollback `os.rename` může taky selhat (disk
+    skutečně rozbitý); bez tyhle ochrany by to spadlo jako nezachycený
+    traceback místo slíbeného "vypíše přesný stav". Při selhání vypíše,
+    KTERÁ cesta SKUTEČNĚ existuje (archivní i původní), ať se dá stav
+    opravit ručně."""
+    if archived is None:
+        return True
+    try:
+        os.rename(archived, original)
+        return True
+    except OSError as e:
+        _say(f"POZOR: rollback {archived} -> {original} selhal ({e}) - "
+             f"zkontroluj ručně: archivní cesta existuje = "
+             f"{os.path.exists(archived)}, původní cesta existuje = "
+             f"{os.path.exists(original)}.")
+        return False
+
+
 def _cmd_init(args) -> int:
     db = config.DB_PATH
     if not state.is_db_empty(db) and not args.reset:
         print("DB už obsahuje knihu. Použij `init --reset` pro nahrazení.")
         return 1
+    # Kniha se NAČTE (a tím validuje) JAKO ÚPLNĚ PRVNÍ krok (kolo 5
+    # plán-ping-pongu BLOCKING) - PŘED archivací i resetem. Dřív se
+    # `ingest.load_book`/`state.seed_chapters` volaly AŽ PO úspěšném
+    # resetu, BEZE ZMĚNY z existujícího main.py a BEZ ochrany - selhání
+    # (špatný vstupní soubor, poškozený EPUB) by nechalo uživatele BEZ
+    # staré knihy (DB resetnutá) I BEZ nové (načtení selhalo) I BEZ
+    # aktivní review fronty (archivovaná, ne smazaná, ale nedostupná z
+    # běžných cest). Validace na začátku eliminuje "špatný vstupní
+    # soubor" jako spouštěč úplně - archivace/reset se vůbec nezačnou,
+    # dokud nevíme, že nová kniha JDE načíst.
+    try:
+        chapters = ingest.load_book(args.path)
+    except Exception as e:
+        print(f"Kniha se nepodařilo načíst ({type(e).__name__}: {e}) - "
+              "nic se nezměnilo, DB i polish soubory beze změny.")
+        return 1
     if args.reset:
-        state.reset_book(db)
-    chapters = ingest.load_book(args.path)
-    state.seed_chapters(db, chapters)
+        # Úklid PŘED `state.reset_book` (kolo 2/9/10) - obě přejmenování
+        # musí uspět DOHROMADY (vše nebo nic), jinak by nezkontrolovaný
+        # draft zmizel z aktivních cest, aniž by o něm cokoli vědělo
+        # (spec "init --reset a draft/historie").
+        archived_history = None
+        archived_draft = None
+        try:
+            archived_history = _archive_polish_file(config.POLISH_HISTORY_PATH)
+            archived_draft = _archive_polish_file(config.POLISH_DRAFT_PATH)
+        except OSError as e:
+            ok = _safe_rollback_rename(archived_history, config.POLISH_HISTORY_PATH)
+            print(f"init --reset selhal (archivace polish souborů: {e}) - "
+                  "DB nedotčená." + ("" if ok else " Rollback SAMOTNÝ selhal, "
+                  "viz hláška výš - zkontroluj stav ručně."))
+            return 1
+        try:
+            state.reset_book(db)
+        except Exception as e:
+            ok_draft = _safe_rollback_rename(archived_draft, config.POLISH_DRAFT_PATH)
+            ok_history = _safe_rollback_rename(archived_history, config.POLISH_HISTORY_PATH)
+            print(f"init --reset selhal ({type(e).__name__}: {e}) - "
+                  "DB nedotčená." + ("" if ok_draft and ok_history else
+                  " Rollback SAMOTNÝ částečně selhal, viz hlášky výš - "
+                  "zkontroluj stav souborů ručně."))
+            return 1
+    # `state.seed_chapters` po `reset_book` zůstává BEZ dalšího rollbacku
+    # (kolo 5 IMPORTANT - vědomě přijaté zbytkové riziko, ne dořešeno):
+    # `reset_book` samo o sobě NENÍ vratné (žádný snapshot dat CHAPTERS
+    # tahle spec nikdy nedělala - to je mimo její rozsah, viz "Mimo
+    # rozsah" v designové spec). Kniha už je ale VALIDOVANÁ výš (selže-li
+    # TADY, je to infrastrukturní chyba - plný disk apod., ne špatný
+    # vstup) - DB v tom případě zůstává PRÁZDNÁ (`reset_book` proběhlo),
+    # ale ne poškozená - obyčejný `init <path>` (bez --reset) na
+    # prázdnou DB bezpečně doběhne, což je jasná a jednoduchá cesta ven.
+    try:
+        state.seed_chapters(db, chapters)
+    except Exception as e:
+        print(f"Načtení kapitol do DB selhalo ({type(e).__name__}: {e}) - "
+              "DB je teď PRÁZDNÁ (reset proběhl, načtení ne). Zkus "
+              "`python main.py init <cesta>` znovu (BEZ --reset, DB je "
+              "prázdná) - polish soubory zůstávají archivované beze změny.")
+        return 1
     print(f"Načteno kapitol: {len(chapters)}")
     return 0
 

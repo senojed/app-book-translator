@@ -1,3 +1,4 @@
+import argparse
 import os, json, sys
 import pytest
 import config
@@ -1179,4 +1180,191 @@ def test_polish_command_registered_and_mutating():
     ns = p.parse_args(["polish", "--only", "1", "2", "--force"])
     assert ns.func is main._cmd_polish
     assert ns.only == [1, 2] and ns.force is True
+
+
+def _init_args(path, reset=False):
+    return argparse.Namespace(path=path, reset=reset)
+
+
+def test_init_reset_archives_draft_and_history(tmp_path, monkeypatch):
+    db = str(tmp_path / "state.sqlite3")
+    state.init_db(db)
+    with state.connect(db) as conn:
+        conn.execute("INSERT INTO chapters (idx,title,raw_text,status) "
+                     "VALUES (1,'Old','en','done')")
+    monkeypatch.setattr(config, "DB_PATH", db)
+    draft_path = str(tmp_path / "polish.draft.json")
+    history_path = str(tmp_path / "polish.history.json")
+    monkeypatch.setattr(config, "POLISH_DRAFT_PATH", draft_path)
+    monkeypatch.setattr(config, "POLISH_HISTORY_PATH", history_path)
+    open(draft_path, "w", encoding="utf-8").write('{"schema_version":1,'
+        '"generated_at":"x","codex_model":"m","chapters":[]}')
+    open(history_path, "w", encoding="utf-8").write('{"schema_version":1,"entries":[]}')
+    book = tmp_path / "book.txt"
+    book.write_text("Kapitola 1\ntext")
+    monkeypatch.setattr(main.ingest, "load_book", lambda p: [])
+    rc = main._cmd_init(_init_args(str(book), reset=True))
+    assert rc == 0
+    assert not os.path.exists(draft_path)
+    assert not os.path.exists(history_path)
+    archived = os.listdir(tmp_path)
+    assert any(f.startswith("polish.draft.") and f != "polish.draft.json" for f in archived)
+    assert any(f.startswith("polish.history.") and f != "polish.history.json" for f in archived)
+    assert state.is_db_empty(db)   # reset proběhl
+
+
+def test_init_reset_missing_polish_files_is_a_noop(tmp_path, monkeypatch):
+    db = str(tmp_path / "state.sqlite3")
+    state.init_db(db)
+    monkeypatch.setattr(config, "DB_PATH", db)
+    monkeypatch.setattr(config, "POLISH_DRAFT_PATH", str(tmp_path / "polish.draft.json"))
+    monkeypatch.setattr(config, "POLISH_HISTORY_PATH", str(tmp_path / "polish.history.json"))
+    book = tmp_path / "book.txt"
+    book.write_text("x")
+    monkeypatch.setattr(main.ingest, "load_book", lambda p: [])
+    assert main._cmd_init(_init_args(str(book), reset=True)) == 0
+
+
+def test_init_reset_rolls_back_history_rename_if_draft_rename_fails(tmp_path, monkeypatch):
+    db = str(tmp_path / "state.sqlite3")
+    state.init_db(db)
+    monkeypatch.setattr(config, "DB_PATH", db)
+    draft_path = str(tmp_path / "polish.draft.json")
+    history_path = str(tmp_path / "polish.history.json")
+    monkeypatch.setattr(config, "POLISH_DRAFT_PATH", draft_path)
+    monkeypatch.setattr(config, "POLISH_HISTORY_PATH", history_path)
+    open(draft_path, "w", encoding="utf-8").write("draft-content")
+    open(history_path, "w", encoding="utf-8").write("history-content")
+    real_rename = os.rename
+    def _boom_on_draft(src, dst):
+        # `_archive_polish_file` volá `os.rename(path, archived)` PŘÍMO
+        # (žádný tmp soubor) - selhat musí přesně na draft_path jako
+        # zdroji, ať historie stihne úspěšně přejmenovat PRVNÍ (pořadí:
+        # historie → draft, viz `_cmd_init`).
+        if src == draft_path:
+            raise OSError("simulated failure")
+        real_rename(src, dst)
+    monkeypatch.setattr(main.os, "rename", _boom_on_draft)
+    book = tmp_path / "book.txt"
+    book.write_text("x")
+    monkeypatch.setattr(main.ingest, "load_book", lambda p: [])
+    rc = main._cmd_init(_init_args(str(book), reset=True))
+    assert rc == 1
+    # rollback: OBA soubory zpátky na původních jménech
+    assert open(draft_path, encoding="utf-8").read() == "draft-content"
+    assert open(history_path, encoding="utf-8").read() == "history-content"
+    # `state.reset_book` se NIKDY nevolalo (selhalo se dřív) - žádné přímé
+    # tvrzení o DB obsahu tu netřeba, netriviální DB pokrývá další test.
+
+
+def test_init_reset_rolls_back_both_renames_if_reset_book_fails(tmp_path, monkeypatch):
+    db = str(tmp_path / "state.sqlite3")
+    state.init_db(db)
+    with state.connect(db) as conn:
+        conn.execute("INSERT INTO chapters (idx,title,raw_text,status) "
+                     "VALUES (1,'Old','en','done')")
+    monkeypatch.setattr(config, "DB_PATH", db)
+    draft_path = str(tmp_path / "polish.draft.json")
+    history_path = str(tmp_path / "polish.history.json")
+    monkeypatch.setattr(config, "POLISH_DRAFT_PATH", draft_path)
+    monkeypatch.setattr(config, "POLISH_HISTORY_PATH", history_path)
+    open(draft_path, "w", encoding="utf-8").write("draft-content")
+    open(history_path, "w", encoding="utf-8").write("history-content")
+    monkeypatch.setattr(main.state, "reset_book",
+                        lambda *a, **k: (_ for _ in ()).throw(Exception("boom")))
+    book = tmp_path / "book.txt"
+    book.write_text("x")
+    monkeypatch.setattr(main.ingest, "load_book", lambda p: [])
+    rc = main._cmd_init(_init_args(str(book), reset=True))
+    assert rc == 1
+    assert open(draft_path, encoding="utf-8").read() == "draft-content"
+    assert open(history_path, encoding="utf-8").read() == "history-content"
+    assert state.get_chapter(db, 1)["title"] == "Old"   # DB beze změny
+
+
+def test_init_reset_rollback_failure_itself_is_reported_not_traceback(tmp_path, monkeypatch, capsys):
+    """Kolo 2 plán-ping-pongu IMPORTANT - i SAMOTNÝ rollback (`os.rename`
+    zpět) může selhat (disk skutečně rozbitý) - musí to vypsat přesný
+    stav, ne spadnout jako nezachycený traceback."""
+    db = str(tmp_path / "state.sqlite3")
+    state.init_db(db)
+    monkeypatch.setattr(config, "DB_PATH", db)
+    draft_path = str(tmp_path / "polish.draft.json")
+    history_path = str(tmp_path / "polish.history.json")
+    monkeypatch.setattr(config, "POLISH_DRAFT_PATH", draft_path)
+    monkeypatch.setattr(config, "POLISH_HISTORY_PATH", history_path)
+    open(draft_path, "w", encoding="utf-8").write("draft-content")
+    open(history_path, "w", encoding="utf-8").write("history-content")
+    real_rename = os.rename
+    def _boom_on_rollback_to_draft(src, dst):
+        # Blokuje JEN zápis NA `draft_path` - to je přesně rollback krok
+        # (`os.rename(archived, draft_path)`), ne prvotní archivace
+        # (jejíž cíl je timestampovaná cesta, ne `draft_path`).
+        if dst == draft_path:
+            raise OSError("rollback samo selhalo")
+        real_rename(src, dst)
+    monkeypatch.setattr(main.os, "rename", _boom_on_rollback_to_draft)
+    monkeypatch.setattr(main.state, "reset_book",
+                        lambda *a, **k: (_ for _ in ()).throw(Exception("boom")))
+    book = tmp_path / "book.txt"
+    book.write_text("x")
+    monkeypatch.setattr(main.ingest, "load_book", lambda p: [])
+    rc = main._cmd_init(_init_args(str(book), reset=True))
+    assert rc == 1   # nesmí spadnout jako traceback
+    out = capsys.readouterr().out
+    assert "rollback" in out.lower()
+
+
+def test_init_reset_invalid_book_touches_nothing(tmp_path, monkeypatch):
+    """Kolo 5 plán-ping-pongu BLOCKING - kniha se validuje JAKO PRVNÍ,
+    PŘED archivací/resetem. Špatný vstupní soubor tak nesmí zanechat DB
+    resetnutou ani draft/historii archivovanou."""
+    db = str(tmp_path / "state.sqlite3")
+    state.init_db(db)
+    with state.connect(db) as conn:
+        conn.execute("INSERT INTO chapters (idx,title,raw_text,status) "
+                     "VALUES (1,'Old','en','done')")
+    monkeypatch.setattr(config, "DB_PATH", db)
+    draft_path = str(tmp_path / "polish.draft.json")
+    history_path = str(tmp_path / "polish.history.json")
+    monkeypatch.setattr(config, "POLISH_DRAFT_PATH", draft_path)
+    monkeypatch.setattr(config, "POLISH_HISTORY_PATH", history_path)
+    open(draft_path, "w", encoding="utf-8").write("draft-content")
+    open(history_path, "w", encoding="utf-8").write("history-content")
+    monkeypatch.setattr(main.ingest, "load_book",
+                        lambda p: (_ for _ in ()).throw(ValueError("špatný formát")))
+    book = tmp_path / "book.txt"
+    book.write_text("x")
+    rc = main._cmd_init(_init_args(str(book), reset=True))
+    assert rc == 1
+    # NIC se nezměnilo - žádná archivace, žádný reset.
+    assert open(draft_path, encoding="utf-8").read() == "draft-content"
+    assert open(history_path, encoding="utf-8").read() == "history-content"
+    assert state.get_chapter(db, 1)["title"] == "Old"
+
+
+def test_init_reset_seed_failure_after_reset_gives_clear_recovery_path(tmp_path, monkeypatch, capsys):
+    """Kolo 5 plán-ping-pongu BLOCKING - `state.seed_chapters` může
+    selhat i PO úspěšném resetu (infrastrukturní chyba - `reset_book`
+    samo o sobě není vratné, žádný snapshot dat CHAPTERS tahle spec
+    nedělá). Musí to jasně vysvětlit, že DB je teď PRÁZDNÁ a obyčejný
+    `init` (bez --reset) je bezpečná cesta ven."""
+    db = str(tmp_path / "state.sqlite3")
+    state.init_db(db)
+    with state.connect(db) as conn:
+        conn.execute("INSERT INTO chapters (idx,title,raw_text,status) "
+                     "VALUES (1,'Old','en','done')")
+    monkeypatch.setattr(config, "DB_PATH", db)
+    monkeypatch.setattr(config, "POLISH_DRAFT_PATH", str(tmp_path / "polish.draft.json"))
+    monkeypatch.setattr(config, "POLISH_HISTORY_PATH", str(tmp_path / "polish.history.json"))
+    monkeypatch.setattr(main.ingest, "load_book", lambda p: [])
+    monkeypatch.setattr(main.state, "seed_chapters",
+                        lambda *a, **k: (_ for _ in ()).throw(Exception("disk full")))
+    book = tmp_path / "book.txt"
+    book.write_text("x")
+    rc = main._cmd_init(_init_args(str(book), reset=True))
+    assert rc == 1
+    assert state.is_db_empty(db) is True   # reset PROBĚHLO, seed ne
+    out = capsys.readouterr().out
+    assert "init" in out.lower() and "reset" in out.lower()
     assert "polish" in main._MUTATING
