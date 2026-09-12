@@ -389,6 +389,284 @@ def test_run_polish_review_server_cleans_up_unpromoted_snapshot(tmp_path, monkey
     assert not os.path.exists(db + ".pre-polish-review-snapshot")
 
 
+def test_apply_writes_text_and_moves_draft_to_history(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(
+        tmp_path, chapters=1,
+        draft_chapters=[_chapter_draft(1, cz_before="Věta 1.", styled="Věta 1. lepší")])
+    client = TestClient(app)
+    r = client.post("/api/polish/apply", json={"idx": 1, "text": "Věta 1. ručně."})
+    assert r.status_code == 200
+    assert state.get_chapter(db, 1)["translated_text"] == "Věta 1. ručně."
+    assert polish_store.is_draft_pending(draft_path) is False
+    hist = polish_store.load_history(history_path)["entries"]
+    assert len(hist) == 1 and hist[0]["cz_after"] == "Věta 1. ručně."
+    assert hist[0]["cz_before"] == "Věta 1."
+    assert hist[0]["source"] == "polish-review"
+
+
+def test_apply_uses_polish_marker_when_text_changed(tmp_path):
+    app, db, *_ = _app(tmp_path, chapters=1,
+                       draft_chapters=[_chapter_draft(1, cz_before="Věta 1.", styled="B")])
+    client = TestClient(app)
+    client.post("/api/polish/apply", json={"idx": 1, "text": "Nová věta."})
+    import main
+    assert main._already_styled(state.get_chapter(db, 1)["notes"]) is True
+
+
+def test_apply_marker_hashes_saved_text_not_cz_before(tmp_path):
+    """Kolo 3 plán-ping-pongu IMPORTANT - marker MUSÍ popisovat, co
+    SKUTEČNĚ šlo do knihy (`text`), ne originál (`cz_before`) ani
+    Codexův raw návrh (`styled`) - zvlášť důležité při ruční editaci,
+    kdy se všechny tři liší."""
+    import hashlib, json
+    import main
+    app, db, *_ = _app(tmp_path, chapters=1,
+                       draft_chapters=[_chapter_draft(1, cz_before="Věta 1.", styled="Návrh Codexu.")])
+    client = TestClient(app)
+    client.post("/api/polish/apply", json={"idx": 1, "text": "Ručně upravený text."})
+    marker = next(f for f in json.loads(state.get_chapter(db, 1)["notes"])
+                 if f.get("type") == "polish")
+    expected_hash = hashlib.sha256("Ručně upravený text.".encode("utf-8")).hexdigest()
+    assert expected_hash in marker["issue"]
+    assert str(len("Ručně upravený text.")) in marker["issue"]
+
+
+def test_apply_uses_kept_original_marker_when_text_unchanged_and_no_history(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(
+        tmp_path, chapters=1, draft_chapters=[_chapter_draft(1, cz_before="Věta 1.", styled="B")])
+    client = TestClient(app)
+    client.post("/api/polish/apply", json={"idx": 1, "text": "Věta 1."})
+    import main
+    assert main._already_styled(state.get_chapter(db, 1)["notes"]) is False
+    assert polish_store.load_history(history_path)["entries"] == []
+
+
+def test_apply_noop_retry_after_draft_removal_failure_is_idempotent(tmp_path, monkeypatch):
+    """Kolo 9 plán-ping-pongu IMPORTANT - GET/UI (kolo 6) UŽ detekuje
+    `already_committed_kept_original`, ale bez týhle kontroly PŘÍMO v
+    endpointu by retry no-op apply ZNOVU commitnul a přidal DRUHÝ
+    `kept_original` marker (CAS by prošel - DB text se u no-op apply
+    nemění)."""
+    app, db, draft_path, history_path, lock_path = _app(
+        tmp_path, chapters=1, draft_chapters=[_chapter_draft(1, cz_before="Věta 1.", styled="B")])
+    client = TestClient(app)
+    monkeypatch.setattr(polish_server.polish_store, "save_draft",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    r1 = client.post("/api/polish/apply", json={"idx": 1, "text": "Věta 1."})
+    assert r1.status_code == 500
+    assert polish_store.is_draft_pending(draft_path) is True
+    import main
+    notes1 = state.get_chapter(db, 1)["notes"]
+    assert sum(1 for f in main._parse_findings(notes1) if f.get("type") == "kept_original") == 1
+
+    monkeypatch.undo()   # obnov skutečný save_draft pro retry
+    r2 = client.post("/api/polish/apply", json={"idx": 1, "text": "Věta 1."})
+    assert r2.status_code == 200
+    assert polish_store.is_draft_pending(draft_path) is False
+    notes2 = state.get_chapter(db, 1)["notes"]
+    assert sum(1 for f in main._parse_findings(notes2) if f.get("type") == "kept_original") == 1
+
+
+def test_get_polish_does_not_flag_new_draft_stale_from_older_kept_original_same_text(tmp_path):
+    """Kolo 10 plán-ping-pongu BLOCKING - `already_committed_kept_original`
+    (kolo 6/9) dřív matchovala podle HASHE textu, ne konkrétního draftu.
+    Kapitola, co zůstává nestylizovaná, může mít STEJNÝ `cz_before` napříč
+    VÍCE nezávislými `polish` běhy - starý marker z DŘÍVĚJŠÍHO no-op apply
+    nesmí falešně označit ÚPLNĚ NOVÝ, nevyřízený draft jako už vyřízený.
+    (Kolo 11 plán-ping-pongu BLOCKING - patří sem do Task 9, ne do Task 8:
+    test potřebuje `POST /api/polish/apply`, co Task 8 ještě nemá.)"""
+    app, db, draft_path, history_path, lock_path = _app(
+        tmp_path, chapters=1,
+        draft_chapters=[_chapter_draft(1, cz_before="Věta 1.", styled="B", draft_id="draft-A")])
+    client = TestClient(app)
+    r1 = client.post("/api/polish/apply", json={"idx": 1, "text": "Věta 1."})
+    assert r1.status_code == 200
+    assert polish_store.is_draft_pending(draft_path) is False
+
+    # Nový nezávislý `polish` běh na STÁLE nestylizované kapitole (no-op
+    # apply DB text nezměnilo) - nový draft se STEJNÝM `cz_before`, ale
+    # JINÝM `draft_id`.
+    new_draft = polish_store.load_draft(draft_path)
+    new_draft["chapters"] = [_chapter_draft(1, cz_before="Věta 1.", styled="C", draft_id="draft-B")]
+    polish_store.save_draft(draft_path, new_draft)
+
+    body = client.get("/api/polish").json()
+    ch = body["chapters"][0]
+    assert ch["stale"] is False   # NENÍ vyřízeno - je to nový, nevyřízený draft
+
+    r2 = client.post("/api/polish/apply", json={"idx": 1, "text": "C"})
+    assert r2.status_code == 200
+    assert state.get_chapter(db, 1)["translated_text"] == "C"
+
+
+def test_apply_conflict_when_db_text_moved(tmp_path):
+    app, db, *_ = _app(tmp_path, chapters=1,
+                       draft_chapters=[_chapter_draft(1, cz_before="Věta 1.", styled="B")])
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET translated_text=? WHERE idx=1", ("Jinak.",))
+    client = TestClient(app)
+    r = client.post("/api/polish/apply", json={"idx": 1, "text": "X"})
+    assert r.status_code == 409
+    assert state.get_chapter(db, 1)["translated_text"] == "Jinak."
+
+
+def test_apply_conflict_when_status_not_done(tmp_path):
+    app, db, *_ = _app(tmp_path, chapters=1,
+                       draft_chapters=[_chapter_draft(1, cz_before="Věta 1.", styled="B")])
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET status='pending' WHERE idx=1")
+    client = TestClient(app)
+    r = client.post("/api/polish/apply", json={"idx": 1, "text": "X"})
+    assert r.status_code == 409
+
+
+def test_apply_400_on_bad_input(tmp_path):
+    app, *_ = _app(tmp_path, chapters=1, draft_chapters=[_chapter_draft(1)])
+    client = TestClient(app)
+    assert client.post("/api/polish/apply", json={"idx": "x", "text": "y"}).status_code == 400
+    assert client.post("/api/polish/apply", json={"idx": 1, "text": None}).status_code == 400
+
+
+def test_apply_400_on_bool_idx(tmp_path):
+    """Kolo 3 plán-ping-pongu BLOCKING - `isinstance(True, int)` je
+    `True` v Pythonu; `idx: true` by se bez explicitní kontroly chovalo
+    jako `idx: 1` a mohlo tichem apply-nout ŠPATNOU kapitolu."""
+    app, *_ = _app(tmp_path, chapters=1, draft_chapters=[_chapter_draft(1)])
+    client = TestClient(app)
+    r = client.post("/api/polish/apply", json={"idx": True, "text": "y"})
+    assert r.status_code == 400
+
+
+def test_apply_reads_draft_only_while_holding_write_lock(tmp_path, monkeypatch):
+    """Kolo 3 plán-ping-pongu BLOCKING - draft SE MUSÍ číst uvnitř
+    `write_lock`, ne PŘED ním - jinak by souběžný `discard` mohl
+    proběhnout MEZI apply čtením draftu a jeho vlastním získáním zámku,
+    a apply by i tak zapsalo právě zahozenou kapitolu (CAS na DB text
+    tohle nezachytí, protože `discard` DB vůbec netouch - jen draft.json).
+    Deterministický test bez skutečné souběžnosti: špehuje, jestli je
+    `write_lock` už držený v okamžiku, kdy apply volá `load_draft`."""
+    app, db, draft_path, history_path, lock_path = _app(
+        tmp_path, chapters=1, draft_chapters=[_chapter_draft(1, cz_before="Věta 1.", styled="B")])
+    real_load_draft = polish_server.polish_store.load_draft
+    seen = {"locked": None}
+    def _spy_load_draft(path):
+        if path == draft_path:
+            seen["locked"] = app.state.write_lock.locked()
+        return real_load_draft(path)
+    monkeypatch.setattr(polish_server.polish_store, "load_draft", _spy_load_draft)
+    client = TestClient(app)
+    client.post("/api/polish/apply", json={"idx": 1, "text": "B"})
+    assert seen["locked"] is True
+
+
+def test_apply_503_when_lock_lost_no_db_or_json_write(tmp_path, monkeypatch):
+    """Kolo 7 plán-ping-pongu IMPORTANT - unit testy pokrývaly `refresh_
+    lock` samostatně, ale žádný nedokazoval end-to-end kontrakt endpointu:
+    ztracený zámek musí vrátit 503 BEZ jakéhokoli zápisu do DB nebo
+    draftu/historie."""
+    app, db, draft_path, history_path, lock_path = _app(
+        tmp_path, chapters=1, draft_chapters=[_chapter_draft(1, cz_before="Věta 1.", styled="B")])
+    app.state.require_lock = lambda: False
+    client = TestClient(app)
+    r = client.post("/api/polish/apply", json={"idx": 1, "text": "B"})
+    assert r.status_code == 503
+    assert state.get_chapter(db, 1)["translated_text"] == "Věta 1."
+    assert polish_store.is_draft_pending(draft_path) is True
+
+
+def test_apply_404_when_idx_not_in_draft(tmp_path):
+    app, *_ = _app(tmp_path, chapters=1, draft_chapters=[])
+    client = TestClient(app)
+    r = client.post("/api/polish/apply", json={"idx": 1, "text": "x"})
+    assert r.status_code == 404
+
+
+def test_apply_corrupt_history_returns_500_without_db_write(tmp_path):
+    """Kolo 2 plán-ping-pongu BLOCKING - historie se validuje PŘED
+    commitem. Test poškodí `history.json` PO startu serveru (obchází
+    startovní preflight, simuluje ruční zásah za běhu) a ověří, že
+    apply NEZAPÍŠE nic do DB, když historie nejde načíst."""
+    app, db, draft_path, history_path, lock_path = _app(
+        tmp_path, chapters=1, draft_chapters=[_chapter_draft(1, cz_before="Věta 1.", styled="B")])
+    open(history_path, "w", encoding="utf-8").write("{not valid json")
+    client = TestClient(app)
+    r = client.post("/api/polish/apply", json={"idx": 1, "text": "B"})
+    assert r.status_code == 500
+    assert state.get_chapter(db, 1)["translated_text"] == "Věta 1."
+    assert polish_store.is_draft_pending(draft_path) is True
+
+
+def test_apply_pre_commit_failure_returns_500_db_and_draft_unchanged(tmp_path, monkeypatch):
+    """Kolo 12 plán-ping-pongu IMPORTANT - selhání `commit_chapter_result`
+    SAMOTNÉHO (SQLite transakce - `src/state.py` garantuje "výjimka
+    kdekoli uvnitř = nic se necommitne") musí vrátit ŘÍZENOU 500 s jasným
+    "text NEBYL uložen", ne propadnout jako neřízená výjimka - a DB/draft
+    zůstávají NEDOTČENÉ, protože k commitu vůbec nedošlo."""
+    app, db, draft_path, history_path, lock_path = _app(
+        tmp_path, chapters=1, draft_chapters=[_chapter_draft(1, cz_before="Věta 1.", styled="B")])
+    monkeypatch.setattr(polish_server.state, "commit_chapter_result",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk full")))
+    client = TestClient(app)
+    r = client.post("/api/polish/apply", json={"idx": 1, "text": "Nový text."})
+    assert r.status_code == 500
+    assert "nebyl" in r.json()["error"].lower()
+    assert state.get_chapter(db, 1)["translated_text"] == "Věta 1."
+    assert polish_store.is_draft_pending(draft_path) is True
+
+
+def test_apply_post_commit_save_failure_db_already_updated(tmp_path, monkeypatch):
+    """Kolo 5 plán-ping-pongu IMPORTANT - selhání ZÁPISU historie/draftu
+    AŽ PO úspěšném DB commitu je jiná třída chyby, než selhání PŘED
+    commitem (viz test výš) - DB SE ZMĚNILA a zpráva to musí říct."""
+    app, db, draft_path, history_path, lock_path = _app(
+        tmp_path, chapters=1, draft_chapters=[_chapter_draft(1, cz_before="Věta 1.", styled="B")])
+    monkeypatch.setattr(polish_server.polish_store, "save_history",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    client = TestClient(app)
+    r = client.post("/api/polish/apply", json={"idx": 1, "text": "Nový text."})
+    assert r.status_code == 500
+    assert "uloži" in r.json()["error"].lower() or "ulož" in r.json()["error"].lower()
+    # DB SE PŘESTO ZMĚNILA - commit proběhl dřív, než save_history spadlo.
+    assert state.get_chapter(db, 1)["translated_text"] == "Nový text."
+
+
+def test_apply_backs_up_db_only_once(tmp_path):
+    app, db, *_ = _app(
+        tmp_path, chapters=2,
+        draft_chapters=[_chapter_draft(1, cz_before="Věta 1.", styled="B1"),
+                        _chapter_draft(2, cz_before="Věta 2.", styled="B2")])
+    client = TestClient(app)
+    client.post("/api/polish/apply", json={"idx": 1, "text": "B1"})
+    import os as _os
+    mtime1 = _os.path.getmtime(db + ".pre-polish-backup")
+    client.post("/api/polish/apply", json={"idx": 2, "text": "B2"})
+    assert _os.path.getmtime(db + ".pre-polish-backup") == mtime1
+
+
+def test_apply_uses_live_glossary_not_snapshot_from_draft_creation(tmp_path, monkeypatch):
+    """Kolo 13 plán-ping-pongu IMPORTANT - `glossary_rows` se natahuje
+    ŽIVĚ (`glossary.all_terms(db_path)`) UVNITŘ handleru, NIKDY se
+    nepřenáší z doby vzniku draftu - na rozdíl od `rendered_terms` (ty
+    JSOU zmrazené, viz `test_revert_uses_stored_rendered_terms_not_
+    narrowed_live_mentions`). Term přidaný do glosáře MEZI vznikem
+    draftu a apply musí být vidět v `mentions`/`build_mentions`."""
+    app, db, draft_path, history_path, lock_path = _app(
+        tmp_path, chapters=1, draft_chapters=[_chapter_draft(1, cz_before="Věta 1.", styled="B")])
+    seen = {}
+    def _bm(en, cz, glossary_rows, rendered_terms):
+        seen["glossary_rows"] = list(glossary_rows)
+        return []
+    monkeypatch.setattr(polish_server.concordance, "build_mentions", _bm)
+    monkeypatch.setattr(polish_server.concordance, "check_chapter", lambda *a, **k: [])
+    with state.connect(db) as conn:
+        conn.execute("INSERT INTO glossary (term_id,canonical_en,cz) VALUES "
+                     "('t/new','New','Nový')")
+    client = TestClient(app)
+    r = client.post("/api/polish/apply", json={"idx": 1, "text": "B"})
+    assert r.status_code == 200
+    assert any(g["term_id"] == "t/new" for g in seen["glossary_rows"])
+
+
 def test_run_polish_review_server_stops_heartbeat_before_returning(tmp_path, monkeypatch):
     """Kolo 14 plán-ping-pongu IMPORTANT - heartbeat vlákno se dřív při
     ČISTÉM vypnutí serveru nikdy explicitně nezastavovalo (jen `daemon=

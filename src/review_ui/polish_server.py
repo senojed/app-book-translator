@@ -251,6 +251,156 @@ def build_app(db_path: str, draft_path: str, history_path: str, lock_path: str) 
             hist_out = [e for _, e in hist_out][:20]
         return {"chapters": chapters, "history": _annotate_history(db_path, history, hist_out)}
 
+    @app.post("/api/polish/apply")
+    def post_apply(payload: dict):
+        idx_raw, text = payload.get("idx"), payload.get("text")
+        # `type(x) is int` NE `isinstance` (kolo 3 plán-ping-pongu
+        # BLOCKING - `bool` je podtřída `int`, `isinstance(True, int)`
+        # je `True`; `idx: true` by se choval jako `idx: 1`). Tahle
+        # kontrola zůstává PŘED zámkem - je to levná kontrola TVARU
+        # requestu, ne rozhodnutí závislé na stavu, žádný důvod držet
+        # kvůli ní `write_lock`.
+        if type(idx_raw) is not int or not isinstance(text, str):
+            return JSONResponse({"error": "idx musí být int, text musí být str"},
+                                status_code=400)
+        idx = idx_raw
+        # CELÉ rozhodnutí - ověření zámku, čtení draftu, existence
+        # položky, CAS, zápis - je JEDNA atomická operace (kolo 3 + kolo
+        # 4 plán-ping-pongu BLOCKING): draft se dřív četl MIMO
+        # `write_lock` (kolo 3 - souběžný `discard` mohl proběhnout
+        # MEZI čtením a získáním zámku, CAS na DB text to nezachytí).
+        # `require_lock()` se dřív volalo PŘED `write_lock` (kolo 4) -
+        # čekání na `write_lock` (drží ho jiný request) mohlo trvat
+        # dost dlouho, že by MEZITÍM mohl zestárnout zámek napříč
+        # procesy a ověření z PŘED čekáním by bylo zastaralé. Ověření
+        # JAKO PRVNÍ krok UVNITŘ zámku dělá kontrolu platnou přesně v
+        # okamžiku, kdy se s ní skutečně pracuje.
+        with write_lock:
+            if not app.state.require_lock():
+                return JSONResponse({"error": "zámek ztracen"}, status_code=503)
+            draft, err = _try_load_draft(draft_path)
+            if err:
+                return err
+            ch = next((c for c in draft["chapters"] if c["idx"] == idx), None)
+            if ch is None:
+                return JSONResponse({"error": "kapitola už není ve frontě - "
+                                              "zkontroluj, jestli mezitím neproběhla "
+                                              "v jiné kartě"}, status_code=404)
+            row = state.get_chapter(db_path, idx)
+            if (row is None or row["translated_text"] != ch["cz_before"]
+                    or row["status"] != "done"):
+                return JSONResponse(
+                    {"error": "kapitola se mezitím změnila mimo tenhle review - "
+                              "pravděpodobně `answer`/nová revize; zkontroluj "
+                              "aktuální text, případně spusť `polish` znovu"},
+                    status_code=409)
+
+            import main   # lazy - main.py nikdy neimportuje tenhle modul na top-levelu
+            changed = text != ch["cz_before"]
+            if not changed:
+                # Idempotentní zkrácení PŘED jakýmkoli DB zápisem (kolo 9
+                # plán-ping-pongu IMPORTANT) - GET/UI (kolo 6) UŽ tenhle
+                # stav DETEKUJE (`already_committed_kept_original`), ale
+                # samotný endpoint by bez týhle kontroly no-op apply
+                # ZNOVU commitnul a přidal DRUHÝ `kept_original` marker.
+                # Match podle `ch["draft_id"]`, NIKDY podle hashe textu
+                # (kolo 10 plán-ping-pongu BLOCKING - stejný `cz_before`
+                # se může legitimně opakovat napříč VÍCE nezávislými
+                # `polish` běhy; hash by falešně přeskočil komit pro
+                # ÚPLNĚ NOVÝ, nevyřízený draft) - když marker se STEJNÝM
+                # `draft_id` UŽ existuje, TOHLE rozhodnutí bylo dřív
+                # potvrzeno, zbývá jen dokončit úklid draftu.
+                already = any(
+                    f.get("source") == "stylist" and f.get("type") == "kept_original"
+                    and f.get("draft_id") == ch["draft_id"]
+                    for f in main._parse_findings(row["notes"]))
+                if already:
+                    draft["chapters"] = [c for c in draft["chapters"] if c["idx"] != idx]
+                    try:
+                        polish_store.save_draft(draft_path, draft)
+                    except Exception as e:
+                        return JSONResponse(
+                            {"error": f"Zápis draftu selhal ({type(e).__name__}: "
+                                      f"{e}) - rozhodnutí bylo dřív potvrzeno, jen "
+                                      "se nepovedlo odebrat z fronty, zkus to znovu."},
+                            status_code=500)
+                    return {"ok": True}
+
+            # Historie se NAČTE (a tím i validuje) PŘED jakýmkoli zápisem
+            # do DB (kolo 2 plán-ping-pongu BLOCKING - dřív se `load_
+            # history` volalo AŽ PO `commit_chapter_result`: poškozená
+            # historie by pak nechala DB už změněnou, ale request by
+            # spadl s nezachyceným `PolishStoreError` a draft by zůstal
+            # viset pending bez historie). Startovní preflight v `build_
+            # app` tohle pokrývá pro "poškozeno PŘED spuštěním serveru" -
+            # tady navíc pro "poškozeno AŽ za běhu" (ruční zásah do
+            # souboru mezitím).
+            history, err = _try_load_history(history_path)
+            if err:
+                return err
+
+            en = row["raw_text"]
+            glossary_rows = glossary.all_terms(db_path)
+            mentions = concordance.build_mentions(en, text, glossary_rows, ch["rendered_terms"])
+            # Marker VŽDY popisuje `text` (co SKUTEČNĚ šlo do knihy),
+            # NIKDY `cz_before`/`styled` (kolo 3 plán-ping-pongu IMPORTANT
+            # - dřív `_stylist_marker(ch["cz_before"], ...)` popisoval
+            # PŮVODNÍ text, ne uložený - auditní hash/délka by neseděly
+            # s tím, co reálně skončilo v DB, zvlášť při ruční editaci).
+            marker = (main._stylist_marker(text, draft["codex_model"]) if changed
+                      else main._kept_original_marker(text, draft["codex_model"], ch["draft_id"]))
+            findings = ch["findings"] + [marker]
+
+            # Záloha + DB commit OBALENÉ (kolo 12 plán-ping-pongu IMPORTANT
+            # - dřív bez ošetření propadly jako neřízená 500). `commit_
+            # chapter_result` je JEDNA SQLite transakce (`src/state.py` -
+            # "Výjimka kdekoli uvnitř = nic se necommitne"), takže selhání
+            # TADY znamená JISTOTU, ne domněnku, že se DB nezměnila -
+            # bezpečné vrátit jasné "text NEBYL uložen, zkus znovu".
+            import json as _json
+            try:
+                main._backup_db_once(db_path, app.state.backup_state)
+                state.commit_chapter_result(
+                    db_path, idx, translated_text=text,
+                    revision_rounds=row["revision_rounds"],   # z ŽIVÉ DB (kolo 2), ne z draftu
+                    notes_json=_json.dumps(findings, ensure_ascii=False), status="done",
+                    new_candidates=[], mentions=mentions, questions=[])
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"Text NEBYL uložen - záloha/DB commit selhal "
+                              f"({type(e).__name__}: {e}) - zkus to znovu."},
+                    status_code=500)
+
+            # DB commit VÝŠ už proběhl a je NEODVOLATELNÝ - selhání
+            # NÍŽE (disk plný, práva) je jiná třída chyby než selhání
+            # PŘED commitem (kolo 5 plán-ping-pongu IMPORTANT - dřív se
+            # tenhle rozdíl nikde neřekl, request by dostal obyčejnou
+            # 500 bez vysvětlení, že kniha SE ZMĚNILA). `GET /api/polish`
+            # (kolo 3/4 detekce) tenhle konkrétní stav sama najde příští
+            # načtení stránky (DB už neodpovídá draftu/historii), takže
+            # nejde o TICHOU korupci - jen o hůř formulovanou 500 bez
+            # tyhle opravy.
+            try:
+                if changed:
+                    history["entries"].append({
+                        "idx": idx, "applied_at": polish_store.utc_now_z(),
+                        "cz_before": ch["cz_before"], "cz_after": text,
+                        "styled_by_codex": ch["styled"], "title": ch["title"],
+                        "findings": findings, "rendered_terms": ch["rendered_terms"],
+                        "source": "polish-review", "draft_id": ch["draft_id"]})
+                    polish_store.save_history(history_path, history)
+
+                draft["chapters"] = [c for c in draft["chapters"] if c["idx"] != idx]
+                polish_store.save_draft(draft_path, draft)
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"Text SE ULOŽIL do knihy úspěšně, ale zápis "
+                              f"do historie/draftu selhal ({type(e).__name__}: "
+                              f"{e}) - načti stránku znovu, `polish-review` "
+                              "detekuje nesoulad a nabídne úklid přes "
+                              "`discard`."}, status_code=500)
+        return {"ok": True}
+
     app.state.write_lock = write_lock
     app.state.lock_lost = lock_lost
     app.state.shutdown_heartbeat = shutdown
