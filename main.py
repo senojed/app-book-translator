@@ -95,7 +95,12 @@ def _parse_findings(notes_json: str | None) -> list:
 
 
 def _already_styled(notes_json: str | None) -> bool:
-    return any(f.get("source") == "stylist" for f in _parse_findings(notes_json))
+    """`type == "polish"` (ne jen `source == "stylist"`) - kolo 5/7:
+    revert marker a "kept_original" marker mají STEJNÝ source, ale JINÝ
+    type, aby po revertu / potvrzení originálu bylo možné `polish`
+    znovu nabídnout bez `--force`."""
+    return any(f.get("source") == "stylist" and f.get("type") == "polish"
+              for f in _parse_findings(notes_json))
 
 
 def _stylist_marker(cz_before: str, model: str) -> dict:
@@ -109,8 +114,36 @@ def _stylist_marker(cz_before: str, model: str) -> dict:
             "action": "note", "term_id": None, "expected": None,
             "actual": None, "cz_excerpt": None,
             "issue": f"stylizováno přes Codex (model={model}), "
-                    f"původní délka {len(cz_before)} znaků, hash "
+                    f"délka {len(cz_before)} znaků, hash "
                     f"{hashlib.sha256(cz_before.encode('utf-8')).hexdigest()}.",
+            "suggestion": None}
+
+
+def _kept_original_marker(text: str, model: str, draft_id: str) -> dict:
+    """Apply BEZ věcné změny (text == cz_before) - kolo 7: `type` musí
+    LIŠIT od `_stylist_marker`, jinak by `_already_styled` nepravdivě
+    tvrdilo, že kapitola byla stylizována, i když zůstala nezměněná.
+    `draft_id` je VLASTNÍ pole, NE součást `issue` textu (kolo 10
+    plán-ping-pongu BLOCKING) - `_stale_info`/`post_apply`'s idempotence
+    (kolo 6/9) musí porovnávat KONKRÉTNÍ draft, ne hash obsahu textu,
+    protože STEJNÝ `cz_before` se může legitimně opakovat napříč VÍCE
+    nezávislými `polish` běhy na kapitole, co zůstává nestylizovaná."""
+    return {"source": "stylist", "type": "kept_original", "severity": "info",
+            "action": "note", "term_id": None, "expected": None,
+            "actual": None, "cz_excerpt": None, "draft_id": draft_id,
+            "issue": f"potvrzeno ponechání originálu přes polish-review "
+                    f"(model={model}), délka {len(text)} znaků, hash "
+                    f"{hashlib.sha256(text.encode('utf-8')).hexdigest()}.",
+            "suggestion": None}
+
+
+def _revert_marker(note: str) -> dict:
+    """Kolo 5: `type` odlišný od `_stylist_marker`, ať `_already_styled`
+    po revertu vrátí `False` (kapitola se má chovat, jako by ještě
+    nebyla stylizována)."""
+    return {"source": "stylist", "type": "revert", "severity": "info",
+            "action": "note", "term_id": None, "expected": None,
+            "actual": None, "cz_excerpt": None, "issue": note,
             "suggestion": None}
 
 

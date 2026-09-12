@@ -329,6 +329,39 @@ def test_stylist_marker_shape_and_hash():
     assert "model=gpt-5-codex" in m["issue"]
 
 
+def test_already_styled_true_for_polish_marker():
+    notes = json.dumps([main._stylist_marker("cz", "m")])
+    assert main._already_styled(notes) is True
+
+
+def test_already_styled_false_for_revert_marker():
+    notes = json.dumps([main._revert_marker("vráceno")])
+    assert main._already_styled(notes) is False
+
+
+def test_already_styled_false_for_kept_original_marker():
+    notes = json.dumps([main._kept_original_marker("cz", "m", "draft-1")])
+    assert main._already_styled(notes) is False
+
+
+def test_kept_original_marker_shape():
+    m = main._kept_original_marker("text", "model-x", "draft-42")
+    assert m["source"] == "stylist" and m["type"] == "kept_original"
+    assert "model-x" in m["issue"]
+    assert m["draft_id"] == "draft-42"
+
+
+def test_revert_marker_carries_note_as_issue():
+    m = main._revert_marker("vráceno na verzi před poslední stylizací")
+    assert m["source"] == "stylist" and m["type"] == "revert"
+    assert m["issue"] == "vráceno na verzi před poslední stylizací"
+
+
+def test_stylist_marker_wording_does_not_claim_original():
+    m = main._stylist_marker("nejaky text", "model-x")
+    assert "původní" not in m["issue"]
+
+
 def test_finding_key_includes_actual():
     f = {"type": "inconsistency", "term_id": "t/a", "actual": "špatně"}
     assert main._finding_key(f) == ("inconsistency", "t/a", "špatně")
