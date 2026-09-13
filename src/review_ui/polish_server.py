@@ -17,9 +17,12 @@ _STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 _LOCK_REFRESH_INTERVAL = state._LOCK_STALE_SECONDS // 2   # kolo 2
 
 
-def _stale_info(db_path: str, draft_ch: dict, history_entries: list) -> "dict | None":
-    """Spec kolo 3/4 - GET detekuje AKTIVNĚ, ne pasivně přes 409 při retry."""
-    row = state.get_chapter(db_path, draft_ch["idx"])
+def _stale_info(row: "dict | None", draft_ch: dict, history_entries: list) -> "dict | None":
+    """Spec kolo 3/4 - GET detekuje AKTIVNĚ, ne pasivně přes 409 při retry.
+    `row` (kolo polish-ui-v2 IMPORTANT) - dřív si funkce sama volala
+    `state.get_chapter`, takže `get_polish` otvíralo DB spojení PODRUHÉ
+    jen kvůli `raw_text` pro EN sloupec. Volající teď kapitolu načte
+    JEDNOU a předá řádek sem - žádná duplicitní DB práce."""
     if row is None:
         return None
     if row["translated_text"] == draft_ch["cz_before"]:
@@ -211,7 +214,13 @@ def build_app(db_path: str, draft_path: str, history_path: str, lock_path: str) 
         chapters = []
         for ch in draft["chapters"]:
             row = dict(ch)
-            stale = _stale_info(db_path, ch, history)
+            db_row = state.get_chapter(db_path, ch["idx"])
+            # `raw_text` (kolo polish-ui-v2) - anglický originál pro třetí
+            # UI panel. `db_row` může být `None`, když kapitola mezitím
+            # zmizela z DB (stejná hrana, co uz `_stale_info` řeší níž) -
+            # `None` je pak i výsledný `raw_text`, ne pád na chybějícím klíči.
+            row["raw_text"] = db_row["raw_text"] if db_row else None
+            stale = _stale_info(db_row, ch, history)
             row["stale"] = stale is not None
             if stale:
                 row["reason"] = stale["reason"]

@@ -75,6 +75,31 @@ def test_get_polish_returns_pending_and_history(tmp_path):
     assert body["history"] == []
 
 
+def test_get_polish_includes_raw_text_for_english_original_context(tmp_path):
+    """UI kolo polish-ui-v2 - třetí panel (ORIGINÁL EN) potřebuje anglický
+    zdrojový text vedle CZ originálu/návrhu. `_db` fixture vkládá `raw_text`
+    `"EN"` pro každou kapitolu - GET musí tenhle text vrátit beze změny."""
+    app, db, draft_path, history_path, lock_path = _app(
+        tmp_path, chapters=1, draft_chapters=[_chapter_draft(1, cz_before="Věta 1.")])
+    client = TestClient(app)
+    body = client.get("/api/polish").json()
+    assert body["chapters"][0]["raw_text"] == "EN"
+
+
+def test_get_polish_raw_text_is_none_when_chapter_deleted_from_db(tmp_path):
+    """Edge case - kapitola byla mezitím smazaná z DB (`_stale_info` uz
+    tenhle `get_chapter -> None` případ řeší jinde, GET nesmí spadnout na
+    chybějícím `raw_text`, jen ho vrátí jako `None`)."""
+    app, db, draft_path, history_path, lock_path = _app(
+        tmp_path, chapters=1, draft_chapters=[_chapter_draft(1, cz_before="Věta 1.")])
+    with state.connect(db) as conn:
+        conn.execute("DELETE FROM chapters WHERE idx=1")
+    client = TestClient(app)
+    r = client.get("/api/polish")
+    assert r.status_code == 200
+    assert r.json()["chapters"][0]["raw_text"] is None
+
+
 def test_heartbeat_thread_calls_refresh_lock_periodically(tmp_path, monkeypatch):
     """Code review nález IMPORTANT (Task 8 review kolo 1) - dřív nic
     neověřovalo, že heartbeat vlákno SKUTEČNĚ volá `state.refresh_lock`

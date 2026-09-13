@@ -7,21 +7,36 @@
   body { font-family: system-ui, sans-serif; margin: 0; padding: 1.5rem;
         background: #f7f7f5; color: #1a1a1a; }
   h1 { font-size: 1.3rem; }
+  /* Tab-navigace mezi kapitolami (UI kolo polish-ui-v2, bod 4) - jen JEDNA
+     kapitola je vidět naráz, tahle lišta pilulek přepíná, kterou. */
+  .tabs { display: flex; gap: .4rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  .tab { padding: .35rem .8rem; border: 1px solid #ccc; border-radius: 999px;
+        background: #fff; cursor: pointer; font-size: .85rem; }
+  .tab.stale { border-color: #d9822b; color: #b35c00; }
+  .tab.active { background: #1a6b3c; color: #fff; border-color: #1a6b3c; }
   .chapter { background: #fff; border: 1px solid #ddd; border-radius: 8px;
             padding: 1rem; margin-bottom: 1.5rem; }
   .chapter.stale { border-color: #d9822b; background: #fff8ee; }
   .stale-msg { color: #b35c00; font-weight: 600; margin-bottom: .5rem; }
   .findings { font-size: .85rem; color: #555; margin-bottom: .5rem; }
   .findings li { margin-bottom: .2rem; }
-  .panes { display: flex; gap: 1rem; }
-  .pane { flex: 1; min-width: 0; }
+  .panes { display: flex; gap: 1rem; align-items: stretch; }
+  .pane { flex: 1; min-width: 0; display: flex; flex-direction: column; }
   .pane h4 { margin: 0 0 .3rem; font-size: .8rem; text-transform: uppercase;
             color: #888; }
-  .pane pre, .pane textarea { width: 100%; box-sizing: border-box;
-            min-height: 200px; font-family: inherit; font-size: .95rem;
-            white-space: pre-wrap; padding: .5rem; border: 1px solid #ccc;
-            border-radius: 4px; }
-  .pane pre { background: #fafafa; overflow-y: auto; }
+  /* Sdílená pevná výška (bod 3) - VŠECHNY panely v řádku kapitoly mají
+     stejnou výšku, ať uz jde o <pre>, <textarea>, nebo diff <div>. */
+  .pane-content { height: 320px; box-sizing: border-box; font-family: inherit;
+            font-size: .95rem; white-space: pre-wrap; padding: .5rem;
+            border: 1px solid #ccc; border-radius: 4px; overflow-y: auto; }
+  .pane pre.pane-content, .pane div.pane-content { background: #fafafa; margin: 0; }
+  /* Editovatelný panel: JEN horizontální resize (bod 3) - výška zůstává
+     zamčená na výšku řádku, uživatel může roztáhnout jen šířku. */
+  .pane textarea.pane-content { background: #fff; width: 100%; resize: horizontal; }
+  .diff-box .diff-del { text-decoration: line-through; color: #b3261e;
+            background: #fbe4e2; }
+  .diff-box .diff-add { color: #1a6b3c; background: #e3f3e9; }
+  .diff-too-big { color: #888; font-style: italic; margin: 0; }
   .buttons { margin-top: .5rem; display: flex; gap: .5rem; flex-wrap: wrap; }
   button { cursor: pointer; border: 1px solid #ccc; background: #fff;
           border-radius: 4px; padding: .4rem .8rem; font-size: .85rem; }
@@ -36,6 +51,7 @@
 </head>
 <body>
 <h1>Polish review</h1>
+<div id="tabs" class="tabs"></div>
 <div id="chapters"></div>
 
 <h2>Historie</h2>
@@ -46,14 +62,19 @@
 <div id="history"></div>
 
 <script>
-// Kolo 1 plán-ping-pongu BLOCKING - `title`/`issue`/`cz_before`/`styled`
-// jsou Codexem-odvozený (nedůvěryhodný, prompt-injectable) text. CELÁ
-// tahle stránka proto staví DOM VÝHRADNĚ přes `createElement`+`textContent`
-// (nikdy `innerHTML` s interpolovaným textem) a posluchače přes
-// `addEventListener` s daty v JS closure (nikdy inline `onclick="..."`
-// s `JSON.stringify` uvnitř HTML atributu - to by šlo prolomit uvozovkou
-// v samotném textu a spustit libovolný JS/žádost).
+// Kolo 1 plán-ping-pongu BLOCKING - `title`/`issue`/`cz_before`/`styled`/
+// `raw_text` jsou Codexem-odvozený nebo z knihy převzatý (nedůvěryhodný,
+// prompt-injectable) text. CELÁ tahle stránka proto staví DOM VÝHRADNĚ přes
+// `createElement`+`textContent` (nikdy `innerHTML` s interpolovaným textem)
+// a posluchače přes `addEventListener` s daty v JS closure (nikdy inline
+// `onclick="..."` s `JSON.stringify` uvnitř HTML atributu - to by šlo
+// prolomit uvozovkou v samotném textu a spustit libovolný JS/žádost). Diff
+// preview (UI kolo polish-ui-v2, bod 2) drží stejnou disciplínu - i tam jde
+// o nedůvěryhodný text (originál i ručně/Codexem upravená verze).
 let LAST = { chapters: [], history: [] };
+let activeIdx = null;          // idx aktuálně zobrazené kapitoly (tab-nav)
+let CARD_ELS = {};             // idx -> DOM div kapitoly (přepínání beze ztráty rozepsané editace)
+let TAB_ELS = {};              // idx -> DOM tlačítko záložky
 
 async function load() {
   const r = await fetch('/api/polish');
@@ -63,6 +84,7 @@ async function load() {
   // `LAST` na `{error: ...}` a `LAST.chapters.length` spadlo v JS -
   // pečlivě formulovaná server chyba tak nikdy nebyla vidět.
   if (!r.ok) {
+    document.getElementById('tabs').textContent = '';
     const root = document.getElementById('chapters');
     root.textContent = '';
     root.appendChild(el('p', { class: 'error', text: body.error || `HTTP ${r.status}` }));
@@ -98,14 +120,111 @@ function el(tag, opts, children) {
   return e;
 }
 
+// --- Slovní LCS diff pro živý náhled rozdílu (bod 2) ---------------------
+
+// Ochrana proti O(n*m) LCS tabulce na obřím textu (kolo polish-ui-v2) -
+// klasická slovní LCS je kvadratická v počtu tokenů. Nad `DIFF_TOKEN_CAP`
+// tokenů na jedné straně bychom alokovali desítky MB a diff by mohl trvat
+// citelně dlouho i po debounce - radši ukázat kratší hlášku, než nechat
+// stránku sekat při psaní v dlouhé kapitole. Zjednodušení oproti zadání
+// (žádný "coarser" fallback diff, jen jasná zpráva "moc velké na náhled").
+const DIFF_TOKEN_CAP = 6000;
+
+function tokenizeWords(s) {
+  // Zachovává mezery jako VLASTNÍ tokeny (split se zachytávací skupinou),
+  // aby diff četl jako přirozený text, ne jako slova bez mezer mezi sebou.
+  return (s || '').split(/(\s+)/).filter(t => t.length > 0);
+}
+
+function diffWords(before, after) {
+  const a = tokenizeWords(before);
+  const b = tokenizeWords(after);
+  if (a.length > DIFF_TOKEN_CAP || b.length > DIFF_TOKEN_CAP) return null;
+  const n = a.length, m = b.length, w = m + 1;
+  const dp = new Uint16Array((n + 1) * w);
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      dp[i * w + j] = (a[i - 1] === b[j - 1])
+        ? dp[(i - 1) * w + (j - 1)] + 1
+        : Math.max(dp[(i - 1) * w + j], dp[i * w + (j - 1)]);
+    }
+  }
+  const ops = [];
+  let i = n, j = m;
+  while (i > 0 && j > 0) {
+    if (a[i - 1] === b[j - 1]) { ops.push({ type: 'equal', text: a[i - 1] }); i--; j--; }
+    else if (dp[(i - 1) * w + j] >= dp[i * w + (j - 1)]) { ops.push({ type: 'del', text: a[i - 1] }); i--; }
+    else { ops.push({ type: 'add', text: b[j - 1] }); j--; }
+  }
+  while (i > 0) ops.push({ type: 'del', text: a[--i] });
+  while (j > 0) ops.push({ type: 'add', text: b[--j] });
+  ops.reverse();
+  return ops;
+}
+
+function renderDiff(container, before, after) {
+  container.textContent = '';
+  const ops = diffWords(before, after);
+  if (ops === null) {
+    container.appendChild(el('p', { class: 'diff-too-big',
+      text: 'Náhled rozdílu je pro tak dlouhý text vypnutý (moc velké na živé porovnání).' }));
+    return;
+  }
+  for (const op of ops) {
+    if (op.type === 'equal') {
+      container.appendChild(document.createTextNode(op.text));   // textContent-ekvivalent, ne innerHTML
+    } else {
+      container.appendChild(el('span',
+        { class: op.type === 'del' ? 'diff-del' : 'diff-add', text: op.text }));
+    }
+  }
+}
+
+// --- Vykreslení kapitol + tab-navigace (bod 4) ---------------------------
+
 function renderChapters() {
+  const tabsRoot = document.getElementById('tabs');
   const root = document.getElementById('chapters');
+  tabsRoot.textContent = '';
   root.textContent = '';
+  CARD_ELS = {};
+  TAB_ELS = {};
   if (LAST.chapters.length === 0) {
+    activeIdx = null;
     root.appendChild(el('p', { text: 'Žádné kapitoly nečekají na review.' }));
     return;
   }
-  for (const ch of LAST.chapters) root.appendChild(chapterCard(ch));
+  // Aktivní kapitola zmizela (uložena/zahozena/revertnuta jinde) - spadni
+  // na první zbývající, přesně jak dřív dělal plochý seznam (ten prostě
+  // ukázal všechny zbývající, tady ukazujeme první z nich).
+  if (!LAST.chapters.some(c => c.idx === activeIdx)) {
+    activeIdx = LAST.chapters[0].idx;
+  }
+  for (const ch of LAST.chapters) {
+    const tab = el('button', { class: 'tab' + (ch.stale ? ' stale' : ''),
+      text: `#${ch.idx} - ${ch.title}` });
+    tab.addEventListener('click', () => switchTab(ch.idx));
+    TAB_ELS[ch.idx] = tab;
+    tabsRoot.appendChild(tab);
+
+    const card = chapterCard(ch);
+    CARD_ELS[ch.idx] = card;
+    root.appendChild(card);
+  }
+  switchTab(activeIdx);
+}
+
+function switchTab(idx) {
+  // Přepnutí NIKDY nepřestavuje karty (na rozdíl od `renderChapters`) -
+  // jen mění `hidden`, takže rozepsaná editace v jiné, právě opuštěné
+  // kapitole zůstává zachovaná, dokud nepřijde další `load()`.
+  activeIdx = idx;
+  for (const [i, tab] of Object.entries(TAB_ELS)) {
+    tab.classList.toggle('active', Number(i) === idx);
+  }
+  for (const [i, card] of Object.entries(CARD_ELS)) {
+    card.hidden = Number(i) !== idx;
+  }
 }
 
 function chapterCard(ch) {
@@ -132,20 +251,42 @@ function chapterCard(ch) {
       text: `[${f.severity || '?'}] ${f.issue || '(bez popisu)'}` })));
   div.appendChild(findings);
 
-  const origPre = el('pre', { text: ch.cz_before });
-  const textarea = el('textarea');
+  // Čtvrtý panel (bod 1) - anglický originál pro kontext. `raw_text` může
+  // chybět/být `null` (kapitola mezitím zmizela z DB - server to teď hlídá
+  // stejně jako u `_stale_info`), ukaž srozumitelnou náhradu místo pádu.
+  const enPre = el('pre', { class: 'pane-content',
+    text: ch.raw_text != null ? ch.raw_text : '(originál nedostupný)' });
+  const origPre = el('pre', { class: 'pane-content', text: ch.cz_before });
+  const textarea = el('textarea', { class: 'pane-content' });
   textarea.value = ch.styled;
+  // Živý diff náhled (bod 2) - samostatný read-only panel, NE inline
+  // zvýrazňování uvnitř textarey (křehké, netriviální na spolehlivost).
+  const diffBox = el('div', { class: 'pane-content diff-box' });
+
   const panes = el('div', { class: 'panes' }, [
-    el('div', { class: 'pane' }, [el('h4', { text: 'Originál' }), origPre]),
+    el('div', { class: 'pane' }, [el('h4', { text: 'Originál EN' }), enPre]),
+    el('div', { class: 'pane' }, [el('h4', { text: 'Originál CZ' }), origPre]),
     el('div', { class: 'pane' }, [el('h4', { text: 'Návrh (editovatelné)' }), textarea]),
+    el('div', { class: 'pane' }, [el('h4', { text: 'Rozdíl CZ originál vs. návrh' }), diffBox]),
   ]);
   div.appendChild(panes);
 
+  let diffTimer = null;
+  const refreshDiff = () => renderDiff(diffBox, ch.cz_before, textarea.value);
+  const scheduleDiff = () => {
+    // Lehký debounce (150-200 ms) - nepočítat LCS na KAŽDÝ stisk klávesy
+    // u dlouhé kapitoly, jen když psaní na chvíli ustane.
+    clearTimeout(diffTimer);
+    diffTimer = setTimeout(refreshDiff, 180);
+  };
+  refreshDiff();   // počáteční diff (originál vs. Codexův návrh), bez čekání na debounce
+  textarea.addEventListener('input', scheduleDiff);
+
   const errBox = el('div', { class: 'error' });
   const btnOrig = el('button', { text: 'Vrať na originál' });
-  btnOrig.addEventListener('click', () => { textarea.value = ch.cz_before; });
+  btnOrig.addEventListener('click', () => { textarea.value = ch.cz_before; refreshDiff(); });
   const btnCodex = el('button', { text: 'Vrať na Codex' });
-  btnCodex.addEventListener('click', () => { textarea.value = ch.styled; });
+  btnCodex.addEventListener('click', () => { textarea.value = ch.styled; refreshDiff(); });
   const btnApply = el('button', { class: 'primary', text: 'Uložit tuhle kapitolu' });
   btnApply.addEventListener('click', () => applyChapter(ch.idx, textarea, errBox));
   const btnDiscard = el('button', { class: 'danger', text: 'Zahodit' });
