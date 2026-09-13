@@ -6,6 +6,7 @@ Fáze běhu:
     review             web UI: potvrdíš návod → guide.json (+ reseed glosáře)
     run [--retry-flagged [IDX...]]   překladová smyčka
     polish [--only IDX...] [--force]   stylistický průchod přes Codex (status=="done", volitelné, za STYLIST_ACCEPT_FS_RISK)
+    polish-review      web UI: ruční review draftu z `polish`, apply/revert per kapitola
     questions / answer QID "text"    dávkové otázky
     status / export [--only-done]
 
@@ -32,7 +33,8 @@ from src import reference_mine, textnorm
 from src.agents import scout, stylist
 from src.llm.client import AnthropicClient, FatalRunError, OutputTruncated, PipelineLLMClient
 
-_MUTATING = {"init", "scan", "run", "answer", "review", "reference", "polish"}
+_MUTATING = {"init", "scan", "run", "answer", "review", "reference", "polish",
+            "polish-review"}
 
 _MARKERS = {"done": "OK", "pending": "..", "flagged": "!!", "needs_human": "??",
             "error": "XX", "processing": "~~"}
@@ -905,6 +907,13 @@ def _cmd_review(args) -> int:
     return 0
 
 
+def _cmd_polish_review(args) -> int:
+    from src.review_ui import polish_server
+    return polish_server.run_polish_review_server(
+        config.DB_PATH, config.POLISH_DRAFT_PATH, config.POLISH_HISTORY_PATH,
+        config.LOCK_PATH)
+
+
 def _cmd_run(args) -> int:
     db = config.DB_PATH
     state.recover_processing(db)
@@ -1273,6 +1282,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pol.add_argument("--force", action="store_true",
                        help="stylizuj i kapitoly, co už prošly (přepíše dřívější stylizaci)")
     p_pol.set_defaults(func=_cmd_polish)
+
+    sub.add_parser("polish-review", help="web UI: ruční review stylistického "
+                   "průchodu, apply/revert per kapitola").set_defaults(
+                       func=_cmd_polish_review)
 
     sub.add_parser("status", help="přehled kapitol").set_defaults(func=_cmd_status)
     sub.add_parser("questions", help="otevřené otázky").set_defaults(func=_cmd_questions)

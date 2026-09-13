@@ -1182,6 +1182,32 @@ def test_polish_command_registered_and_mutating():
     assert ns.only == [1, 2] and ns.force is True
 
 
+def test_polish_review_command_registered_and_mutating():
+    assert "polish-review" in main._MUTATING
+    args = main._build_parser().parse_args(["polish-review"])
+    assert args.func is main._cmd_polish_review
+
+
+def test_cmd_polish_review_calls_server_with_configured_paths(tmp_path, monkeypatch):
+    seen = {}
+    def _fake_run(db_path, draft_path, history_path, lock_path, **kw):
+        seen.update(db_path=db_path, draft_path=draft_path,
+                    history_path=history_path, lock_path=lock_path)
+        return 0
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "s.sqlite3"))
+    monkeypatch.setattr(config, "POLISH_DRAFT_PATH", str(tmp_path / "d.json"))
+    monkeypatch.setattr(config, "POLISH_HISTORY_PATH", str(tmp_path / "h.json"))
+    monkeypatch.setattr(config, "LOCK_PATH", str(tmp_path / ".lock"))
+    import src.review_ui.polish_server as ps_module
+    monkeypatch.setattr(ps_module, "run_polish_review_server", _fake_run)
+    rc = main._cmd_polish_review(argparse.Namespace())
+    assert rc == 0
+    assert seen["db_path"] == config.DB_PATH
+    assert seen["draft_path"] == config.POLISH_DRAFT_PATH
+    assert seen["history_path"] == config.POLISH_HISTORY_PATH
+    assert seen["lock_path"] == config.LOCK_PATH
+
+
 def _init_args(path, reset=False):
     return argparse.Namespace(path=path, reset=reset)
 
