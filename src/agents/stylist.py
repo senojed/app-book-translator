@@ -126,6 +126,14 @@ from src.llm.parsing import extract_json
 # vynucuje - `structural_findings()` níž by kratší "ukázku" i tak
 # odchytila jako `length_drift`/`structure_drift`, ale je levnější tomu
 # rovnou předejít, než to pokaždé posílat k ručnímu review.
+#
+# DODATEK 2 (2026-09-13 v3, uživatelská zpětná vazba): Codex bez omezení
+# rozsekal skoro KAŽDOU větu do vlastního odstavce (85→119 odstavců,
+# průměrná délka 104→72 znaků) - technicky v toleranci `structural_
+# findings`, ale nechtěné. Přidána JEDNA věta doporučení (ne zákaz -
+# "drž se podobného rytmu", ne "nesmíš měnit odstavce"), ať se neopakuje
+# efekt zamítnutých "PEVNÝCH HRANIC" (seznam zákazů výš v tomhle
+# komentáři) - je to rada o rytmu, ne restrikce OBSAHU.
 POLISH_PROMPT_TEMPLATE = """Umíš tenhle text učesat? Teď je děsně
 kostrbatej. Přidávám ještě anglický originál.
 
@@ -137,7 +145,10 @@ kostrbatej. Přidávám ještě anglický originál.
 
 (Odpověz POUZE učesaným českým textem CELÉ kapitoly od začátku do konce -
 žádný úvodní komentář, žádné vysvětlení, žádná "ukázka" jen části, žádné
-markdown citace ani bloky, nic navíc kolem.)"""
+markdown citace ani bloky, nic navíc kolem. Odstavce klidně uprav, ale
+drž se podobného rytmu jako originál - neroztrhej skoro každou větu do
+vlastního odstavce, uvozující větu repliky nech spojenou s replikou
+samotnou, kde to originál taky dělá.)"""
 
 
 class StylistError(Exception):
