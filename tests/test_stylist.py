@@ -144,14 +144,17 @@ def test_polish_roundtrips_utf8_diacritics(tmp_path):
     Codexu. Fake skript přečte stdin, VYTÁHNE si jen český text (mezi
     značkami promptu - stejná délka/struktura jako originál, ať neselže na
     strukturální kontrole) a s drobnou úpravou ho napíše do `-o` - test tak
-    ověří CELOU cestu tam (stdin) i zpět (-o), ne jen jednu stranu."""
+    ověří CELOU cestu tam (stdin) i zpět (-o), ne jen jednu stranu.
+    Regex musí sedět na OBOU prompt šablonách dvoukolového `polish()`
+    (2026-09-13) - kolo 1 má jiný nadpis sekce než kolo 2, fake skript se
+    volá v obou."""
     fake = tmp_path / "echo_codex.py"
     fake.write_text(
         "import sys, re\n"
         "out = sys.argv[sys.argv.index('-o') + 1]\n"
         "received = sys.stdin.buffer.read().decode('utf-8').replace('\\r\\n', '\\n')\n"
-        "m = re.search(r'--- ČESKÝ PŘEKLAD K UPRAVENÍ ---\\n(.*?)\\n\\nOdpověz',\n"
-        "             received, re.DOTALL)\n"
+        "m = re.search(r'--- ČESK[ÝÁ] (?:PŘEKLAD K UPRAVENÍ|VERZE K OVĚŘENÍ)"
+        " ---\\n(.*?)\\n\\nOdpověz', received, re.DOTALL)\n"
         "cz = m.group(1)\n"
         "open(out, 'w', encoding='utf-8').write(cz.replace('Řekl', 'Pravil'))\n",
         encoding="utf-8")
@@ -357,6 +360,8 @@ def test_polish_invokes_codex_with_expected_argv(tmp_path):
 
 
 def test_polish_long_input_goes_through_stdin_not_argv(tmp_path, monkeypatch):
+    """Regex tolerantní k oběma kolům dvoukolového `polish()` (2026-09-13)
+    - viz `test_polish_roundtrips_utf8_diacritics`."""
     monkeypatch.setattr(config, "STYLIST_MAX_CHARS", 1_000_000)
     long_cz = "\n\n".join(["Odstavec o delce, co by se do argv nevesla. " * 800
                            for _ in range(3)])
@@ -366,8 +371,8 @@ def test_polish_long_input_goes_through_stdin_not_argv(tmp_path, monkeypatch):
         "import sys, re\n"
         "out = sys.argv[sys.argv.index('-o') + 1]\n"
         "received = sys.stdin.buffer.read().decode('utf-8').replace('\\r\\n', '\\n')\n"
-        "m = re.search(r'--- ČESKÝ PŘEKLAD K UPRAVENÍ ---\\n"
-        "(.*?)\\n\\nOdpověz upravenou', received, re.DOTALL)\n"
+        "m = re.search(r'--- ČESK[ÝÁ] (?:PŘEKLAD K UPRAVENÍ|VERZE K OVĚŘENÍ)"
+        " ---\\n(.*?)\\n\\nOdpověz', received, re.DOTALL)\n"
         "cz = m.group(1)\n"
         "open(out, 'w', encoding='utf-8').write("
         "cz.replace('Odstavec', 'Upraveny odstavec'))\n",
@@ -435,6 +440,50 @@ def test_polish_forwards_guide_block_into_prompt(tmp_path):
                             codex_cmd=[sys.executable, str(fake)],
                             guide_block="NEPORUS-VYKANI-XYZ")
     assert "Druha veta" in result   # fake zapsal výstup => assert v něm prošel
+
+
+def test_polish_two_pass_wiring(tmp_path):
+    """Dvoukolový `polish()` (2026-09-13, pilotní nález) - ověřuje SAMOTNOU
+    orchestraci, ne jen že staré testy náhodou přežijí:
+    1) KOLO 1 dostane JEN `cz_text`, anglický originál v jeho promptu vůbec
+       není (proto text psaný uvnitř `EN-MARKER-UNIKATNI` nesmí být ve
+       stdin prvního volání).
+    2) KOLO 2 dostane anglický originál A VÝSTUP KOLA 1 (ne původní
+       `cz_text`) jako 'českou verzi k ověření'.
+    Fake skript si drží počítadlo volání v souboru (dvě NEZÁVISLÁ spuštění
+    procesu, žádný sdílený stav v paměti)."""
+    counter_path = tmp_path / "calls.txt"
+    stdin1_path = tmp_path / "stdin1.txt"
+    stdin2_path = tmp_path / "stdin2.txt"
+    fake = tmp_path / "two_pass_codex.py"
+    fake.write_text(
+        "import sys\n"
+        f"counter_path = {str(counter_path)!r}\n"
+        "n = int(open(counter_path).read()) if __import__('os').path.exists(counter_path) else 0\n"
+        "open(counter_path, 'w').write(str(n + 1))\n"
+        "received = sys.stdin.buffer.read().decode('utf-8')\n"
+        "out = sys.argv[sys.argv.index('-o') + 1]\n"
+        "if n == 0:\n"
+        f"    open({str(stdin1_path)!r}, 'w', encoding='utf-8').write(received)\n"
+        "    open(out, 'w', encoding='utf-8').write('VYSTUP-KOLA-JEDNA stejne dlouhy jako vstup je.')\n"
+        "else:\n"
+        f"    open({str(stdin2_path)!r}, 'w', encoding='utf-8').write(received)\n"
+        "    open(out, 'w', encoding='utf-8').write('VYSTUP-KOLA-DVA stejne dlouhy jako vstup je.')\n",
+        encoding="utf-8")
+    cmd = [sys.executable, str(fake)]
+    result = stylist.polish("EN-MARKER-UNIKATNI text originalu.",
+                            "Puvodni cesky text stejne dlouhy jako vystup.", codex_cmd=cmd)
+
+    stdin1 = stdin1_path.read_text(encoding="utf-8")
+    stdin2 = stdin2_path.read_text(encoding="utf-8")
+    assert "EN-MARKER-UNIKATNI" not in stdin1   # kolo 1 NEMÁ anglický originál
+    assert "Puvodni cesky text" in stdin1        # kolo 1 dostal originální CZ
+
+    assert "EN-MARKER-UNIKATNI" in stdin2        # kolo 2 MÁ anglický originál
+    assert "VYSTUP-KOLA-JEDNA" in stdin2             # kolo 2 dostal VÝSTUP KOLA 1...
+    assert "Puvodni cesky text" not in stdin2    # ...ne původní CZ text
+
+    assert result == "VYSTUP-KOLA-DVA stejne dlouhy jako vstup je."
 
 
 def test_polish_kills_process_tree_on_keyboard_interrupt(monkeypatch):
