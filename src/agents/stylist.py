@@ -109,11 +109,23 @@ from src.llm.parsing import extract_json
 # změnil. Závěr: sama PŘÍTOMNOST seznamu "NESMÍŠ..." vedle sebe dělá
 # model nápadně opatrným i tam, kde mu zadání volnost výslovně dává;
 # nejde o tón ani o dvoukolovost, jde o samotnou strukturu "tady jsou
-# zákazy". `polish()` níž proto žádný seznam zákazů v promptu NEMÁ -
-# bezpečnost/věrnost hlídají POUZE nezávislé kontroly PO stylizaci
-# (strukturální kontrola níž, kritik + concordance + meaning-check v
+# zákazy". `polish()` níž proto žádný seznam zákazů OBSAHU v promptu
+# NEMÁ - bezpečnost/věrnost hlídají POUZE nezávislé kontroly PO stylizaci
+# (strukturální nálezy + kritik + concordance + meaning-check v
 # `_cmd_polish`, a nakonec člověk v `polish-review`) - to je vědomá
 # volba: víc věcí půjde k ručnímu review, ale návrhy budou odvážnější.
+#
+# DODATEK (2026-09-13 v2, pilotní nález): bez FORMÁTOVÉHO pokynu Codex
+# místo celé kapitoly někdy vrátí konverzační odpověď - úvodní komentář
+# ("Ano. Překlad je významově většinou v pořádku...") a jen "Ukázku
+# učesaného začátku" v markdown citaci (`>`), ne celý text. Tohle NENÍ
+# obsahové omezení jako zamítnutá "PEVNÁ HRANICE" výš (neříká CO smí/
+# nesmí změnit) - je to čistě FORMÁT odpovědi, jiná kategorie, co s
+# potlačením odvahy nesouvisí. Poslední řádek promptu (ne první, ať to
+# neproblikne stejným "seznam pravidel hned na začátku" efektem) to
+# vynucuje - `structural_findings()` níž by kratší "ukázku" i tak
+# odchytila jako `length_drift`/`structure_drift`, ale je levnější tomu
+# rovnou předejít, než to pokaždé posílat k ručnímu review.
 POLISH_PROMPT_TEMPLATE = """Umíš tenhle text učesat? Teď je děsně
 kostrbatej. Přidávám ještě anglický originál.
 
@@ -121,7 +133,11 @@ kostrbatej. Přidávám ještě anglický originál.
 {en_text}
 
 --- ČESKÝ PŘEKLAD ---
-{cz_text}"""
+{cz_text}
+
+(Odpověz POUZE učesaným českým textem CELÉ kapitoly od začátku do konce -
+žádný úvodní komentář, žádné vysvětlení, žádná "ukázka" jen části, žádné
+markdown citace ani bloky, nic navíc kolem.)"""
 
 
 class StylistError(Exception):
@@ -407,6 +423,16 @@ def _exec_codex(prompt_text: str, *, codex_cmd: list[str], codex_model: str,
     if result.startswith("```") or result.endswith("```"):
         raise StylistError(
             f"odpověď je obalená v markdown bloku (```) navzdory pokynu - "
+            f"podezřelý formát, radši zamítnout. [{label}]")
+    # Markdown CITACE (`>` na začátku) - stejný princip jako ``` výš, jen
+    # jiný obal (2026-09-13 v2, pilotní nález: reálná odpověď byla úvodní
+    # komentář + "Ukázka učesaného začátku:" + `> ...` citace jen ČÁSTI
+    # kapitoly, ne celý text). `structural_findings()` by kratší výstup
+    # stejně odchytila (length_drift/structure_drift), ale tohle je
+    # levnější a jde tomu rovnou předejít.
+    if result.startswith(">"):
+        raise StylistError(
+            f"odpověď je obalená v markdown citaci (>) navzdory pokynu - "
             f"podezřelý formát, radši zamítnout. [{label}]")
     return result
 

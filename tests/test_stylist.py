@@ -312,6 +312,15 @@ def test_polish_raises_on_markdown_fence_wrapper(tmp_path):
         stylist.polish("EN", "Prvni odstavec.\n\nDruhy odstavec.", codex_cmd=cmd)
 
 
+def test_polish_raises_on_markdown_blockquote_wrapper(tmp_path):
+    """Pilotní nález (2026-09-13 v2): model vrátil úvodní komentář +
+    "Ukázka učesaného začátku:" + jen ČÁST kapitoly v markdown citaci
+    (`>`), ne celý text - stejný princip jako ``` blok výš, jiný obal."""
+    cmd = _fake_codex(tmp_path, "> Prvni odstavec.\n\n> Druhy odstavec.")
+    with pytest.raises(stylist.StylistError, match="markdown"):
+        stylist.polish("EN", "Prvni odstavec.\n\nDruhy odstavec.", codex_cmd=cmd)
+
+
 def test_polish_returns_output_file_contents(tmp_path):
     cz = ("Prvni odstavec byl napsan drive a ted se cte hur.\n\n"
           "Druhy odstavec byl take napsan drive a cte se podobne.")
@@ -384,7 +393,7 @@ def test_polish_long_input_goes_through_stdin_not_argv(tmp_path, monkeypatch):
         "import sys, re\n"
         "out = sys.argv[sys.argv.index('-o') + 1]\n"
         "received = sys.stdin.buffer.read().decode('utf-8').replace('\\r\\n', '\\n')\n"
-        "m = re.search(r'--- ČESKÝ PŘEKLAD ---\\n(.*)', received, re.DOTALL)\n"
+        "m = re.search(r'--- ČESKÝ PŘEKLAD ---\\n(.*?)\\n\\n\\(Odpověz', received, re.DOTALL)\n"
         "cz = m.group(1)\n"
         "open(out, 'w', encoding='utf-8').write("
         "cz.replace('Odstavec', 'Upraveny odstavec'))\n",
