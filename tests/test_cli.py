@@ -717,7 +717,7 @@ def test_polish_one_chapter_returns_draft_dict_when_no_reasons(tmp_path, monkeyp
 
 def test_polish_one_chapter_returns_draft_dict_with_reason_types_when_rejected(tmp_path, monkeypatch):
     db = _polish_db(tmp_path)
-    monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Jiná věta se SECRET.")
+    monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Jiná věta SECRET.")
     monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
     monkeypatch.setattr(main.concordance, "build_mentions", lambda *a, **k: [])
     monkeypatch.setattr(main.pipeline, "_run_critic",

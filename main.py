@@ -181,11 +181,15 @@ def _rejection_reasons(baseline_concordance: list, after_findings: list,
     nešlo stylizovat (kolo 3 IMPORTANT).
 
     Tři pravidla, každé pro jiný zdroj nálezu:
-    1. `meaning_drift`/`register_drift` (zdroj `stylist_check`) - odmítá
-       VŽDY, když se objeví. `register_drift` přidán v kole 7 (tykání/
-       vykání, hlas vypravěče) - deterministicky nové signály, PŘED
-       stylizací nemohly existovat (ta kontrola PŘED tímhle během vůbec
-       neexistovala).
+    1. `meaning_drift`/`register_drift`/`structure_drift`/`length_drift`/
+       `number_drift` (zdroj `stylist_check`) - odmítá VŽDY, když se
+       objeví. `register_drift` přidán v kole 7 (tykání/vykání, hlas
+       vypravěče); `structure_drift`/`length_drift`/`number_drift`
+       přidány 2026-09-13 v2 (`stylist.structural_findings` - dřív to
+       samo `stylist.polish()` řešilo tvrdým `StylistError`, teď je to
+       nález jako kterýkoli jiný, viz `stylist.py` docstring proč) -
+       všechny deterministicky nové signály, PŘED stylizací nemohly
+       existovat (ta kontrola PŘED tímhle během vůbec neexistovala).
     2. Kritikův nález s `action == "revise"` (`severity == "critical"`) -
        odmítá VŽDY. Kapitola má `status == "done"`, což už samo o sobě
        znamená, že v PŮVODNÍM stavu žádný takový nález neměla (jinak by
@@ -231,7 +235,8 @@ def _rejection_reasons(baseline_concordance: list, after_findings: list,
     """
     reasons = []
     reasons += [f for f in after_findings
-                if f.get("type") in ("meaning_drift", "register_drift")]
+                if f.get("type") in ("meaning_drift", "register_drift",
+                                     "structure_drift", "length_drift", "number_drift")]
     reasons += [f for f in after_findings
                 if f.get("source") == "critic" and f.get("action") == "revise"]
     baseline_keys = {_finding_key(f) for f in baseline_concordance}
@@ -593,6 +598,11 @@ def _polish_one_chapter(c, glossary_rows, cf, db, model: str,
 
     baseline_concordance = concordance.check_chapter(en, cz, glossary_rows, rendered_terms)
     findings = concordance.check_chapter(en, styled, glossary_rows, rendered_terms)
+    # Strukturální nálezy (odstavce/délka/čísla) - deterministické, žádné
+    # LLM volání, PŘED kritikem (2026-09-13 v2 - dřív uvnitř `stylist.
+    # polish()` jako tvrdé zamítnutí, viz `structural_findings` docstring
+    # proč se to přestavělo na nález jako kterýkoli jiný).
+    findings += stylist.structural_findings(cz, styled)
     try:
         critic_findings, critic_failed = pipeline._run_critic(en, styled, cf("critic"))
         findings += critic_findings

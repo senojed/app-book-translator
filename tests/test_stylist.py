@@ -198,34 +198,57 @@ def test_polish_raises_stylist_error_on_permission_error(tmp_path, monkeypatch):
         stylist.polish("EN", "CZ", codex_cmd=[sys.executable])
 
 
-def test_polish_raises_on_paragraph_count_mismatch(tmp_path):
-    """Levná strukturální kontrola - jeden odstavec místo dvou (poloviční
-    počet) = podezřele zkrácený výstup, i kdyby exit kód byl 0 a soubor
-    neprázdný. Zůstává tvrdé selhání i po uvolnění na toleranci (2026-09-13,
-    volnější polish) - poloviční počet je mimo jakoukoli rozumnou toleranci
-    pro editorské sloučení/rozdělení pár odstavců."""
+def test_polish_returns_text_even_on_gross_paragraph_mismatch(tmp_path):
+    """`polish()` už NEzahazuje na strukturální kontrole (2026-09-13 v2 -
+    viz `stylist.polish` docstring: "hlídač u dveří" bez šance na review
+    byl přestavěn na `structural_findings()`, co vrací nález, ne výjimku).
+    I hrubě odlišný počet odstavců (2 → 1) se teď vrátí volajícímu -
+    `_polish_one_chapter`/`_cmd_polish` z toho udělají draft s nálezem,
+    ne tiché zahození."""
     cmd = _fake_codex(tmp_path, "Jen jeden odstavec, podobně dlouhý jako vstup celkem.")
-    with pytest.raises(stylist.StylistError, match="odstavců"):
-        stylist.polish("EN", "Prvni odstavec.\n\nDruhy odstavec.", codex_cmd=cmd)
+    result = stylist.polish("EN", "Prvni odstavec.\n\nDruhy odstavec.", codex_cmd=cmd)
+    assert result == "Jen jeden odstavec, podobně dlouhý jako vstup celkem."
 
 
 def test_polish_allows_small_paragraph_count_drift(tmp_path):
-    """Volnější polish (2026-09-13) - stylista smí sloučit/rozdělit PÁR
-    odstavců kvůli plynulosti (pilot nález: reálný Codex běh změnil počet
-    odstavců o +1 ze 64-85 - editorská drobnost, ne uťatý výstup). Dřív by
-    tenhle výstup tvrdě spadl jako 'počet odstavců se liší', i když jde o
-    legitimní editorskou úpravu, ne o chybu."""
+    """`polish()` beze změny vrátí i mírně jiný počet odstavců (pilot
+    nález: reálný Codex běh změnil počet odstavců o +1 ze 64-85 -
+    editorská drobnost) - `structural_findings()` pro tohle navíc ani
+    nevygeneruje nález (uvnitř tolerance), viz test níž."""
     cz = "\n\n".join(f"Odstavec s dostatecne dlouhym textem, poradove {i}." for i in range(20))
     styled_text = cz + "\n\nJeste jeden odstavec navic, bez cislic."   # 20 -> 21 odstavcu
     cmd = _fake_codex(tmp_path, styled_text)
     result = stylist.polish("EN", cz, codex_cmd=cmd)
     assert result == styled_text
+    assert stylist.structural_findings(cz, styled_text) == []
 
 
-def test_polish_raises_on_wildly_different_length(tmp_path):
-    cmd = _fake_codex(tmp_path, "X")   # jeden znak místo dlouhého textu, ale STEJNÝ počet odstavců (1)
-    with pytest.raises(stylist.StylistError, match="délka"):
-        stylist.polish("EN", "Dost dlouhý český text pro porovnání délky výstupu.", codex_cmd=cmd)
+def test_polish_returns_text_even_on_wildly_different_length(tmp_path):
+    cmd = _fake_codex(tmp_path, "X")   # jeden znak místo dlouhého textu
+    result = stylist.polish("EN", "Dost dlouhý český text pro porovnání délky výstupu.", codex_cmd=cmd)
+    assert result == "X"
+
+
+def test_structural_findings_flags_paragraph_count_drift():
+    findings = stylist.structural_findings(
+        "Prvni odstavec.\n\nDruhy odstavec.",
+        "Jen jeden odstavec, podobně dlouhý jako vstup celkem.")
+    types = [f["type"] for f in findings]
+    assert "structure_drift" in types
+    assert all(f["source"] == "stylist_check" for f in findings)
+
+
+def test_structural_findings_flags_length_drift():
+    findings = stylist.structural_findings(
+        "Dost dlouhý český text pro porovnání délky výstupu.", "X")
+    assert "length_drift" in [f["type"] for f in findings]
+
+
+def test_structural_findings_empty_for_normal_edit():
+    findings = stylist.structural_findings(
+        "Prvni odstavec byl napsan drive.\n\nDruhy odstavec taky.",
+        "Prvni odstavec vznikl drive, teď zni lip.\n\nDruhy odstavec taky, o neco plynuleji.")
+    assert findings == []
 
 
 def test_polish_raises_on_chapter_too_long(tmp_path, monkeypatch):
@@ -250,28 +273,26 @@ def test_polish_allows_chapter_at_size_limit(tmp_path, monkeypatch):
     assert result == cz
 
 
-def test_polish_raises_on_changed_number(tmp_path):
+def test_structural_findings_flags_changed_number():
     """Kolo 6 IMPORTANT: přehozená číslice ("12"→"21") zůstává čitelná pro
     LLM kontroly, ale je to faktická změna - deterministická kontrola
     čísel to musí chytit sama, bez spoléhání na kritika."""
-    cz = "Bylo jich 12 a čekali od rána."
-    cmd = _fake_codex(tmp_path, "Bylo jich 21 a čekali od rána.")
-    with pytest.raises(stylist.StylistError, match="čísla"):
-        stylist.polish("EN", cz, codex_cmd=cmd)
+    findings = stylist.structural_findings(
+        "Bylo jich 12 a čekali od rána.", "Bylo jich 21 a čekali od rána.")
+    assert "number_drift" in [f["type"] for f in findings]
 
 
-def test_polish_raises_on_swapped_numbers_same_set(tmp_path):
+def test_structural_findings_flags_swapped_numbers_same_set():
     """Kolo 13 BLOCKING: DVĚ RŮZNÁ čísla prohozená mezi dvěma místy v
     textu dají STEJNOU seřazenou množinu ({"3","5"} oběma směry) - dřívější
     `_number_multiset` (řadila výstup) by tohle NEZACHYTILA. `_number_
     sequence` (bez řazení, v pořadí výskytu) rozdíl vidí."""
-    cz = "Anna měla 3 jablka, Petr 5 hrušek."
-    cmd = _fake_codex(tmp_path, "Anna měla 5 jablek, Petr 3 hrušek.")
-    with pytest.raises(stylist.StylistError, match="čísla"):
-        stylist.polish("EN", cz, codex_cmd=cmd)
+    findings = stylist.structural_findings(
+        "Anna měla 3 jablka, Petr 5 hrušek.", "Anna měla 5 jablek, Petr 3 hrušek.")
+    assert "number_drift" in [f["type"] for f in findings]
 
 
-def test_polish_raises_on_decimal_separator_change(tmp_path):
+def test_structural_findings_flags_decimal_separator_change():
     """Kolo 14 IMPORTANT - INVERTUJE dřívější kolo-13 test, co tvrdil OPAK:
     dřív se tečka/čárka normalizovaly jako stejný token, aby stylistova
     oprava anglicismu ("3.5" → "3,5") neprošla jako falešný poplach. "Python
@@ -279,10 +300,8 @@ def test_polish_raises_on_decimal_separator_change(tmp_path):
     "jen formátování", i když jde o poškození technického identifikátoru -
     regex nemá jak rozlišit desetinné číslo od identifikátoru, co jako
     desetinné číslo vypadá."""
-    cz = "Věž měřila 3.5 metru."
-    cmd = _fake_codex(tmp_path, "Věž měřila 3,5 metru.")
-    with pytest.raises(stylist.StylistError, match="čísla"):
-        stylist.polish("EN", cz, codex_cmd=cmd)
+    findings = stylist.structural_findings("Věž měřila 3.5 metru.", "Věž měřila 3,5 metru.")
+    assert "number_drift" in [f["type"] for f in findings]
 
 
 def test_polish_raises_on_markdown_fence_wrapper(tmp_path):
@@ -387,33 +406,18 @@ def _fake_codex_stderr(tmp_path, stderr_text, *, exit_code=1):
 
 @pytest.mark.parametrize("flag,is_redacted", [(False, True), (1, True),
                                               ("False", True), (None, True), (True, False)])
-def test_polish_redacts_all_codex_derived_error_values(tmp_path, monkeypatch, flag, is_redacted):
+def test_polish_redacts_codex_stderr_on_nonzero_exit(tmp_path, monkeypatch, flag, is_redacted):
+    """Jediný zbývající scénář `polish()`'s vlastní `StylistError` s
+    hodnotou odvozenou z Codexova výstupu (2026-09-13 v2 - scénáře
+    "změněné číslo"/"jiný počet odstavců"/"poměr délky" přesunuty do
+    `structural_findings()`, co žádnou výjimku nevyhazuje, viz testy
+    výš)."""
     monkeypatch.setattr(config, "STYLIST_REPORT_REJECTED_TEXT", flag)
-
-    # 1) nenulový exit + secret na stderr
     with pytest.raises(stylist.StylistError) as e1:
         stylist.polish("EN", "Veta jedna je tady.\n\nVeta dva je take tady.",
                        codex_cmd=_fake_codex_stderr(tmp_path, "TAJNY-STDERR-42"))
     assert ("TAJNY-STDERR-42" not in str(e1.value)) == is_redacted
     assert (stylist._REDACTED in str(e1.value)) == is_redacted
-
-    # 2) změněné číslo - `after_nums` pochází ze stylizovaného textu
-    with pytest.raises(stylist.StylistError) as e2:
-        stylist.polish("EN", "Bylo jich 12 tady.",
-                       codex_cmd=_fake_codex(tmp_path, "Bylo jich 21 tady."))
-    assert ("21" in str(e2.value)) == (not is_redacted)
-
-    # 3) jiný počet odstavců
-    with pytest.raises(stylist.StylistError) as e3:
-        stylist.polish("EN", "Prvni odstavec.\n\nDruhy odstavec.",
-                       codex_cmd=_fake_codex(tmp_path, "Jen jeden odstavec podobne dlouhy jako vstup."))
-    assert (stylist._REDACTED in str(e3.value)) == is_redacted
-
-    # 4) poměr délky
-    with pytest.raises(stylist.StylistError) as e4:
-        stylist.polish("EN", "Dost dlouhy cesky text na porovnani delky vystupu.",
-                       codex_cmd=_fake_codex(tmp_path, "X"))
-    assert (stylist._REDACTED in str(e4.value)) == is_redacted
 
 
 def test_polish_single_call_carries_both_en_and_cz(tmp_path):

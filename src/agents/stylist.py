@@ -414,8 +414,8 @@ def _exec_codex(prompt_text: str, *, codex_cmd: list[str], codex_model: str,
 def polish(en_text: str, cz_text: str, *, timeout: int | None = None,
            codex_cmd: list[str] | None = None,
            codex_model: str | None = None) -> str:
-    """Vrací upravený český text. Zvedá StylistError při jakémkoli selhání
-    NEBO když výstup neprojde levnou strukturální kontrolou (viz níže) -
+    """Vrací upravený český text. Zvedá StylistError jen při TECHNICKÉM
+    selhání (Codex se nespustil/timeoutoval/vrátil nečitelný výstup) -
     volající (main.py) na to reaguje ponecháním původního textu, ne pádem.
 
     JEDNO volání `codex exec` (`_exec_codex`), prompt bez seznamu zákazů -
@@ -425,9 +425,21 @@ def polish(en_text: str, cz_text: str, *, timeout: int | None = None,
     `guide_block` parametr (odstraněn 2026-09-13, poslední pokus ho
     záměrně vynechal spolu se seznamem zákazů a fungoval) - bezpečnost a
     věrnost termínům/faktům hlídají výhradně nezávislé kontroly PO
-    stylizaci (strukturální kontrola níž + kritik/concordance/meaning-
-    check v `_cmd_polish` + člověk v `polish-review`), ne instrukce v
-    promptu.
+    stylizaci (kritik/concordance/meaning-check/`structural_findings` v
+    `_cmd_polish` + člověk v `polish-review`), ne instrukce v promptu.
+
+    NEDĚLÁ srovnávací strukturální kontrolu proti `cz_text` (počet
+    odstavců/poměr délky/čísla) - to dřív dělala (kolo 2026-09-13 v1,
+    tvrdý `StylistError`), ale ukázalo se to jako "hlídač u dveří, co
+    zahazuje beze stopy": kapitola s VELKOU, ale LEGITIMNÍ restrukturalizací
+    (běžná bez promptových omezení výš) tak zmizela, aniž by se draft
+    vůbec vytvořil - ŽÁDNÁ šance na lidské review, na rozdíl od
+    kritika/concordance, které vždycky vytvoří draft s nálezem jako
+    KONTEXTEM. Přestavěno (2026-09-13 v2) na `structural_findings()` níž -
+    STEJNÉ tři kontroly, ale jako NÁLEZY, ne výjimka; `_polish_one_chapter`
+    je sloučí do stejného `findings`/`reasons` mechanismu jako
+    kritika/concordance, takže se draft VŽDY vytvoří a člověk v
+    `polish-review` rozhodne.
 
     ZÁVAZNÁ bezpečnostní brána (kolo 20 BLOCKING): bez `config.STYLIST_
     ACCEPT_FS_RISK is True` funkce rovnou vyhodí `StylistError` - `codex
@@ -441,15 +453,6 @@ def polish(en_text: str, cz_text: str, *, timeout: int | None = None,
     `_resolve_codex_cmd`). Vždy seznam, ne string - string by `subprocess.run`
     vzal jako JEDEN spustitelný soubor s mezerou ve jméně, ne jako "spusť
     python se skriptem jako argumentem".
-
-    Levná STRUKTURÁLNÍ kontrola (počet odstavců, poměr délky, sekvence
-    čísel) běží tady, PŘED tím, než se výsledek vůbec vrátí volajícímu -
-    je zadarmo (žádné další LLM volání) a odchytí hrubé selhání (uťatý/
-    zkrácený výstup, přehozená číslice) dřív, než se zaplatí za drahou
-    kritikovu kontrolu v `_cmd_polish`. Nenahrazuje kritika (ten hlídá
-    VÝZNAM, ne strukturu) - jsou to nezávislé sítě. Bez promptové ochrany
-    čísel/faktů (viz výš) je tahle kontrola teď PRVNÍ obranná linie, ne
-    jen doplněk - viz `_number_sequence` docstring.
 
     `config.STYLIST_MAX_CHARS` guard (kolo 17 IMPORTANT) - běží HNED, PŘED
     `_resolve_codex_cmd`/samotným voláním Codexu. Extrémně dlouhá kapitola
@@ -504,46 +507,59 @@ def polish(en_text: str, cz_text: str, *, timeout: int | None = None,
     codex_cmd = _resolve_codex_cmd(list(codex_cmd))
 
     prompt_text = POLISH_PROMPT_TEMPLATE.format(en_text=en_text, cz_text=cz_text)
-    styled = _exec_codex(prompt_text, codex_cmd=codex_cmd,
-                        codex_model=codex_model, timeout=timeout, label="styl")
+    return _exec_codex(prompt_text, codex_cmd=codex_cmd,
+                       codex_model=codex_model, timeout=timeout, label="styl")
 
-    # Levná strukturální kontrola - viz docstring. Prahy jsou schválně
-    # volné (skutečnou kontrolu obsahu dělá až kritik v _cmd_polish) -
-    # cílem je odchytit JEN hrubé selhání (uťatý výstup, smazaný obsah).
-    # Tolerance na POMĚR, ne přesná rovnost (2026-09-13, volnější polish) -
-    # dřívější `!=` tvrdě zahodilo i legitimní sloučení/rozdělení pár
-    # odstavců kvůli plynulosti (pilot nález: reálný Codex běh změnil počet
-    # odstavců o +1 ze 64/85 - editorská drobnost, ne uťatý výstup). Stejné
-    # pásmo jako kontrola délky níž (0.7-1.3, o něco přísnější než 0.5-1.5 -
-    # počet odstavců je citlivější signál na useknutí než syrová délka).
-    p_before, p_styled = _paragraph_count(cz_text), _paragraph_count(styled)
-    p_ratio = p_styled / max(1, p_before)
+
+def _structural_finding(type_: str, issue: str) -> dict:
+    return {"source": "stylist_check", "type": type_, "severity": "critical",
+            "action": "revise", "term_id": None, "expected": None,
+            "actual": None, "cz_excerpt": None, "issue": issue, "suggestion": None}
+
+
+def structural_findings(cz_before: str, cz_after: str) -> list[dict]:
+    """Strukturální rozdíly mezi PŘED/PO (počet odstavců, poměr délky,
+    sekvence čísel) jako NÁLEZY - kontext pro člověka v `polish-review`,
+    NIKDY tvrdé zamítnutí (viz `polish()` docstring, kolo 2026-09-13 v2 -
+    dřív to bylo uvnitř `polish()` jako `StylistError`, co draft vůbec
+    nenechalo vzniknout; teď draft vznikne vždycky, tohle jen řekne
+    proč si ho prohlédnout pozorněji). Prázdný seznam = žádný
+    strukturální nález.
+
+    Volající (`_polish_one_chapter`) tenhle výstup slučuje do STEJNÉHO
+    `findings`/`reasons` mechanismu jako `concordance`/kritik/`check_
+    meaning_preserved` (`_rejection_reasons` v `main.py` musí typy níž
+    znát, jinak by se zobrazily jako `findings`, ale nepřidaly do
+    `reason_types` kontextu). Prahy (0.7-1.3 odstavce, 0.5-1.5 délka)
+    jsou schválně volné - cílem je upozornit na HRUBOU odchylku (uťatý
+    výstup, masivní přepis), ne na běžnou editorskou práci."""
+    out = []
+    p_before, p_after = _paragraph_count(cz_before), _paragraph_count(cz_after)
+    p_ratio = p_after / max(1, p_before)
     if not (0.7 <= p_ratio <= 1.3):
-        raise StylistError(
-            "počet odstavců se liší příliš "
-            f"{_redact_detail(f'({p_styled} vs. {p_before} originál)')}"
-            " - podezření na useknutý nebo přepsaný výstup.")
-    ratio = len(styled) / max(1, len(cz_text))
-    if not (0.5 <= ratio <= 1.5):
-        raise StylistError(
-            f"délka výstupu se od originálu liší {_redact_detail(f'{ratio:.1f}x')}"
-            " - podezření na useknutý nebo přepsaný výstup.")
+        out.append(_structural_finding(
+            "structure_drift",
+            f"počet odstavců se výrazně liší ({p_after} vs. {p_before} "
+            "originál) - zkontroluj, jestli něco nechybí/nepřibylo."))
+    len_ratio = len(cz_after) / max(1, len(cz_before))
+    if not (0.5 <= len_ratio <= 1.5):
+        out.append(_structural_finding(
+            "length_drift",
+            f"délka výstupu se od originálu liší {len_ratio:.1f}x - "
+            "zkontroluj, jestli text nebyl uťatý nebo výrazně přepsaný."))
     # Sekvence arabských číslic (kolo 6 IMPORTANT, revize kol 4-5, ŘAZENÍ
     # odstraněno kolo 13 BLOCKING - viz `_number_sequence` docstring) -
-    # levné, deterministické, fail-closed. Zachytí přehození číslic
-    # ("12"→"21") I přehození DVOU RŮZNÝCH čísel mezi sebou (na rozdíl od
-    # dřívější seřazené verze), co LLM kontroly (kritik,
+    # levné, deterministické. Zachytí přehození číslic ("12"→"21") I
+    # přehození DVOU RŮZNÝCH čísel mezi sebou, co LLM kontroly (kritik,
     # check_meaning_preserved) mohou přehlédnout, protože oboje zůstává
     # "čitelné". Slovně vypsaná čísla mimo rozsah.
-    before_nums, after_nums = _number_sequence(cz_text), _number_sequence(styled)
+    before_nums, after_nums = _number_sequence(cz_before), _number_sequence(cz_after)
     if before_nums != after_nums:
-        # `after_nums` pochází ze STYLIZOVANÉHO textu (Codexův výstup) -
-        # přes `_redact_detail` (kolo 33-34).
-        raise StylistError(
-            "čísla v textu se změnila "
-            f"{_redact_detail(f'({before_nums} → {after_nums})')} - "
-            "podezření na faktickou změnu, ne jen styl.")
-    return styled
+        out.append(_structural_finding(
+            "number_drift",
+            f"čísla v textu se změnila ({before_nums} → {after_nums}) - "
+            "zkontroluj, jestli nejde o faktickou změnu, ne jen styl."))
+    return out
 
 
 MEANING_CHECK_PROMPT = """Dostaneš dvě verze stejného českého textu - PŘED
