@@ -98,81 +98,30 @@ import tempfile
 import config
 from src.llm.parsing import extract_json
 
-# Dvoukolový polish (2026-09-13, pilotní nález): JEDNO volání Codexu s
-# EN+CZ dohromady a se zadáním "buď volný, ALE zůstaň věrný" drží model
-# nápadně konzervativní i pod uvolněným zadáním (ověřeno na reálném běhu -
-# tři různé varianty jednoho promptu, nulová změna u konkrétní fráze -
-# "Hell's frickin' bells!" → "Zatracený zvonečky pekelný!" zůstalo beze
-# změny pokaždé). Uživatelův manuální test ukázal jiný postup: NEJDŘÍV
-# stylistická úprava BEZ anglického originálu (model sám: "Bez originálu
-# můžu posoudit češtinu, nikoli přesnost překladu" - žádné rozporování si
-# nekonkuruje se svobodou), AŽ POTOM samostatný krok "over podle AJ a
-# oprav věcné chyby" NAD JIŽ stylizovaným textem. `polish()` níž tenhle
-# dvoukrokový postup replikuje jako dvě sekvenční volání `codex exec`.
-_HARD_CONSTRAINTS = """PEVNÉ HRANICE (uvnitř nich máš volnou ruku, přes ně ne):
-- Nesmíš nic přidat, co v originále ani v překladu není (žádné nové fakty,
-  detaily, popisy, vysvětlení).
-- Nesmíš nic vynechat - žádná informace z překladu nesmí zmizet, ani se
-  "sloučením" věty ztratit.
-- Nesmíš měnit jména, tituly ani zavedené termíny - i kdyby zněly kostrbatě,
-  jsou to schválené, závazné tvary. To platí i pro ZKRACOVÁNÍ nebo
-  parafrázi zavedeného termínu (např. "čarodějná hůl" na pouhé "hůl",
-  "Sedm zákonů magie" na "zákony magie") - i to se počítá jako změna
-  termínu, ne jako stylistická drobnost.
-- Nesmíš měnit žádná čísla, procenta, data ani jiné konkrétní údaje (váhy,
-  teploty, vzdálenosti, časy apod.) - ani přibližně, ani kvůli plynulosti.
-- Nesmíš měnit pořadí událostí ani to, kdo co řekl nebo udělal.
-- Neupravuj žádné soubory na disku. Tvůj jediný úkol je vrátit text jako
-  SVOU ODPOVĚĎ.
-- Odpověz POUZE opraveným českým textem kapitoly - žádné vysvětlení,
-  žádné poznámky, žádné markdown bloky (```), nic navíc kolem."""
+# Prompt bez omezení (2026-09-13, pilotní nález, 5 pokusů): postupně
+# vyzkoušeno (1) jedno volání EN+CZ dohromady se seznamem "PEVNÝCH HRANIC"
+# + volným tónem, (2) ležérnější formulace téhož, (3) uživatelova doslovná
+# věta jako úvod téhož seznamu pravidel, (4) dvoukolové volání (styl BEZ
+# EN, pak fidelita-check S EN) - u VŠECH čtyř nulová změna na jedné
+# konkrétní frázi ("Hell's frickin' bells!" → "Zatracený zvonečky
+# pekelný!" zůstalo beze změny pokaždé). Pátý pokus - stejná věta, EN+CZ
+# dohromady, ale BEZ JAKÉHOKOLI seznamu zákazů/hranic - frázi konečně
+# změnil. Závěr: sama PŘÍTOMNOST seznamu "NESMÍŠ..." vedle sebe dělá
+# model nápadně opatrným i tam, kde mu zadání volnost výslovně dává;
+# nejde o tón ani o dvoukolovost, jde o samotnou strukturu "tady jsou
+# zákazy". `polish()` níž proto žádný seznam zákazů v promptu NEMÁ -
+# bezpečnost/věrnost hlídají POUZE nezávislé kontroly PO stylizaci
+# (strukturální kontrola níž, kritik + concordance + meaning-check v
+# `_cmd_polish`, a nakonec člověk v `polish-review`) - to je vědomá
+# volba: víc věcí půjde k ručnímu review, ale návrhy budou odvážnější.
+POLISH_PROMPT_TEMPLATE = """Umíš tenhle text učesat? Teď je děsně
+kostrbatej. Přidávám ještě anglický originál.
 
-
-STYLE_PASS_PROMPT_TEMPLATE = """Umíš tenhle text učesat? Teď je děsně
-kostrbatej.
-
-Dostaneš český text kapitoly (překlad z angličtiny - anglický originál
-tady NEMÁŠ, posuzuj jen samotnou češtinu). Sedni si k tomu jako ke
-skutečné redakci: přepiš věty, co zní neohrabaně nebo mechanicky
-přeloženě, najdi přirozenější slovosled, živější slovní zásobu,
-idiomatičtější obraty a nadávky, přirozenější tón replik. Nebuď plachý -
-klidně větu rozeber a poskládej jinak, sluč nebo rozděl pár vět či
-odstavců, uprav rejstřík scény, když to lépe sedí postavě. Cíl je, aby to
-znělo, jako by to psal rodilý český spisovatel, ne jako strojový překlad.
-Jediné, co se nesmí změnit, je CO se říká a KDO to říká komu - forma je
-celá tvoje.
-
-{constraints}
-{guide_section}
---- ČESKÝ PŘEKLAD K UPRAVENÍ ---
-{cz_text}
-
-Odpověz upravenou verzí ČESKÉHO textu - a jenom jí."""
-
-
-FIDELITY_PASS_PROMPT_TEMPLATE = """Dostaneš anglický originál kapitoly a
-jeho zredigovanou českou verzi (prošla stylistickou úpravou o kolo dřív,
-BEZ přístupu k originálu). Over ji PROTI anglickému originálu a oprav JEN
-to, co je věcně špatně:
-- něco přibylo, co v originále není,
-- něco chybí, co v originále je,
-- změnil se fakt, číslo, jméno nebo pořadí událostí,
-- rejstřík/tón repliky neodpovídá tomu, co naznačuje originál a návod níže
-  (formálnost oslovení, tykání/vykání, vážnost/ironie).
-
-NEDĚLEJ nic navíc - editorská kvalita té české verze je hotová práce, tvůj
-úkol je jen ověřit věrnost, ne znovu stylizovat. Když je všechno v pořádku,
-vrať český text BEZE ZMĚNY.
-
-{constraints}
-{guide_section}
 --- ANGLICKÝ ORIGINÁL ---
 {en_text}
 
---- ČESKÁ VERZE K OVĚŘENÍ ---
-{cz_text}
-
-Odpověz finální verzí ČESKÉHO textu - a jenom jí."""
+--- ČESKÝ PŘEKLAD ---
+{cz_text}"""
 
 
 class StylistError(Exception):
@@ -248,11 +197,12 @@ def _number_sequence(text: str) -> list:
     množinu {"08","09","2026"} jako originál) by tak prošlo beze
     povšimnutí, přestože jde přesně o tu třídu chyby ("přehození číslic"),
     kterou tahle kontrola má zachytit. Porovnání SEKVENCE (ne množiny)
-    tuhle mezeru zavírá - a je to bezpečné, protože obě prompt šablony
-    výše (`STYLE_PASS_PROMPT_TEMPLATE`, `FIDELITY_PASS_PROMPT_TEMPLATE`,
-    přes `_HARD_CONSTRAINTS`) stylistovi explicitně zakazují měnit "pořadí
-    událostí" i čísla samotná, takže shodná posloupnost čísel je u
-    DODRŽUJÍCÍHO stylisty očekávaná, ne jen náhodná shoda.
+    tuhle mezeru zavírá. POZOR (2026-09-13, prompt bez omezení): prompt
+    už stylistovi NEŘÍKÁ, ať čísla nemění - tahle kontrola je teď PRVNÍ a
+    JEDINÁ obranná linie proti faktické změně čísla, ne jen doplněk k
+    promptové instrukci. Zafunguje o to častěji (model bez zábran čísla
+    mění snadněji), což je záměr, ne regrese - kapitola pak jde k
+    ručnímu review místo tichého přijetí.
 
     DESETINNÝ ODDĚLOVAČ SE NENORMALIZUJE (kolo 14 IMPORTANT, revize kola
     13) - kolo 13 zavedlo normalizaci `,`/`.` s odůvodněním "tečka v už
@@ -463,22 +413,21 @@ def _exec_codex(prompt_text: str, *, codex_cmd: list[str], codex_model: str,
 
 def polish(en_text: str, cz_text: str, *, timeout: int | None = None,
            codex_cmd: list[str] | None = None,
-           codex_model: str | None = None,
-           guide_block: str = "") -> str:
+           codex_model: str | None = None) -> str:
     """Vrací upravený český text. Zvedá StylistError při jakémkoli selhání
     NEBO když výstup neprojde levnou strukturální kontrolou (viz níže) -
     volající (main.py) na to reaguje ponecháním původního textu, ne pádem.
 
-    DVOUKOLOVÉ (2026-09-13, pilotní nález - viz komentář nad prompt
-    šablonami výše): KOLO 1 (`STYLE_PASS_PROMPT_TEMPLATE`) dostane JEN
-    `cz_text` (bez `en_text`) a volnou ruku na styl. KOLO 2
-    (`FIDELITY_PASS_PROMPT_TEMPLATE`) dostane `en_text` + výstup kola 1 a
-    má za úkol jen OPRAVIT věcné chyby, ne znovu stylizovat. Každé kolo je
-    samostatné volání `codex exec` (`_exec_codex`) - `timeout` platí PRO
-    KAŽDÉ zvlášť (celkový běh tak může trvat až 2x `timeout`, ne jen
-    jednou). Selže-li KTERÉKOLI kolo, celé `polish()` skončí `StylistError`
-    (žádný částečný výsledek) - volající (`_polish_one_chapter`) na to
-    reaguje stejně jako na selhání jediného volání dřív.
+    JEDNO volání `codex exec` (`_exec_codex`), prompt bez seznamu zákazů -
+    viz komentář nad `POLISH_PROMPT_TEMPLATE` výše, kam patří i historie
+    PROČ (5 pokusů, dřívější dvoukolová a jednokolová varianta se
+    seznamem "PEVNÝCH HRANIC" obojí ZAMÍTNUTO na základě dat). ŽÁDNÝ
+    `guide_block` parametr (odstraněn 2026-09-13, poslední pokus ho
+    záměrně vynechal spolu se seznamem zákazů a fungoval) - bezpečnost a
+    věrnost termínům/faktům hlídají výhradně nezávislé kontroly PO
+    stylizaci (strukturální kontrola níž + kritik/concordance/meaning-
+    check v `_cmd_polish` + člověk v `polish-review`), ne instrukce v
+    promptu.
 
     ZÁVAZNÁ bezpečnostní brána (kolo 20 BLOCKING): bez `config.STYLIST_
     ACCEPT_FS_RISK is True` funkce rovnou vyhodí `StylistError` - `codex
@@ -493,28 +442,14 @@ def polish(en_text: str, cz_text: str, *, timeout: int | None = None,
     vzal jako JEDEN spustitelný soubor s mezerou ve jméně, ne jako "spusť
     python se skriptem jako argumentem".
 
-    `guide_block` (kolo 6 IMPORTANT) - stejný text jako `guide_
-    as_prompt_block(guide)`, co dostává translator (`translate_scene` i
-    `revise_chapter` v `pipeline.process_chapter`) - NE kritik
-    (`pipeline._run_critic` volá `critic.review(en, cz, client)` bez
-    návodu, kolo 17 NIT opravuje dřívější nepřesné "translator/kritik",
-    ověřeno přímo v `src/pipeline.py`). Jde do OBOU kol (2026-09-13) - kolo
-    1 ho potřebuje pro tykání/vykání a hlas vypravěče, kolo 2 ho potřebuje
-    STEJNĚ, aby dokázalo posoudit `register_drift` proti ZAVEDENÝM
-    pravidlům, ne jen vůči EN (EN samo tykání/vykání nenese). Prázdný
-    string, když návod není k dispozici (volitelný parametr, ne tvrdý
-    požadavek).
-
     Levná STRUKTURÁLNÍ kontrola (počet odstavců, poměr délky, sekvence
-    čísel) běží tady, na FINÁLNÍM výsledku KOLA 2 proti PŮVODNÍMU
-    `cz_text` - PŘED tím, než se výsledek vůbec vrátí volajícímu. Je
-    zadarmo (žádné další LLM volání) a odchytí hrubé selhání (uťatý/
+    čísel) běží tady, PŘED tím, než se výsledek vůbec vrátí volajícímu -
+    je zadarmo (žádné další LLM volání) a odchytí hrubé selhání (uťatý/
     zkrácený výstup, přehozená číslice) dřív, než se zaplatí za drahou
     kritikovu kontrolu v `_cmd_polish`. Nenahrazuje kritika (ten hlídá
-    VÝZNAM, ne strukturu) - jsou to nezávislé sítě. Mezivýsledek kola 1 se
-    strukturálně nekontroluje - kolo 1 smí volně měnit strukturu, kolo 2
-    ji už jen ověřuje/opravuje, takže jen FINÁLNÍ tvar musí sedět proti
-    originálu.
+    VÝZNAM, ne strukturu) - jsou to nezávislé sítě. Bez promptové ochrany
+    čísel/faktů (viz výš) je tahle kontrola teď PRVNÍ obranná linie, ne
+    jen doplněk - viz `_number_sequence` docstring.
 
     `config.STYLIST_MAX_CHARS` guard (kolo 17 IMPORTANT) - běží HNED, PŘED
     `_resolve_codex_cmd`/samotným voláním Codexu. Extrémně dlouhá kapitola
@@ -567,26 +502,14 @@ def polish(en_text: str, cz_text: str, *, timeout: int | None = None,
     if timeout is None:
         timeout = config.STYLIST_TIMEOUT_SECONDS
     codex_cmd = _resolve_codex_cmd(list(codex_cmd))
-    guide_section = (f"\n--- NÁVOD PRO PŘEKLAD (tykání/vykání, hlas, "
-                     f"rejstřík - NEPORUŠUJ) ---\n{guide_block}\n"
-                     if guide_block else "")
 
-    style_prompt = STYLE_PASS_PROMPT_TEMPLATE.format(
-        cz_text=cz_text, guide_section=guide_section, constraints=_HARD_CONSTRAINTS)
-    styled_draft = _exec_codex(style_prompt, codex_cmd=codex_cmd,
-                              codex_model=codex_model, timeout=timeout, label="styl")
-
-    fidelity_prompt = FIDELITY_PASS_PROMPT_TEMPLATE.format(
-        en_text=en_text, cz_text=styled_draft, guide_section=guide_section,
-        constraints=_HARD_CONSTRAINTS)
-    styled = _exec_codex(fidelity_prompt, codex_cmd=codex_cmd,
-                        codex_model=codex_model, timeout=timeout, label="fidelita")
+    prompt_text = POLISH_PROMPT_TEMPLATE.format(en_text=en_text, cz_text=cz_text)
+    styled = _exec_codex(prompt_text, codex_cmd=codex_cmd,
+                        codex_model=codex_model, timeout=timeout, label="styl")
 
     # Levná strukturální kontrola - viz docstring. Prahy jsou schválně
     # volné (skutečnou kontrolu obsahu dělá až kritik v _cmd_polish) -
     # cílem je odchytit JEN hrubé selhání (uťatý výstup, smazaný obsah).
-    # Porovnává se FINÁLNÍ `styled` (po OBOU kolech) proti PŮVODNÍMU
-    # `cz_text`, ne proti mezivýsledku kola 1 (viz docstring).
     # Tolerance na POMĚR, ne přesná rovnost (2026-09-13, volnější polish) -
     # dřívější `!=` tvrdě zahodilo i legitimní sloučení/rozdělení pár
     # odstavců kvůli plynulosti (pilot nález: reálný Codex běh změnil počet

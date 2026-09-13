@@ -553,7 +553,7 @@ def _write_polish_report(db: str, rid: int, report: list, *, codex_model: str,
                 pass
 
 
-def _polish_one_chapter(c, glossary_rows, cf, db, model: str, guide_block: str,
+def _polish_one_chapter(c, glossary_rows, cf, db, model: str,
                         codex_cmd: list) -> dict:
     """Vrací JEDEN záznam za kapitolu - NEcommituje nic do DB (spec
     2026-09-11-polish-review-design.md - `_cmd_polish`/`polish-review`
@@ -569,11 +569,13 @@ def _polish_one_chapter(c, glossary_rows, cf, db, model: str, guide_block: str,
         našly) - nikdy negate ROZHODNUTÍ, to dělá teď `polish-review`.
     `FatalRunError` z kritika/meaning-checku pořád propaguje (kolo 37) -
     žádná DB zápisová `FatalRunError` už neexistuje, funkce nic
-    nezapisuje."""
+    nezapisuje. Žádný `guide_block` (odstraněn 2026-09-13, pilotní nález -
+    `stylist.polish()` prompt bez omezení funguje lépe, `guide_block` šel
+    pryč spolu se seznamem zákazů, viz `stylist.py` komentář nad
+    `POLISH_PROMPT_TEMPLATE`)."""
     idx, en, cz = c["idx"], c["raw_text"], c["translated_text"]
     try:
         styled = stylist.polish(en, cz, codex_cmd=codex_cmd, codex_model=model,
-                                guide_block=guide_block,
                                 timeout=config.STYLIST_TIMEOUT_SECONDS)
     except stylist.StylistError as e:
         _say(f"Kapitola {idx}: stylista selhal ({e}), ponechávám původní.")
@@ -1156,14 +1158,12 @@ def _cmd_polish(args) -> int:
         planned_count = len(chapters)
 
         glossary_rows = glossary.all_terms(db)
-        guide_block = guide_mod.guide_as_prompt_block(guide_mod.load_guide(config.GUIDE_PATH))
         rid = state.create_run(db, "polish")
         cf = _client_factory(rid, interactive=True)
         for c in chapters:
             rec = None
             try:
-                rec = _polish_one_chapter(c, glossary_rows, cf, db, model,
-                                          guide_block, codex_cmd)
+                rec = _polish_one_chapter(c, glossary_rows, cf, db, model, codex_cmd)
             except FatalRunError as fe:
                 rec = {"idx": c["idx"], "outcome": "fatal", "error": str(fe)}
                 raise

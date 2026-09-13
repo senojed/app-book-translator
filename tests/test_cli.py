@@ -684,7 +684,7 @@ def _cf_stub(agent):
 def test_polish_one_chapter_unchanged(tmp_path, monkeypatch):
     db = _polish_db(tmp_path)
     monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Původní věta.")
-    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"])
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", ["codex"])
     assert rec == {"idx": 1, "outcome": "unchanged"}
 
 
@@ -692,7 +692,7 @@ def test_polish_one_chapter_stylist_error_is_failed(tmp_path, monkeypatch):
     db = _polish_db(tmp_path)
     def _boom(*a, **k): raise _stylist.StylistError("nope")
     monkeypatch.setattr(main.stylist, "polish", _boom)
-    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"])
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", ["codex"])
     assert rec["outcome"] == "failed" and "nope" in rec["error"]
     assert state.get_chapter(db, 1)["translated_text"] == "Původní věta."
 
@@ -704,7 +704,7 @@ def test_polish_one_chapter_returns_draft_dict_when_no_reasons(tmp_path, monkeyp
     monkeypatch.setattr(main.concordance, "build_mentions", lambda *a, **k: [])
     monkeypatch.setattr(main.pipeline, "_run_critic", lambda *a, **k: ([], False))
     monkeypatch.setattr(main.stylist, "check_meaning_preserved", lambda *a, **k: [])
-    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "gpt-5-codex", "", ["codex"])
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "gpt-5-codex", ["codex"])
     assert "outcome" not in rec
     assert rec["idx"] == 1 and rec["title"] == "K1"
     assert rec["cz_before"] == "Původní věta." and rec["styled"] == "Vylepšená věta."
@@ -724,7 +724,7 @@ def test_polish_one_chapter_returns_draft_dict_with_reason_types_when_rejected(t
                         lambda *a, **k: ([{"source": "critic", "action": "revise",
                                            "severity": "critical", "type": "fidelity",
                                            "issue": "SECRET"}], False))
-    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"])
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", ["codex"])
     assert "outcome" not in rec
     assert rec["reason_types"] == ["critic/fidelity"]
     assert any(f.get("issue") == "SECRET" for f in rec["findings"])
@@ -745,7 +745,7 @@ def test_polish_one_chapter_prints_critic_minor_findings_as_context(tmp_path, mo
          "issue": "PRIDANE PRIJMENI CO NENI V ORIGINALE", "suggestion": "Harry"}]})
     def _cf(agent):
         return FakeLLMClient([Completion(resp, False, 5, 5)])
-    rec = main._polish_one_chapter(_c(), [], _cf, db, "m", "", ["codex"])
+    rec = main._polish_one_chapter(_c(), [], _cf, db, "m", ["codex"])
     assert "outcome" not in rec
     out = capsys.readouterr().out
     assert "PRIDANE PRIJMENI CO NENI V ORIGINALE" in out
@@ -763,7 +763,7 @@ def test_polish_one_chapter_rejected_full_detail_when_opted_in(tmp_path, monkeyp
                         lambda *a, **k: [{"source": "stylist_check",
                                           "type": "meaning_drift", "issue": "x"}])
     monkeypatch.setattr(config, "STYLIST_REPORT_REJECTED_TEXT", True)
-    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"])
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", ["codex"])
     assert "outcome" not in rec and rec["styled"] == "Jiná věta."
     assert rec["reason_types"] == ["stylist_check/meaning_drift"]
 
@@ -781,7 +781,7 @@ def test_polish_one_chapter_rejected_detail_gated_console_only(tmp_path, monkeyp
                                            "severity": "critical", "type": "fidelity",
                                            "issue": "SECRET123"}], False))
     monkeypatch.setattr(config, "STYLIST_REPORT_REJECTED_TEXT", flag)
-    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"])
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", ["codex"])
     assert "outcome" not in rec
     assert any(f.get("issue") == "SECRET123" for f in rec["findings"])   # draft VŽDY plný
 
@@ -795,7 +795,7 @@ def test_polish_one_chapter_real_critic_failure_redacts_console_by_default(tmp_p
     bad = json.dumps({"verdict": "SECRET123", "findings": []})
     def _cf(agent):
         return FakeLLMClient([Completion(bad, False, 5, 5), Completion(bad, False, 5, 5)])
-    rec = main._polish_one_chapter(_c(), [], _cf, db, "m", "", ["codex"])
+    rec = main._polish_one_chapter(_c(), [], _cf, db, "m", ["codex"])
     assert "outcome" not in rec and "critic/critic_failed" in rec["reason_types"]
     assert "SECRET123" not in capsys.readouterr().out   # konzole redigovaná
     assert any("SECRET123" in (f.get("issue") or "") for f in rec["findings"])  # draft plný
@@ -808,7 +808,7 @@ def test_polish_one_chapter_critic_fatal_is_wrapped_redacted(tmp_path, monkeypat
     monkeypatch.setattr(main.pipeline, "_run_critic",
                         lambda *a, **k: (_ for _ in ()).throw(FatalRunError("SECRET123")))
     with pytest.raises(FatalRunError) as ei:
-        main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"])
+        main._polish_one_chapter(_c(), [], _cf_stub, db, "m", ["codex"])
     assert "SECRET123" not in str(ei.value)
 
 
@@ -822,7 +822,7 @@ def test_polish_one_chapter_critic_failed_skips_meaning_check(tmp_path, monkeypa
         called["n"] += 1
         return []
     monkeypatch.setattr(main.stylist, "check_meaning_preserved", _mc)
-    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"])
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", ["codex"])
     assert "outcome" not in rec and rec["reason_types"] == ["critic/critic_failed"]
     assert called["n"] == 0
 
@@ -846,7 +846,7 @@ def test_polish_one_chapter_forwards_only_rendered_mentions_as_rendered_terms(tm
     monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
     monkeypatch.setattr(main.pipeline, "_run_critic", lambda *a, **k: ([], False))
     monkeypatch.setattr(main.stylist, "check_meaning_preserved", lambda *a, **k: [])
-    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", "", ["codex"])
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", ["codex"])
     assert rec["rendered_terms"] == [{"term_id": "t/a", "cz_as_used": "Áčko", "scene_idx": 0}]
 
 
@@ -989,20 +989,6 @@ def test_cmd_polish_happy_path_writes_draft_not_db_and_reports(tmp_path, monkeyp
     assert r["summary"]["drafted"] == 2
     with state.connect(db) as conn:
         assert conn.execute("SELECT status FROM runs").fetchone()["status"] == "ok"
-
-
-def test_cmd_polish_passes_nonempty_guide_block(tmp_path, monkeypatch):
-    db = _polish_env(tmp_path, monkeypatch, n_done=1)
-    monkeypatch.setattr(main.guide_mod, "load_guide", lambda p: {"rules": ["vykani"]})
-    monkeypatch.setattr(main.guide_mod, "guide_as_prompt_block",
-                        lambda g: "NAVOD: vykani mezi X a Y")
-    seen = {}
-    def _spy_polish(en, cz, **k):
-        seen["guide"] = k.get("guide_block")
-        return cz + " uprav"
-    monkeypatch.setattr(main.stylist, "polish", _spy_polish)
-    assert main._cmd_polish(_Args()) == 0
-    assert seen["guide"] == "NAVOD: vykani mezi X a Y"
 
 
 def test_cmd_polish_all_failed_is_fatal_but_batch_completed(tmp_path, monkeypatch):
