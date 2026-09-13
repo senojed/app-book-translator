@@ -99,19 +99,27 @@ import config
 from src.llm.parsing import extract_json
 
 SYSTEM_PROMPT_TEMPLATE = """Jsi redaktor české prózy. Dostaneš anglický
-originál a jeho český překlad. Tvůj JEDINÝ úkol: uprav ČESKÝ text tak, aby
-zněl plynuleji a přirozeněji - beze změny významu, faktů, jmen postav,
-míst nebo termínů, beze změny počtu odstavců nebo pořadí událostí.
+originál a jeho český překlad. Tvůj úkol: uprav ČESKÝ text tak, aby zněl
+plynuleji, přirozeněji a čtivěji - jako profesionálně redigovaná próza, ne
+jen opravená hrubka po hrubce. Máš volnost v tom, JAK to řekneš (slovosled,
+volba slov, přirozenější idiomy/nadávky, sloučení nebo rozdělení pár vět či
+odstavců kvůli plynulosti, drobná úprava rejstříku/tónu, když to sedí lépe
+k postavě nebo scéně) - pokud zůstane přesně zachováno, CO to říká a KDO to
+říká komu.
 
-PŘÍSNÁ PRAVIDLA:
-- Nesmíš nic přidat, co v překladu není (žádné nové věty, detaily, popisy).
-- Nesmíš nic vynechat.
+PŘÍSNÁ PRAVIDLA (tohle nesmíš porušit, ani ve jménu lepšího stylu):
+- Nesmíš nic přidat, co v originále ani v překladu není (žádné nové fakty,
+  detaily, popisy, vysvětlení).
+- Nesmíš nic vynechat - žádná informace z překladu nesmí zmizet, ani se
+  "sloučením" věty ztratit.
 - Nesmíš měnit jména, tituly ani zavedené termíny - i kdyby zněly kostrbatě,
-  jsou to schválené, závazné tvary.
-- Nesmíš měnit tykání/vykání, hlas vypravěče ani rejstřík postav - drž se
-  toho, co je v předchozím textu, i v návodu níže (je-li přiložen).
-- Nesmíš měnit žádná čísla, procenta ani data.
-- Zachovej přesně stejný počet odstavců jako má český text níže.
+  jsou to schválené, závazné tvary. To platí i pro ZKRACOVÁNÍ nebo
+  parafrázi zavedeného termínu (např. "čarodějná hůl" na pouhé "hůl",
+  "Sedm zákonů magie" na "zákony magie") - i to se počítá jako změna
+  termínu, ne jako stylistická drobnost.
+- Nesmíš měnit žádná čísla, procenta, data ani jiné konkrétní údaje (váhy,
+  teploty, vzdálenosti, časy apod.) - ani přibližně, ani kvůli plynulosti.
+- Nesmíš měnit pořadí událostí ani to, kdo co řekl nebo udělal.
 - Neupravuj žádné soubory na disku. Tvůj jediný úkol je vrátit text jako
   SVOU ODPOVĚĎ.
 - Odpověz POUZE opraveným českým textem kapitoly - žádné vysvětlení,
@@ -501,10 +509,18 @@ def polish(en_text: str, cz_text: str, *, timeout: int | None = None,
     # Levná strukturální kontrola - viz docstring. Prahy jsou schválně
     # volné (skutečnou kontrolu obsahu dělá až kritik v _cmd_polish) -
     # cílem je odchytit JEN hrubé selhání (uťatý výstup, smazaný obsah).
-    if _paragraph_count(styled) != _paragraph_count(cz_text):
+    # Tolerance na POMĚR, ne přesná rovnost (2026-09-13, volnější polish) -
+    # dřívější `!=` tvrdě zahodilo i legitimní sloučení/rozdělení pár
+    # odstavců kvůli plynulosti (pilot nález: reálný Codex běh změnil počet
+    # odstavců o +1 ze 64/85 - editorská drobnost, ne uťatý výstup). Stejné
+    # pásmo jako kontrola délky níž (0.7-1.3, o něco přísnější než 0.5-1.5 -
+    # počet odstavců je citlivější signál na useknutí než syrová délka).
+    p_before, p_styled = _paragraph_count(cz_text), _paragraph_count(styled)
+    p_ratio = p_styled / max(1, p_before)
+    if not (0.7 <= p_ratio <= 1.3):
         raise StylistError(
-            "počet odstavců se liší "
-            f"{_redact_detail(f'({_paragraph_count(styled)} vs. {_paragraph_count(cz_text)} originál)')}"
+            "počet odstavců se liší příliš "
+            f"{_redact_detail(f'({p_styled} vs. {p_before} originál)')}"
             " - podezření na useknutý nebo přepsaný výstup.")
     ratio = len(styled) / max(1, len(cz_text))
     if not (0.5 <= ratio <= 1.5):

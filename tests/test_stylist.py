@@ -200,11 +200,27 @@ def test_polish_raises_stylist_error_on_permission_error(tmp_path, monkeypatch):
 
 
 def test_polish_raises_on_paragraph_count_mismatch(tmp_path):
-    """Levná strukturální kontrola - jeden odstavec místo dvou = podezřele
-    zkrácený výstup, i kdyby exit kód byl 0 a soubor neprázdný."""
+    """Levná strukturální kontrola - jeden odstavec místo dvou (poloviční
+    počet) = podezřele zkrácený výstup, i kdyby exit kód byl 0 a soubor
+    neprázdný. Zůstává tvrdé selhání i po uvolnění na toleranci (2026-09-13,
+    volnější polish) - poloviční počet je mimo jakoukoli rozumnou toleranci
+    pro editorské sloučení/rozdělení pár odstavců."""
     cmd = _fake_codex(tmp_path, "Jen jeden odstavec, podobně dlouhý jako vstup celkem.")
     with pytest.raises(stylist.StylistError, match="odstavců"):
         stylist.polish("EN", "Prvni odstavec.\n\nDruhy odstavec.", codex_cmd=cmd)
+
+
+def test_polish_allows_small_paragraph_count_drift(tmp_path):
+    """Volnější polish (2026-09-13) - stylista smí sloučit/rozdělit PÁR
+    odstavců kvůli plynulosti (pilot nález: reálný Codex běh změnil počet
+    odstavců o +1 ze 64-85 - editorská drobnost, ne uťatý výstup). Dřív by
+    tenhle výstup tvrdě spadl jako 'počet odstavců se liší', i když jde o
+    legitimní editorskou úpravu, ne o chybu."""
+    cz = "\n\n".join(f"Odstavec s dostatecne dlouhym textem, poradove {i}." for i in range(20))
+    styled_text = cz + "\n\nJeste jeden odstavec navic, bez cislic."   # 20 -> 21 odstavcu
+    cmd = _fake_codex(tmp_path, styled_text)
+    result = stylist.polish("EN", cz, codex_cmd=cmd)
+    assert result == styled_text
 
 
 def test_polish_raises_on_wildly_different_length(tmp_path):
