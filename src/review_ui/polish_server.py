@@ -401,6 +401,112 @@ def build_app(db_path: str, draft_path: str, history_path: str, lock_path: str) 
                               "`discard`."}, status_code=500)
         return {"ok": True}
 
+    @app.post("/api/polish/revert")
+    def post_revert(payload: dict):
+        idx_raw = payload.get("idx")
+        # `type(x) is int` NE `isinstance` (kolo 3 plán-ping-pongu
+        # BLOCKING - `bool` je podtřída `int`). Levná kontrola tvaru,
+        # zůstává PŘED zámkem stejně jako u `apply`.
+        if type(idx_raw) is not int:
+            return JSONResponse({"error": "idx musí být int"}, status_code=400)
+        idx = idx_raw
+        to = payload.get("to", "previous")
+        if to not in ("previous", "original"):
+            return JSONResponse({"error": "to musí být previous/original"}, status_code=400)
+
+        # CELÉ rozhodnutí - ověření zámku, draft-pending kontrola,
+        # načtení historie, výpočet cíle, CAS, zápis - je JEDNA
+        # atomická operace pod STEJNÝM zámkem (kolo 3 + kolo 4
+        # plán-ping-pongu BLOCKING - stejný princip jako u `apply` výš,
+        # včetně přesunu `require_lock()` dovnitř, ať čekání na
+        # `write_lock` samo neudělá kontrolu zastaralou).
+        with write_lock:
+            if not app.state.require_lock():
+                return JSONResponse({"error": "zámek ztracen"}, status_code=503)
+            draft, err = _try_load_draft(draft_path)
+            if err:
+                return err
+            if any(c["idx"] == idx for c in draft["chapters"]):
+                return JSONResponse(
+                    {"error": "kapitola má nevyřízený draft z novějšího `polish` "
+                              "běhu - nejdřív ho vyřeš (ulož nebo zahoď), pak zkus "
+                              "revert znovu"}, status_code=409)
+
+            history, err = _try_load_history(history_path)
+            if err:
+                return err
+            entries = history["entries"]
+            latest = polish_store.find_latest(entries, idx)
+            if latest is None:
+                return JSONResponse({"error": "kapitola nemá historii"}, status_code=404)
+            target = polish_store.resolve_revert_target(entries, idx, to)
+
+            row = state.get_chapter(db_path, idx)
+            if row is None or row["translated_text"] != latest["cz_after"] or row["status"] != "done":
+                return JSONResponse(
+                    {"error": "kapitola se mezitím změnila mimo tenhle review"},
+                    status_code=409)
+            if target == row["translated_text"]:
+                return {"ok": True, "noop": True}   # kolo 22 - žádný zápis
+
+            import main
+            en = state.get_chapter(db_path, idx)["raw_text"]
+            glossary_rows = glossary.all_terms(db_path)
+            mentions = concordance.build_mentions(en, target, glossary_rows, latest["rendered_terms"])
+            note = ("vráceno na verzi před poslední stylizací" if to == "previous"
+                    else "vráceno na verzi před JAKOUKOLI stylizací")
+            findings = concordance.check_chapter(en, target, glossary_rows,
+                                                 latest["rendered_terms"]) + [main._revert_marker(note)]
+
+            # Záloha + DB commit OBALENÉ (kolo 12 plán-ping-pongu IMPORTANT
+            # - stejný princip jako u `apply` výš: `commit_chapter_result`
+            # je JEDNA SQLite transakce, selhání tu tedy znamená JISTOTU,
+            # ne domněnku, že se DB nezměnila).
+            import json as _json
+            try:
+                main._backup_db_once(db_path, app.state.backup_state)
+                state.commit_chapter_result(
+                    db_path, idx, translated_text=target,
+                    revision_rounds=row["revision_rounds"],   # ze ŽIVÉ DB (kolo 1 plán-ping-pongu IMPORTANT), ne natvrdo 0
+                    notes_json=_json.dumps(findings, ensure_ascii=False), status="done",
+                    new_candidates=[], mentions=mentions, questions=[])
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"Text NEBYL vrácen - záloha/DB commit selhal "
+                              f"({type(e).__name__}: {e}) - zkus to znovu."},
+                    status_code=500)
+
+            # Stejný princip jako u `apply` výš (kolo 5 plán-ping-pongu
+            # IMPORTANT) - DB commit už proběhl, selhání zápisu historie
+            # NÍŽE je odlišná třída chyby, co si zaslouží jasnou zprávu.
+            # `polish-review` DETEKUJE nesoulad (kolo 6 plán-ping-pongu
+            # BLOCKING - dřív tohle tvrzení bylo nepravdivé: draftová
+            # `_stale_info` revert vůbec nezachytí, protože revert žádný
+            # draft nevytváří; `_annotate_history` teď navíc porovnává
+            # DB text s `cz_after` NEJNOVĚJŠÍHO historie-záznamu a
+            # označí ho `stale: true, reason: "db_diverged_from_history"`).
+            try:
+                history["entries"].append({
+                    "idx": idx, "applied_at": polish_store.utc_now_z(),
+                    "cz_before": row["translated_text"], "cz_after": target,
+                    "styled_by_codex": "", "title": latest["title"], "findings": findings,
+                    "rendered_terms": latest["rendered_terms"], "source": "revert",
+                    # Čerstvé vlastní ID (kolo 15 plán-ping-pongu IMPORTANT) -
+                    # revert nemá žádný vlastní draft, ale `draft_id` je teď
+                    # POVINNÉ pole historie-schématu; unikátní hodnota tu
+                    # zajistí, že tenhle záznam NIKDY nekoliduje se ŽÁDNÝM
+                    # draftem v `_stale_info`'s `already_committed_has_
+                    # history` matchi (ten porovnává PROTI `draft_ch["draft_id"]`).
+                    "draft_id": uuid.uuid4().hex})
+                polish_store.save_history(history_path, history)
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"Text SE VRÁTIL v knize úspěšně, ale zápis do "
+                              f"historie selhal ({type(e).__name__}: {e}) - "
+                              "načti stránku znovu, `polish-review` detekuje "
+                              "nesoulad."}, status_code=500)
+        return {"ok": True}
+
     app.state.write_lock = write_lock
     app.state.lock_lost = lock_lost
     app.state.shutdown_heartbeat = shutdown

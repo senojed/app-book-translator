@@ -723,3 +723,200 @@ def test_run_polish_review_server_returns_0_when_bind_raises_systemexit(tmp_path
     rc = polish_server.run_polish_review_server(db, draft_path, history_path, lock_path)
     assert rc == 0
     assert not os.path.exists(db + ".pre-polish-review-snapshot")
+
+
+def _seed_history(history_path, entries):
+    polish_store.save_history(history_path, {"schema_version": 1, "entries": entries})
+
+
+def _hist_entry(idx=1, cz_before="X", cz_after="A", **over):
+    base = {"idx": idx, "applied_at": polish_store.utc_now_z(), "cz_before": cz_before,
+            "cz_after": cz_after, "styled_by_codex": cz_after, "title": "K1",
+            "findings": [], "rendered_terms": [], "source": "polish-review",
+            "draft_id": f"draft-{idx}"}
+    base.update(over)
+    return base
+
+
+def test_revert_previous_restores_cz_before_of_latest(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET translated_text='A' WHERE idx=1")
+    _seed_history(history_path, [_hist_entry(1, cz_before="X", cz_after="A")])
+    client = TestClient(app)
+    r = client.post("/api/polish/revert", json={"idx": 1})
+    assert r.status_code == 200 and r.json().get("ok") is True
+    assert state.get_chapter(db, 1)["translated_text"] == "X"
+    entries = polish_store.load_history(history_path)["entries"]
+    assert entries[-1] == {**entries[-1], "cz_before": "A", "cz_after": "X", "source": "revert"}
+
+
+def test_revert_preserves_live_revision_rounds(tmp_path):
+    """Kolo 1 plán-ping-pongu IMPORTANT - revert nesmí přepsat
+    `revision_rounds` natvrdo na 0, musí zachovat živou DB hodnotu
+    (stejný princip jako apply, spec kolo 2)."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET translated_text='A', revision_rounds=3 WHERE idx=1")
+    _seed_history(history_path, [_hist_entry(1, cz_before="X", cz_after="A")])
+    client = TestClient(app)
+    client.post("/api/polish/revert", json={"idx": 1})
+    assert state.get_chapter(db, 1)["revision_rounds"] == 3
+
+
+def test_revert_uses_stored_rendered_terms_not_narrowed_live_mentions(tmp_path, monkeypatch):
+    """Spec kolo 18 / kolo 1 plán-ping-pongu IMPORTANT - `rendered_terms`
+    je NEMĚNNÁ hodnota přenášená přes celý řetězec, NIKDY přepočítaná z
+    `state.chapter_mentions` (ta by po apply mohla být OKLESANÁ -
+    `build_mentions` jen emituje to, co SKUTEČNĚ najde v KONKRÉTNÍM
+    textu). Test: DB má po apply zúženou (jinou) sadu mentions, revert
+    MUSÍ i tak použít PŮVODNÍ `rendered_terms` uložené v historii."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    original_terms = [{"term_id": "t/a", "cz_as_used": "Áčko", "scene_idx": 0}]
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET translated_text='A' WHERE idx=1")
+        conn.execute("INSERT INTO glossary (term_id,canonical_en,cz) VALUES ('t/a','A','Á')")
+    _seed_history(history_path, [_hist_entry(
+        1, cz_before="X", cz_after="A", rendered_terms=original_terms)])
+    # DB má TEĎ prázdnou sadu mentions - kdyby revert četl `state.
+    # chapter_mentions` znovu místo použití historie, dostal by TOHLE
+    # místo `original_terms`.
+    state.replace_term_mentions(db, 1, [])
+    seen = {}
+    def _bm(en, cz, glossary_rows, rendered_terms):
+        seen["build"] = list(rendered_terms)
+        return []
+    def _cc(en, cz, glossary_rows, rendered_terms):
+        seen["check"] = list(rendered_terms)
+        return []
+    monkeypatch.setattr(polish_server.concordance, "build_mentions", _bm)
+    monkeypatch.setattr(polish_server.concordance, "check_chapter", _cc)
+    client = TestClient(app)
+    client.post("/api/polish/revert", json={"idx": 1})
+    assert seen["build"] == original_terms
+    assert seen["check"] == original_terms
+
+
+def test_revert_uses_live_glossary_not_snapshot_from_history(tmp_path, monkeypatch):
+    """Kolo 13 plán-ping-pongu IMPORTANT - stejné jako u apply: `glossary_
+    rows` se natahuje ŽIVĚ uvnitř handleru, NIKDY z doby, kdy záznam vznikl
+    v historii - na rozdíl od `rendered_terms` (ty JSOU zmrazené, test
+    výš). Term přidaný do glosáře MEZI historickým commitem a revertem
+    musí být vidět v `mentions`."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET translated_text='A' WHERE idx=1")
+    _seed_history(history_path, [_hist_entry(1, cz_before="X", cz_after="A")])
+    seen = {}
+    def _bm(en, cz, glossary_rows, rendered_terms):
+        seen["glossary_rows"] = list(glossary_rows)
+        return []
+    monkeypatch.setattr(polish_server.concordance, "build_mentions", _bm)
+    monkeypatch.setattr(polish_server.concordance, "check_chapter", lambda *a, **k: [])
+    with state.connect(db) as conn:
+        conn.execute("INSERT INTO glossary (term_id,canonical_en,cz) VALUES "
+                     "('t/new','New','Nový')")
+    client = TestClient(app)
+    r = client.post("/api/polish/revert", json={"idx": 1})
+    assert r.status_code == 200
+    assert any(g["term_id"] == "t/new" for g in seen["glossary_rows"])
+
+
+def test_revert_pre_commit_failure_returns_500_db_and_history_unchanged(tmp_path, monkeypatch):
+    """Kolo 12 plán-ping-pongu IMPORTANT - stejné jako u apply: selhání
+    `commit_chapter_result` SAMOTNÉHO (SQLite transakce - nic se
+    necommitne) musí vrátit ŘÍZENOU 500 s jasným "text NEBYL vrácen",
+    ne propadnout jako neřízená výjimka."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET translated_text='A' WHERE idx=1")
+    _seed_history(history_path, [_hist_entry(1, cz_before="X", cz_after="A")])
+    monkeypatch.setattr(polish_server.state, "commit_chapter_result",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk full")))
+    client = TestClient(app)
+    r = client.post("/api/polish/revert", json={"idx": 1})
+    assert r.status_code == 500
+    assert "nebyl" in r.json()["error"].lower()
+    assert state.get_chapter(db, 1)["translated_text"] == "A"
+    assert len(polish_store.load_history(history_path)["entries"]) == 1   # jen seedovaný záznam
+
+
+def test_revert_post_commit_save_failure_db_already_updated(tmp_path, monkeypatch):
+    """Kolo 5 plán-ping-pongu IMPORTANT - stejné jako u apply: selhání
+    zápisu historie AŽ PO commitu musí jasně říct, že text v knize se
+    už změnil, ne jen vrátit generickou 500."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET translated_text='A' WHERE idx=1")
+    _seed_history(history_path, [_hist_entry(1, cz_before="X", cz_after="A")])
+    monkeypatch.setattr(polish_server.polish_store, "save_history",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    client = TestClient(app)
+    r = client.post("/api/polish/revert", json={"idx": 1})
+    assert r.status_code == 500
+    assert "vrátil" in r.json()["error"].lower() or "vrat" in r.json()["error"].lower()
+    assert state.get_chapter(db, 1)["translated_text"] == "X"
+
+
+def test_revert_original_walks_back_full_chain(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET translated_text='B' WHERE idx=1")
+    _seed_history(history_path, [
+        _hist_entry(1, cz_before="X", cz_after="A"),
+        _hist_entry(1, cz_before="A", cz_after="B")])
+    client = TestClient(app)
+    r = client.post("/api/polish/revert", json={"idx": 1, "to": "original"})
+    assert r.status_code == 200
+    assert state.get_chapter(db, 1)["translated_text"] == "X"
+
+
+def test_revert_noop_when_target_equals_current_db_text(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET translated_text='X' WHERE idx=1")
+    # X->A (entry1), pak revert A->X (entry2) - "original" teď == aktuální DB (X)
+    _seed_history(history_path, [
+        _hist_entry(1, cz_before="X", cz_after="A"),
+        _hist_entry(1, cz_before="A", cz_after="X", source="revert")])
+    client = TestClient(app)
+    r = client.post("/api/polish/revert", json={"idx": 1, "to": "original"})
+    assert r.status_code == 200 and r.json().get("noop") is True
+    entries_before = polish_store.load_history(history_path)["entries"]
+    assert len(entries_before) == 2   # žádný nový záznam
+
+
+def test_revert_409_when_pending_draft_exists_for_idx(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(
+        tmp_path, chapters=1, draft_chapters=[_chapter_draft(1, cz_before="A", styled="B")])
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET translated_text='A' WHERE idx=1")
+    _seed_history(history_path, [_hist_entry(1, cz_before="X", cz_after="A")])
+    client = TestClient(app)
+    r = client.post("/api/polish/revert", json={"idx": 1})
+    assert r.status_code == 409
+    assert state.get_chapter(db, 1)["translated_text"] == "A"
+
+
+def test_revert_404_when_no_history_for_idx(tmp_path):
+    app, *_ = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    assert client.post("/api/polish/revert", json={"idx": 1}).status_code == 404
+
+
+def test_revert_400_on_bool_idx(tmp_path):
+    """Kolo 3 plán-ping-pongu BLOCKING - viz stejný test pro apply."""
+    app, *_ = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/polish/revert", json={"idx": True})
+    assert r.status_code == 400
+
+
+def test_revert_409_when_db_moved_since_latest_entry(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET translated_text='Jinak' WHERE idx=1")
+    _seed_history(history_path, [_hist_entry(1, cz_before="X", cz_after="A")])
+    client = TestClient(app)
+    r = client.post("/api/polish/revert", json={"idx": 1})
+    assert r.status_code == 409
