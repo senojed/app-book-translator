@@ -991,3 +991,55 @@ def test_discard_corrupt_draft_after_startup_returns_500(tmp_path):
     r = client.post("/api/polish/discard", json={"idx": 1})
     assert r.status_code == 500
     assert "draft" in r.json()["error"].lower()
+
+
+def test_end_to_end_polish_then_apply_writes_edited_text(tmp_path, monkeypatch):
+    import argparse
+    import config
+    import main
+    from src.llm.client import FakeLLMClient, Completion
+    db = str(tmp_path / "state.sqlite3")
+    state.init_db(db)
+    with state.connect(db) as conn:
+        conn.execute("INSERT INTO chapters (idx,title,raw_text,translated_text,"
+                     "status,revision_rounds) VALUES (1,'K1','EN','Původní věta.','done',0)")
+    draft_path = str(tmp_path / "polish.draft.json")
+    history_path = str(tmp_path / "polish.history.json")
+    lock_path = str(tmp_path / ".lock")
+    monkeypatch.setattr(config, "DB_PATH", db)
+    monkeypatch.setattr(config, "POLISH_DRAFT_PATH", draft_path)
+    monkeypatch.setattr(config, "POLISH_HISTORY_PATH", history_path)
+    monkeypatch.setattr(config, "STYLIST_ACCEPT_FS_RISK", True)
+    monkeypatch.setattr(config, "CODEX_MODEL", "m")
+    monkeypatch.setattr(main.stylist, "_resolve_codex_cmd", lambda cmd: ["codex"])
+    monkeypatch.setattr(main.guide_mod, "load_guide", lambda path: {})
+    monkeypatch.setattr(main.guide_mod, "guide_as_prompt_block", lambda g: "")
+    monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: "Návrh od Codexu.")
+    monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
+    monkeypatch.setattr(main.concordance, "build_mentions", lambda *a, **k: [])
+    monkeypatch.setattr(main.pipeline, "_run_critic", lambda *a, **k: ([], False))
+    monkeypatch.setattr(main.stylist, "check_meaning_preserved", lambda *a, **k: [])
+    # AnthropicClient by pokouší volat skutečné API - nahraď fake klientem
+    monkeypatch.setattr(
+        main, "AnthropicClient",
+        lambda **kw: FakeLLMClient([Completion("ok", False, 100, 50)]))
+
+    rc = main._cmd_polish(argparse.Namespace(only=None, force=False))
+    assert rc == 0
+    assert polish_store.is_draft_pending(draft_path) is True
+
+    # Zámek MUSÍ být držený PŘED `build_app` (kolo 1 plán-ping-pongu
+    # BLOCKING) - `apply` volá `refresh_lock`, co bez existujícího
+    # zámku (s naším PID) vrátí `LockError` → 503, ne 200.
+    state.acquire_lock(lock_path)
+    app = polish_server.build_app(db, draft_path, history_path, lock_path)
+    _LIVE_APPS.append(app)   # kolo 16 plán-ping-pongu NIT - `_stop_heartbeats` teardown
+    client = TestClient(app)
+    r = client.post("/api/polish/apply", json={"idx": 1, "text": "Ručně upravený text."})
+    assert r.status_code == 200
+
+    assert state.get_chapter(db, 1)["translated_text"] == "Ručně upravený text."
+    assert polish_store.is_draft_pending(draft_path) is False
+    hist = polish_store.load_history(history_path)["entries"]
+    assert hist[0]["styled_by_codex"] == "Návrh od Codexu."
+    assert hist[0]["cz_after"] == "Ručně upravený text."
