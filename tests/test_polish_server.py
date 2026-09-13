@@ -920,3 +920,74 @@ def test_revert_409_when_db_moved_since_latest_entry(tmp_path):
     client = TestClient(app)
     r = client.post("/api/polish/revert", json={"idx": 1})
     assert r.status_code == 409
+
+
+def test_discard_removes_idx_from_draft(tmp_path):
+    app, db, draft_path, *_ = _app(
+        tmp_path, chapters=1, draft_chapters=[_chapter_draft(1, cz_before="A", styled="B")])
+    client = TestClient(app)
+    r = client.post("/api/polish/discard", json={"idx": 1})
+    assert r.status_code == 200
+    assert polish_store.is_draft_pending(draft_path) is False
+    assert state.get_chapter(db, 1)["translated_text"] == "Věta 1."   # DB netknuta
+
+
+def test_discard_idempotent_when_idx_not_pending(tmp_path):
+    app, *_ = _app(tmp_path, chapters=1, draft_chapters=[])
+    client = TestClient(app)
+    assert client.post("/api/polish/discard", json={"idx": 1}).status_code == 200
+
+
+def test_discard_400_on_bad_input(tmp_path):
+    app, *_ = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    assert client.post("/api/polish/discard", json={"idx": "x"}).status_code == 400
+
+
+def test_discard_400_on_bool_idx(tmp_path):
+    """Kolo 3 plán-ping-pongu BLOCKING - viz stejný test pro apply."""
+    app, *_ = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    assert client.post("/api/polish/discard", json={"idx": True}).status_code == 400
+
+
+def test_discard_503_when_lock_lost_no_json_write(tmp_path, monkeypatch):
+    """Kolo 7 plán-ping-pongu IMPORTANT - stejný princip jako u apply:
+    end-to-end důkaz, že ztracený zámek zablokuje zápis, ne jen unit
+    test `refresh_lock` samotného."""
+    app, db, draft_path, *_ = _app(
+        tmp_path, chapters=1, draft_chapters=[_chapter_draft(1, cz_before="A", styled="B")])
+    app.state.require_lock = lambda: False
+    client = TestClient(app)
+    r = client.post("/api/polish/discard", json={"idx": 1})
+    assert r.status_code == 503
+    assert polish_store.is_draft_pending(draft_path) is True
+
+
+def test_discard_save_failure_returns_500_draft_unchanged(tmp_path, monkeypatch):
+    """Kolo 8 plán-ping-pongu IMPORTANT - discard nikdy nesahá na DB,
+    takže selhání zápisu draftu tu není post-commit třída chyby jako u
+    apply/revert - musí ale pořád vrátit ŘÍZENOU 500, ne neošetřenou
+    výjimku, a kapitola zůstává ve frontě (žádný commit proběhnout
+    nemohl - obojí je pořád jen jeden zápis)."""
+    app, db, draft_path, *_ = _app(
+        tmp_path, chapters=1, draft_chapters=[_chapter_draft(1, cz_before="A", styled="B")])
+    monkeypatch.setattr(polish_server.polish_store, "save_draft",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    client = TestClient(app)
+    r = client.post("/api/polish/discard", json={"idx": 1})
+    assert r.status_code == 500
+    assert "draft" in r.json()["error"].lower()
+    assert polish_store.is_draft_pending(draft_path) is True
+
+
+def test_discard_corrupt_draft_after_startup_returns_500(tmp_path):
+    """Kolo 5 plán-ping-pongu IMPORTANT - jednotná čitelná 500, stejná
+    jako GET/apply/revert - viz `test_get_polish_corrupt_draft_after_
+    startup_returns_500`."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    open(draft_path, "w", encoding="utf-8").write("{not valid json")
+    client = TestClient(app)
+    r = client.post("/api/polish/discard", json={"idx": 1})
+    assert r.status_code == 500
+    assert "draft" in r.json()["error"].lower()

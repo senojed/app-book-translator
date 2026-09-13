@@ -507,6 +507,37 @@ def build_app(db_path: str, draft_path: str, history_path: str, lock_path: str) 
                               "nesoulad."}, status_code=500)
         return {"ok": True}
 
+    @app.post("/api/polish/discard")
+    def post_discard(payload: dict):
+        idx_raw = payload.get("idx")
+        # `type(x) is int` NE `isinstance` (kolo 3 plán-ping-pongu
+        # BLOCKING - `bool` je podtřída `int`). Levná kontrola tvaru,
+        # zůstává PŘED zámkem.
+        if type(idx_raw) is not int:
+            return JSONResponse({"error": "idx musí být int"}, status_code=400)
+        idx = idx_raw
+        # `require_lock()` UVNITŘ zámku (kolo 4 plán-ping-pongu BLOCKING,
+        # stejný princip jako u apply/revert výš).
+        with write_lock:
+            if not app.state.require_lock():
+                return JSONResponse({"error": "zámek ztracen"}, status_code=503)
+            draft, err = _try_load_draft(draft_path)
+            if err:
+                return err
+            draft["chapters"] = [c for c in draft["chapters"] if c["idx"] != idx]
+            # discard NIKDY nesahá na DB - selhání zápisu draftu tu tedy
+            # NENÍ post-commit třída chyby jako u apply/revert, ale pořád
+            # by bez ošetření propadlo jako neřízená 500 (kolo 8
+            # plán-ping-pongu IMPORTANT - dřív žádný try/except).
+            try:
+                polish_store.save_draft(draft_path, draft)
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"Zápis draftu selhal ({type(e).__name__}: {e}) - "
+                              "kapitola zůstává ve frontě, zkus to znovu."},
+                    status_code=500)
+        return {"ok": True}
+
     app.state.write_lock = write_lock
     app.state.lock_lost = lock_lost
     app.state.shutdown_heartbeat = shutdown
