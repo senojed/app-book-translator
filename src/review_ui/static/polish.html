@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<title>Polish review</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 1.5rem;
+        background: #f7f7f5; color: #1a1a1a; }
+  h1 { font-size: 1.3rem; }
+  .chapter { background: #fff; border: 1px solid #ddd; border-radius: 8px;
+            padding: 1rem; margin-bottom: 1.5rem; }
+  .chapter.stale { border-color: #d9822b; background: #fff8ee; }
+  .stale-msg { color: #b35c00; font-weight: 600; margin-bottom: .5rem; }
+  .findings { font-size: .85rem; color: #555; margin-bottom: .5rem; }
+  .findings li { margin-bottom: .2rem; }
+  .panes { display: flex; gap: 1rem; }
+  .pane { flex: 1; min-width: 0; }
+  .pane h4 { margin: 0 0 .3rem; font-size: .8rem; text-transform: uppercase;
+            color: #888; }
+  .pane pre, .pane textarea { width: 100%; box-sizing: border-box;
+            min-height: 200px; font-family: inherit; font-size: .95rem;
+            white-space: pre-wrap; padding: .5rem; border: 1px solid #ccc;
+            border-radius: 4px; }
+  .pane pre { background: #fafafa; overflow-y: auto; }
+  .buttons { margin-top: .5rem; display: flex; gap: .5rem; flex-wrap: wrap; }
+  button { cursor: pointer; border: 1px solid #ccc; background: #fff;
+          border-radius: 4px; padding: .4rem .8rem; font-size: .85rem; }
+  button.primary { background: #1a6b3c; color: #fff; border-color: #1a6b3c; }
+  button.danger { background: #b3261e; color: #fff; border-color: #b3261e; }
+  .error { color: #b3261e; font-size: .85rem; margin-top: .3rem; }
+  #history table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  #history td, #history th { padding: .3rem .5rem; border-bottom: 1px solid #eee;
+                             text-align: left; }
+  #find-idx { padding: .3rem; }
+</style>
+</head>
+<body>
+<h1>Polish review</h1>
+<div id="chapters"></div>
+
+<h2>Historie</h2>
+<div>
+  Najít historii kapitoly č. <input id="find-idx" type="number" min="1">
+  <button id="find-btn">Hledat</button>
+</div>
+<div id="history"></div>
+
+<script>
+// Kolo 1 plán-ping-pongu BLOCKING - `title`/`issue`/`cz_before`/`styled`
+// jsou Codexem-odvozený (nedůvěryhodný, prompt-injectable) text. CELÁ
+// tahle stránka proto staví DOM VÝHRADNĚ přes `createElement`+`textContent`
+// (nikdy `innerHTML` s interpolovaným textem) a posluchače přes
+// `addEventListener` s daty v JS closure (nikdy inline `onclick="..."`
+// s `JSON.stringify` uvnitř HTML atributu - to by šlo prolomit uvozovkou
+// v samotném textu a spustit libovolný JS/žádost).
+let LAST = { chapters: [], history: [] };
+
+async function load() {
+  const r = await fetch('/api/polish');
+  const body = await r.json().catch(() => ({}));
+  // Kolo 6 plán-ping-pongu IMPORTANT - dřív `load()` nekontrolovalo
+  // `r.ok`, takže server-side 500 (poškozený draft/historie) nastavilo
+  // `LAST` na `{error: ...}` a `LAST.chapters.length` spadlo v JS -
+  // pečlivě formulovaná server chyba tak nikdy nebyla vidět.
+  if (!r.ok) {
+    const root = document.getElementById('chapters');
+    root.textContent = '';
+    root.appendChild(el('p', { class: 'error', text: body.error || `HTTP ${r.status}` }));
+    document.getElementById('history').textContent = '';
+    return;
+  }
+  LAST = body;
+  renderChapters();
+  renderHistory(LAST.history);
+}
+
+async function loadHistory(idx) {
+  const r = await fetch('/api/polish?idx=' + encodeURIComponent(idx));
+  const body = await r.json().catch(() => ({}));
+  // Kolo 8 plán-ping-pongu IMPORTANT - stejná chyba jako `load()` před
+  // kolem 6 opravou: bez `r.ok` kontroly by 500 (poškozená historie)
+  // spadlo v JS na `undefined.history` místo zobrazení chyby.
+  if (!r.ok) {
+    alert(body.error || `HTTP ${r.status}`);
+    return;
+  }
+  renderHistory(body.history);
+}
+
+function el(tag, opts, children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(opts || {})) {
+    if (k === 'class') e.className = v;
+    else if (k === 'text') e.textContent = v;
+    else e.setAttribute(k, v);
+  }
+  for (const c of children || []) e.appendChild(c);
+  return e;
+}
+
+function renderChapters() {
+  const root = document.getElementById('chapters');
+  root.textContent = '';
+  if (LAST.chapters.length === 0) {
+    root.appendChild(el('p', { text: 'Žádné kapitoly nečekají na review.' }));
+    return;
+  }
+  for (const ch of LAST.chapters) root.appendChild(chapterCard(ch));
+}
+
+function chapterCard(ch) {
+  const div = el('div', { class: 'chapter' + (ch.stale ? ' stale' : '') });
+  div.appendChild(el('h3', { text: `#${ch.idx} - ${ch.title}` }));
+  if (ch.stale) {
+    // Kolo 7 plán-ping-pongu IMPORTANT - `already_committed_kept_original`
+    // dřív sdílelo hlášku s `likely_committed_without_history` ("chybí
+    // záznam, zkontroluj ručně"), i když je to OČEKÁVANÝ, potvrzený stav
+    // (originál byl ponechán, jen se nepovedlo odebrat draft z fronty) -
+    // vlastní, méně poplašná zpráva.
+    const msgs = {
+      already_committed_has_history:
+        'Tahle kapitola už byla uložena (viz historie), zbývá jen odebrat z fronty.',
+      already_committed_kept_original:
+        'Rozhodnutí "ponechat originál" už bylo potvrzeno (viz poznámka v knize), jen se nepovedlo odebrat z fronty - klidně zahoď.',
+    };
+    const msg = msgs[ch.reason]
+      || 'Tahle kapitola byla pravděpodobně už uložena, ale chybí záznam v historii (revert pro ni nepůjde) - zkontroluj text v knize ručně.';
+    div.appendChild(el('div', { class: 'stale-msg', text: msg }));
+  }
+  const findings = el('ul', { class: 'findings' },
+    (ch.findings || []).map(f => el('li', {
+      text: `[${f.severity || '?'}] ${f.issue || '(bez popisu)'}` })));
+  div.appendChild(findings);
+
+  const origPre = el('pre', { text: ch.cz_before });
+  const textarea = el('textarea');
+  textarea.value = ch.styled;
+  const panes = el('div', { class: 'panes' }, [
+    el('div', { class: 'pane' }, [el('h4', { text: 'Originál' }), origPre]),
+    el('div', { class: 'pane' }, [el('h4', { text: 'Návrh (editovatelné)' }), textarea]),
+  ]);
+  div.appendChild(panes);
+
+  const errBox = el('div', { class: 'error' });
+  const btnOrig = el('button', { text: 'Vrať na originál' });
+  btnOrig.addEventListener('click', () => { textarea.value = ch.cz_before; });
+  const btnCodex = el('button', { text: 'Vrať na Codex' });
+  btnCodex.addEventListener('click', () => { textarea.value = ch.styled; });
+  const btnApply = el('button', { class: 'primary', text: 'Uložit tuhle kapitolu' });
+  btnApply.addEventListener('click', () => applyChapter(ch.idx, textarea, errBox));
+  const btnDiscard = el('button', { class: 'danger', text: 'Zahodit' });
+  btnDiscard.addEventListener('click', () => discardChapter(ch.idx, errBox));
+  div.appendChild(el('div', { class: 'buttons' }, [btnOrig, btnCodex, btnApply, btnDiscard]));
+  div.appendChild(errBox);
+  return div;
+}
+
+async function applyChapter(idx, textarea, errBox) {
+  const r = await fetch('/api/polish/apply', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ idx, text: textarea.value }),
+  });
+  if (r.ok) { load(); return; }
+  const body = await r.json().catch(() => ({}));
+  errBox.textContent = body.error || `HTTP ${r.status}`;
+}
+
+async function discardChapter(idx, errBox) {
+  if (!confirm('Zahodit tenhle návrh? Text v knize se nezmění.')) return;
+  const r = await fetch('/api/polish/discard', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ idx }),
+  });
+  // Kolo 8 plán-ping-pongu IMPORTANT - dřív se odpověď ignorovala úplně,
+  // takže selhání zápisu draftu (teď ošetřené serverem výš) nebylo v UI
+  // vidět vůbec - `load()` prostě proběhlo, jako by se nic nestalo.
+  if (r.ok) { load(); return; }
+  const body = await r.json().catch(() => ({}));
+  errBox.textContent = body.error || `HTTP ${r.status}`;
+}
+
+async function revertChapter(idx, to) {
+  const r = await fetch('/api/polish/revert', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ idx, to }),
+  });
+  if (r.ok) { load(); return; }
+  const body = await r.json().catch(() => ({}));
+  alert(body.error || `HTTP ${r.status}`);
+}
+
+function renderHistory(entries) {
+  const root = document.getElementById('history');
+  root.textContent = '';
+  if (!entries.length) {
+    root.appendChild(el('p', { text: 'Zatím žádná historie.' }));
+    return;
+  }
+  // "vrať zpět"/"vrať na původní" - NIKDY lokální "je tohle nejnovější"
+  // heuristika (kolo 12 plán-ping-pongu BLOCKING - dřív `seenIdx` s
+  // "první výskyt idx = nejnovější" fungovalo JEN pro nefiltrovaný GET
+  // (server tam řadí nejnovější-první); `GET ?idx=N` ale vrací pole v
+  // POŘADÍ VLOŽENÍ do historie, tedy NEJSTARŠÍ první - stejný trik by u
+  // dohledané kapitoly skryl tlačítka u SKUTEČNĚ posledního záznamu a
+  // ukázal je u nejstaršího). Server je JEDINÝ zdroj pravdy - `_annotate_
+  // history` (kolo 6/20/22) nastavuje `can_revert_previous`/`can_revert_
+  // original`/`stale` podle IDENTITY objektu v `full_entries` (`find_
+  // latest(...) is e`), NE podle pozice v tomhle poli, takže čtení
+  // přímo z `e.*` je SPRÁVNÉ bez ohledu na pořadí/filtr.
+  const table = el('table');
+  table.appendChild(el('tr', {}, [
+    el('th', { text: '#' }), el('th', { text: 'Kdy' }),
+    el('th', { text: 'Zdroj' }), el('th', {})]));
+  for (const e of entries) {
+    const btnCell = el('td');
+    if (e.can_revert_previous) {
+      const b = el('button', { text: 'Vrať zpět' });
+      b.addEventListener('click', () => revertChapter(e.idx, 'previous'));
+      btnCell.appendChild(b);
+    }
+    if (e.can_revert_original) {
+      const b = el('button', { text: 'Vrať na původní' });
+      b.addEventListener('click', () => revertChapter(e.idx, 'original'));
+      btnCell.appendChild(b);
+    }
+    table.appendChild(el('tr', {}, [
+      el('td', { text: String(e.idx) }), el('td', { text: e.applied_at }),
+      el('td', { text: e.source }), btnCell]));
+    if (e.stale) {
+      // Kolo 6 plán-ping-pongu BLOCKING - `_annotate_history` teď
+      // aktivně porovnává DB text s posledním historie-záznamem (dřív
+      // to dělala jen draftová `_stale_info`, co revert nikdy nezachytí
+      // - revert žádný draft nevytváří).
+      table.appendChild(el('tr', {}, [el('td', { colspan: '4', class: 'stale-msg',
+        text: `#${e.idx}: DB neodpovídá historii - poslední zápis do historie ` +
+              'pravděpodobně selhal PO uložení textu do knihy. Zkontroluj text ' +
+              'ručně; revert/apply pro tuhle kapitolu nemusí fungovat spolehlivě, ' +
+              'dokud nesoulad nevyřešíš.' })]));
+    }
+  }
+  root.appendChild(table);
+}
+
+document.getElementById('find-btn').addEventListener('click', () => {
+  const v = Number(document.getElementById('find-idx').value);
+  if (v > 0) loadHistory(v);
+});
+
+load();
+</script>
+</body>
+</html>
