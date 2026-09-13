@@ -462,9 +462,9 @@ def _write_polish_report(db: str, rid: int, report: list, *, codex_model: str,
     "spustil se, neudělal nic"). `if not report` se NEkontroluje.
 
     Kontrakt záznamu kapitoly - viz `_polish_one_chapter` docstring.
-    Klíčové: `rejected` nese `reason_types` VŽDY (deduplikované
-    `"src/type"` řetězce, bezpečná agregační metrika); `reasons`/
-    `findings`/`styled` jen za `config.STYLIST_REPORT_REJECTED_TEXT`.
+    Klíčové: `drafted` nese `reason_types` VŽDY (deduplikované
+    `"src/type"` řetězce, bezpečná agregační metrika); `findings`/
+    `styled` jen za `config.STYLIST_REPORT_REJECTED_TEXT`.
     `failed` nese jen `error`.
 
     Hlavička (kompletní výčet):
@@ -484,7 +484,7 @@ def _write_polish_report(db: str, rid: int, report: list, *, codex_model: str,
         `finalization_error` (když `state.finish_run` selhal - kolo 28:
         report se píše AŽ PO `finish_run`, aby tohle mohl zaznamenat)
       - `summary` - dict s počty pro každý outcome v `_REPORT_OUTCOMES`
-        (polished/unchanged/rejected/failed/fatal/interrupted)
+        (drafted/unchanged/failed/fatal/interrupted)
 
     `polish-reports/run-<rid>-<timestamp>-<8 hex>.json` - jeden soubor za běh,
     historie zůstává. Atomický zápis (tmp + `os.replace`).
@@ -494,19 +494,21 @@ def _write_polish_report(db: str, rid: int, report: list, *, codex_model: str,
     volá se z `finally`, nová výjimka by přebila skutečný výsledek).
     Selhání jen VYPÍŠE a uklidí `.tmp`.
 
-    BEZPEČNOST (kolo 27-32): s `config.STYLIST_REPORT_REJECTED_TEXT is
-    True` report u `rejected` PERZISTENTNĚ ukládá zamítnutý text od
-    Codexu + volná pole nálezů (`issue`, `cz_excerpt`, ...), co můžou
-    nést exfiltrovaný obsah (dřív se po zamítnutí zahodilo). To je
-    SAMOSTATNÉ riziko (trvalá perzistence potenciálně exfiltrovaného
-    obsahu, navíc do často synchronizované složky) - NENÍ pokryté
-    přijetím `STYLIST_ACCEPT_FS_RISK` (to je jen o čtení disku BĚHEM
-    běhu), proto SAMOSTATNÝ explicitní opt-in (kolo 31 IMPORTANT). DEFAULT
-    je `False` → záznam `rejected` nese JEN `reason_types` (normalizované
-    kategorie, žádný volný text), per-kapitolový konzolový výpis vynechá
-    `issue` řádky, a `polish()` nepřipojí Codex stderr do `StylistError`.
-    Kontrola `is True` (kolo 32) - `1`/`"False"`/`None` plný detail
-    NEaktivují. Retence/práva souborů `polish-reports/` jsou na uživateli."""
+    BEZPEČNOST (kolo 27-32, aktualizováno po zavedení `polish-review`):
+    s `config.STYLIST_REPORT_REJECTED_TEXT is True` report u `drafted`
+    PERZISTENTNĚ ukládá stylizovaný text od Codexu + volná pole nálezů
+    (`issue`, `cz_excerpt`, ...), co můžou nést exfiltrovaný obsah (dřív
+    se po zamítnutí zahodilo, dnes jde vždy k ručnímu review přes
+    `polish-review`). To je SAMOSTATNÉ riziko (trvalá perzistence
+    potenciálně exfiltrovaného obsahu, navíc do často synchronizované
+    složky) - NENÍ pokryté přijetím `STYLIST_ACCEPT_FS_RISK` (to je jen o
+    čtení disku BĚHEM běhu), proto SAMOSTATNÝ explicitní opt-in (kolo 31
+    IMPORTANT). DEFAULT je `False` → záznam `drafted` nese JEN
+    `reason_types` (normalizované kategorie, žádný volný text),
+    per-kapitolový konzolový výpis vynechá `issue` řádky, a `polish()`
+    nepřipojí Codex stderr do `StylistError`. Kontrola `is True` (kolo
+    32) - `1`/`"False"`/`None` plný detail NEaktivují. Retence/práva
+    souborů `polish-reports/` jsou na uživateli."""
     tmp = None
     try:
         now = _dt.datetime.now(_dt.timezone.utc).astimezone()
@@ -909,9 +911,24 @@ def _cmd_review(args) -> int:
 
 def _cmd_polish_review(args) -> int:
     from src.review_ui import polish_server
-    return polish_server.run_polish_review_server(
-        config.DB_PATH, config.POLISH_DRAFT_PATH, config.POLISH_HISTORY_PATH,
-        config.LOCK_PATH)
+    # `run_polish_review_server` volá `build_app` PŘED svým vlastním
+    # try/finally - poškozený `polish.draft.json`/`polish.history.json`
+    # (`PolishStoreError`) nebo selhání startovního `_snapshot_db`
+    # (`TimeoutError` u dlouho zamčené DB, `OSError` u neprošlého
+    # integrity_check) by jinak propadly jako nezachycený traceback až
+    # sem - `main()`'s `except state.LockError` tyhle výjimky nechytá.
+    # Stejný vzor jako `_cmd_polish`'s draft-preflight výš: čitelná
+    # hláška + `return 1`, ne holý traceback.
+    try:
+        return polish_server.run_polish_review_server(
+            config.DB_PATH, config.POLISH_DRAFT_PATH, config.POLISH_HISTORY_PATH,
+            config.LOCK_PATH)
+    except (polish_store.PolishStoreError, OSError, TimeoutError) as e:
+        _say(f"polish-review se nepodařilo spustit ({type(e).__name__}: {e}) - "
+             f"zkontroluj {config.POLISH_DRAFT_PATH}, "
+             f"{config.POLISH_HISTORY_PATH} a DB ({config.DB_PATH}), "
+             "případně poškozený soubor oprav nebo smaž.")
+        return 1
 
 
 def _cmd_run(args) -> int:

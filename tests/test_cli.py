@@ -1208,6 +1208,28 @@ def test_cmd_polish_review_calls_server_with_configured_paths(tmp_path, monkeypa
     assert seen["lock_path"] == config.LOCK_PATH
 
 
+def test_cmd_polish_review_reports_startup_failure_instead_of_traceback(
+        tmp_path, monkeypatch, capsys):
+    """`build_app` (uvnitř `run_polish_review_server`) může vyhodit
+    `PolishStoreError` (poškozený draft/historie) nebo `OSError`/
+    `TimeoutError` (`_snapshot_db` selhání) - `_cmd_polish_review`
+    tohle musí chytit a vrátit čitelné `return 1`, ne nechat traceback
+    propadnout až do `main()`."""
+    def _fake_run(db_path, draft_path, history_path, lock_path, **kw):
+        raise polish_store.PolishStoreError("corrupt")
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "s.sqlite3"))
+    monkeypatch.setattr(config, "POLISH_DRAFT_PATH", str(tmp_path / "d.json"))
+    monkeypatch.setattr(config, "POLISH_HISTORY_PATH", str(tmp_path / "h.json"))
+    monkeypatch.setattr(config, "LOCK_PATH", str(tmp_path / ".lock"))
+    import src.review_ui.polish_server as ps_module
+    monkeypatch.setattr(ps_module, "run_polish_review_server", _fake_run)
+    rc = main._cmd_polish_review(argparse.Namespace())
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "corrupt" in out
+    assert "polish-review" in out
+
+
 def _init_args(path, reset=False):
     return argparse.Namespace(path=path, reset=reset)
 

@@ -751,6 +751,25 @@ def test_revert_previous_restores_cz_before_of_latest(tmp_path):
     assert entries[-1] == {**entries[-1], "cz_before": "A", "cz_after": "X", "source": "revert"}
 
 
+def test_revert_marker_note_names_target_history_entry(tmp_path):
+    """Review nález IMPORTANT - DB audit marker (`main._revert_marker`)
+    musí říct, KTERÝ historie-záznam byl cílem revertu (pozice v poli +
+    `applied_at`), ne jen obecnou slovní frázi bez identifikace."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET translated_text='A' WHERE idx=1")
+    target_entry = _hist_entry(1, cz_before="X", cz_after="A")
+    _seed_history(history_path, [target_entry])
+    client = TestClient(app)
+    r = client.post("/api/polish/revert", json={"idx": 1})
+    assert r.status_code == 200
+    entries = polish_store.load_history(history_path)["entries"]
+    marker = next(f for f in entries[-1]["findings"]
+                 if f.get("source") == "stylist" and f.get("type") == "revert")
+    assert "idx=0" in marker["issue"]
+    assert target_entry["applied_at"] in marker["issue"]
+
+
 def test_revert_preserves_live_revision_rounds(tmp_path):
     """Kolo 1 plán-ping-pongu IMPORTANT - revert nesmí přepsat
     `revision_rounds` natvrdo na 0, musí zachovat živou DB hodnotu
@@ -904,6 +923,54 @@ def test_revert_404_when_no_history_for_idx(tmp_path):
     assert client.post("/api/polish/revert", json={"idx": 1}).status_code == 404
 
 
+def test_revert_503_when_lock_lost_no_db_or_json_write(tmp_path, monkeypatch):
+    """Kolo 7 plán-ping-pongu IMPORTANT - stejný princip jako u apply/
+    discard (viz `test_apply_503_when_lock_lost_no_db_or_json_write`):
+    end-to-end důkaz, že ztracený zámek zablokuje zápis, ne jen unit test
+    `refresh_lock` samotného. Revertu dřív chyběl tenhle regresní test."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET translated_text='A' WHERE idx=1")
+    _seed_history(history_path, [_hist_entry(1, cz_before="X", cz_after="A")])
+    app.state.require_lock = lambda: False
+    client = TestClient(app)
+    r = client.post("/api/polish/revert", json={"idx": 1})
+    assert r.status_code == 503
+    assert state.get_chapter(db, 1)["translated_text"] == "A"
+    assert len(polish_store.load_history(history_path)["entries"]) == 1
+
+
+def test_revert_reads_draft_and_history_only_while_holding_write_lock(tmp_path, monkeypatch):
+    """Kolo 3 plán-ping-pongu BLOCKING - stejný princip jako u apply (viz
+    `test_apply_reads_draft_only_while_holding_write_lock`): revert MUSÍ
+    číst draft (pending-guard) i historii UVNITŘ `write_lock`, ne PŘED
+    ním - jinak by souběžný apply/discard mohl proběhnout MEZI čtením a
+    získáním zámku a revert by rozhodoval podle zastaralého stavu.
+    Revertu dřív chyběl tenhle regresní test."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET translated_text='A' WHERE idx=1")
+    _seed_history(history_path, [_hist_entry(1, cz_before="X", cz_after="A")])
+    real_load_draft = polish_server.polish_store.load_draft
+    real_load_history = polish_server.polish_store.load_history
+    seen = {"draft_locked": None, "history_locked": None}
+    def _spy_load_draft(path):
+        if path == draft_path:
+            seen["draft_locked"] = app.state.write_lock.locked()
+        return real_load_draft(path)
+    def _spy_load_history(path):
+        if path == history_path:
+            seen["history_locked"] = app.state.write_lock.locked()
+        return real_load_history(path)
+    monkeypatch.setattr(polish_server.polish_store, "load_draft", _spy_load_draft)
+    monkeypatch.setattr(polish_server.polish_store, "load_history", _spy_load_history)
+    client = TestClient(app)
+    r = client.post("/api/polish/revert", json={"idx": 1})
+    assert r.status_code == 200
+    assert seen["draft_locked"] is True
+    assert seen["history_locked"] is True
+
+
 def test_revert_400_on_bool_idx(tmp_path):
     """Kolo 3 plán-ping-pongu BLOCKING - viz stejný test pro apply."""
     app, *_ = _app(tmp_path, chapters=1)
@@ -936,6 +1003,18 @@ def test_discard_idempotent_when_idx_not_pending(tmp_path):
     app, *_ = _app(tmp_path, chapters=1, draft_chapters=[])
     client = TestClient(app)
     assert client.post("/api/polish/discard", json={"idx": 1}).status_code == 200
+
+
+def test_discard_ok_when_no_draft_file_exists_at_all(tmp_path):
+    """Bez ŽÁDNÉHO `polish.draft.json` (`draft_chapters=None` - `_app`
+    tenhle soubor vůbec nezapíše) `load_draft`'s prázdný obal musí projít
+    `save_draft`'s vlastní validací (review nález IMPORTANT) - jinak by
+    tenhle discard pro kapitolu, co NIKDY nebyla ve frontě, dostal
+    matoucí 500 misto čistého 200."""
+    app, *_ = _app(tmp_path, chapters=1, draft_chapters=None)
+    client = TestClient(app)
+    r = client.post("/api/polish/discard", json={"idx": 1})
+    assert r.status_code == 200
 
 
 def test_discard_400_on_bad_input(tmp_path):

@@ -171,8 +171,15 @@ def load_draft(path: str) -> dict:
     soubor se VŽDY plně validuje, poškozený/cizí obsah nikdy neprojde
     tiše (spec kolo 3)."""
     if not os.path.exists(path):
-        return {"schema_version": DRAFT_SCHEMA_VERSION, "generated_at": "",
-                "codex_model": "", "chapters": []}
+        # `generated_at`/`codex_model` musí projít VLASTNÍ validací
+        # (kolo plán-ping-pongu review nález IMPORTANT) - `""` u obou
+        # by `save_draft` rovnou odmítlo (`_is_utc_z("")` je `False`,
+        # `codex_model` musí být neprázdný string), takže `post_discard`
+        # na serveru startovaném BEZ draft souboru vůbec by po zavolání
+        # `save_draft` (jen aby se prázdný seznam kapitol zapsal) dostal
+        # matoucí 500 pro kapitolu, co nikdy nebyla ve frontě.
+        return {"schema_version": DRAFT_SCHEMA_VERSION, "generated_at": utc_now_z(),
+                "codex_model": "none", "chapters": []}
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)

@@ -17,16 +17,6 @@ _STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 _LOCK_REFRESH_INTERVAL = state._LOCK_STALE_SECONDS // 2   # kolo 2
 
 
-def _rendered_terms_for(db_path: str, idx: int) -> list:
-    """Použito JEN pro DRAFT-vzniklé kapitoly, co ještě nemají uložený
-    `rendered_terms` (obranná záloha) - normální cesta je vždy přenášet
-    hodnotu z draftu/historie (kolo 18), ne dopočítávat znovu z DB."""
-    prior = state.chapter_mentions(db_path, idx)
-    return [{"term_id": m["term_id"], "cz_as_used": m["cz_form"],
-            "scene_idx": m["scene_idx"]}
-           for m in prior if m.get("cz_form") and m.get("source") == "rendered"]
-
-
 def _stale_info(db_path: str, draft_ch: dict, history_entries: list) -> "dict | None":
     """Spec kolo 3/4 - GET detekuje AKTIVNĚ, ne pasivně přes 409 při retry."""
     row = state.get_chapter(db_path, draft_ch["idx"])
@@ -453,8 +443,20 @@ def build_app(db_path: str, draft_path: str, history_path: str, lock_path: str) 
             en = state.get_chapter(db_path, idx)["raw_text"]
             glossary_rows = glossary.all_terms(db_path)
             mentions = concordance.build_mentions(en, target, glossary_rows, latest["rendered_terms"])
-            note = ("vráceno na verzi před poslední stylizací" if to == "previous"
-                    else "vráceno na verzi před JAKOUKOLI stylizací")
+            # DB audit marker musí ukazovat, KTERÝ konkrétní historie-
+            # záznam revert vysvětluje (review nález IMPORTANT) - dřív
+            # jen slovní popis bez identifikace záznamu; `idx` je pozice
+            # v `entries` (`is` identita, ne `==`, stejný princip jako
+            # `_annotate_history`'s `find_latest(...) is e` výš - pole
+            # DB `idx` znamená kapitolu, ne historii, proto tenhle
+            # samostatný název).
+            target_entry = latest if to == "previous" else polish_store.find_chain_start(entries, idx)
+            entry_pos = next(i for i, e in enumerate(entries) if e is target_entry)
+            note = (f"vráceno na verzi před poslední stylizací (historie "
+                    f"idx={entry_pos}, applied_at={target_entry['applied_at']})"
+                    if to == "previous" else
+                    f"vráceno na verzi před JAKOUKOLI stylizací (historie "
+                    f"idx={entry_pos}, applied_at={target_entry['applied_at']})")
             findings = concordance.check_chapter(en, target, glossary_rows,
                                                  latest["rendered_terms"]) + [main._revert_marker(note)]
 

@@ -20,8 +20,14 @@ def _draft(chapters=(), **over):
 
 def test_load_missing_draft_returns_empty_envelope(tmp_path):
     d = ps.load_draft(str(tmp_path / "nope.json"))
-    assert d == {"schema_version": ps.DRAFT_SCHEMA_VERSION, "generated_at": "",
-                "codex_model": "", "chapters": []}
+    assert d["schema_version"] == ps.DRAFT_SCHEMA_VERSION
+    assert d["chapters"] == []
+    # `generated_at`/`codex_model` musí být VALIDNÍ hodnoty (ne holé
+    # prázdné stringy) - jinak by tenhle obal neprošel `save_draft`'s
+    # vlastní validací (viz `post_discard` na serveru bez draft souboru).
+    assert ps._is_utc_z(d["generated_at"])
+    assert d["codex_model"] == "none"
+    ps.save_draft(str(tmp_path / "roundtrip.json"), d)
 
 
 def test_save_then_load_draft_roundtrips(tmp_path):
