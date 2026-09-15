@@ -2,6 +2,7 @@
 Na rozdíl od `server.py` (`review`) tenhle server BĚŽÍ, dokud ho uživatel
 nezavře - může rozhodnout jen NĚKTERÉ kapitoly a zbytek nechat na příště.
 Viz docs/superpowers/specs/2026-09-11-polish-review-design.md."""
+import json
 import os
 import threading
 import uuid
@@ -245,6 +246,141 @@ def build_app(db_path: str, draft_path: str, history_path: str, lock_path: str) 
                                        if latest and latest["styled_by_codex"] else None),
             "history": _annotate_history(db_path, entries, own_history),
         }
+
+    _EDITABLE_STATUSES = ("done", "flagged", "needs_human", "error")
+
+    def _valid_finding_shape(f) -> bool:
+        if not isinstance(f, dict):
+            return False
+        for key in ("id", "source", "type", "issue", "severity"):
+            if key in f and f[key] is not None and not isinstance(f[key], str):
+                return False
+        if "id" in f and f["id"] == "":
+            return False
+        if "resolved" in f and not isinstance(f["resolved"], bool):
+            return False
+        return True
+
+    def _no_duplicate_ids(findings_list: list) -> bool:
+        ids = [f["id"] for f in findings_list if isinstance(f.get("id"), str) and f["id"]]
+        return len(ids) == len(set(ids))
+
+    def _merge_findings_by_id(current_findings: list, incoming: list, *,
+                              known_ids: "set | None" = None) -> list:
+        """Sloučí ULOŽENÉ nálezy (`current_findings`, včetně auditních
+        markerů - GET je klientovi nikdy neposílá zpátky, takže jejich `id`
+        se s `incoming` nikdy nepřekryje) s tím, co poslal klient
+        (`incoming`, UŽ prošlé `findings.assign_ids`). Markery se ZACHOVÁVAJÍ
+        VŽDY (nikdy se nemažou - append-only audit log). Server-side
+        `resolved` je AUTORITATIVNÍ pro KAŽDÉ `id`, co server už zná.
+
+        `known_ids` - klientova vlastní představa "který nález jsem znal
+        PŘI NAČTENÍ" (`PERSISTED_IDS` z GET, Task 14). Non-marker nález z
+        `current_findings`, co NENÍ v `incoming`, se NEPŘENESE JEN KDYŽ
+        jeho `id` JE v `known_ids` (klient ho znal - buď ho superseduje
+        čerstvou regenerací, nebo ho prostě zahodil). Nález, co klient
+        NIKDY neznal (přidal ho JINÝ požadavek MEZI klientovým GET a
+        týmhle save), se ZACHOVÁ i když ho `incoming` neobsahuje - karta-B-
+        přidala-nález race zůstává chráněný. "Nikdy nic nemaže" (markery
+        vždy, non-markery když nejsou v `known_ids`) PŘEDPOKLÁDÁ platná,
+        unikátní `id` - `current_findings` bez `id` se do `current_by_id`
+        vůbec nedostanou a `_merge_findings_by_id` je TICHE VYNECHÁ z
+        výsledku."""
+        if known_ids is None:
+            known_ids = set()
+        current_by_id = {f["id"]: f for f in current_findings if f.get("id")}
+        incoming_ids = {f["id"] for f in incoming}
+        merged_by_id = {fid: f for fid, f in current_by_id.items()
+                        if findings.is_marker(f) or fid in incoming_ids
+                        or fid not in known_ids}
+        for f in incoming:
+            fid = f["id"]
+            if fid in current_by_id:
+                f["resolved"] = current_by_id[fid].get("resolved", f.get("resolved"))
+            merged_by_id[fid] = f
+        return list(merged_by_id.values())
+
+    @app.post("/api/chapter/{idx}/save")
+    def post_save_chapter(idx: int, payload: dict):
+        cz_before = payload.get("cz_before")
+        text = payload.get("text")
+        raw_findings = payload.get("findings")
+        styled_by_codex = payload.get("styled_by_codex", "")
+        known_ids_raw = payload.get("known_ids")
+        if known_ids_raw is None:
+            known_ids_raw = []
+        if (not isinstance(cz_before, str) or not isinstance(text, str)
+                or not isinstance(raw_findings, list)
+                or not all(_valid_finding_shape(f) for f in raw_findings)
+                or not _no_duplicate_ids(raw_findings)
+                or not isinstance(styled_by_codex, str)
+                or not isinstance(known_ids_raw, list)
+                or not all(isinstance(x, str) for x in known_ids_raw)):
+            return JSONResponse(
+                {"error": "cz_before/text/styled_by_codex musí být string, "
+                          "findings musí být pole objektů se správnými typy "
+                          "a unikátními id, known_ids (pokud přítomné) musí "
+                          "být pole stringů"},
+                status_code=400)
+
+        with write_lock:
+            if not app.state.require_lock():
+                return JSONResponse({"error": "zámek ztracen"}, status_code=503)
+            row = state.get_chapter(db_path, idx)
+            if (row is None or row["translated_text"] != cz_before
+                    or row["status"] not in _EDITABLE_STATUSES):
+                return JSONResponse(
+                    {"error": "kapitola se mezitím změnila mimo tenhle editor, "
+                              "nebo nemá stav vhodný k uložení - načti stránku "
+                              "znovu"}, status_code=409)
+            import main
+            if text == cz_before:
+                current_findings = main._parse_findings(row["notes"])
+                light_findings = _merge_findings_by_id(
+                    current_findings, findings.assign_ids(list(raw_findings)),
+                    known_ids=set(known_ids_raw))
+                if (row["status"] == "done"
+                        and json.dumps(light_findings, ensure_ascii=False)
+                        == json.dumps(current_findings, ensure_ascii=False)):
+                    return {"ok": True, "noop": True}
+                try:
+                    main._backup_db_once(db_path, app.state.backup_state)
+                    with state.connect(db_path) as conn:
+                        conn.execute(
+                            "UPDATE chapters SET notes=?, status='done', "
+                            "updated_at=CURRENT_TIMESTAMP WHERE idx=?",
+                            (json.dumps(light_findings, ensure_ascii=False), idx))
+                except Exception as e:
+                    return JSONResponse(
+                        {"error": f"Nálezy/stav se nepodařilo uložit "
+                                  f"({type(e).__name__}: {e}) - zkus to znovu."},
+                        status_code=500)
+                return {"ok": True, "noop": False}
+
+            en = row["raw_text"]
+            glossary_rows = glossary.all_terms(db_path)
+            resolved_findings = _merge_findings_by_id(
+                main._parse_findings(row["notes"]), findings.assign_ids(list(raw_findings)),
+                known_ids=set(known_ids_raw))
+            try:
+                main._commit_polish_result(
+                    db_path, history_path, idx, en=en, cz_before=cz_before,
+                    final_text=text, findings=resolved_findings,
+                    glossary_rows=glossary_rows,
+                    revision_rounds=row["revision_rounds"], source="polish-review",
+                    model_label="ruční úprava (polish-review)",
+                    styled_by_codex=styled_by_codex, backup_state=app.state.backup_state)
+            except main.HistoryWriteFailedAfterCommit as e:
+                return JSONResponse(
+                    {"error": f"Text SE ULOŽIL do knihy úspěšně, ale zápis "
+                              f"do historie selhal ({e}) - načti stránku "
+                              "znovu, tenhle konkrétní zápis se NEOPAKUJ "
+                              "(CAS by ho stejně odmítl)."}, status_code=500)
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"Text NEBYL uložen ({type(e).__name__}: {e}) - "
+                              "zkus to znovu."}, status_code=500)
+        return {"ok": True}
 
     @app.get("/api/polish")
     def get_polish(idx: "int | None" = None):

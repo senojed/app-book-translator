@@ -1201,3 +1201,262 @@ def test_get_chapter_detail_includes_history_baselines(tmp_path):
     body = client.get("/api/chapter/1").json()
     assert body["cz_before_original"] == "Věta 1."
     assert body["styled_by_codex_latest"] == "Lepší věta."
+
+
+def test_save_chapter_commits_and_writes_history(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Lepší věta 1.",
+        "findings": [{"id": "f1", "resolved": False, "source": "critic",
+                     "type": "fidelity", "issue": "x"}]})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+    row = state.get_chapter(db, 1)
+    assert row["translated_text"] == "Lepší věta 1."
+    history = polish_store.load_history(history_path)
+    assert history["entries"][0]["source"] == "polish-review"
+    assert history["entries"][0]["cz_before"] == "Věta 1."
+
+
+def test_save_chapter_noop_when_text_unchanged(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Věta 1.", "findings": []})
+    assert r.json() == {"ok": True, "noop": True}
+    history = polish_store.load_history(history_path)
+    assert history["entries"] == []   # žádný zbytečný záznam
+
+
+def test_save_chapter_persists_findings_and_approves_flagged_without_text_change(tmp_path):
+    """Kolo 2 IMPORTANT - text beze změny NEZNAMENÁ nulová operace,
+    pokud kapitola byla `flagged` (uživatel ji Uložit tlačítkem ručně
+    schválil) NEBO nese nové (dosud neuložené) nálezy z regenerace."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET status='flagged' WHERE idx=1")
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Věta 1.",
+        "findings": [{"id": "new1", "resolved": False,
+                     "source": "critic", "type": "fidelity"}]})
+    assert r.json() == {"ok": True, "noop": False}
+    row = state.get_chapter(db, 1)
+    assert row["status"] == "done"
+    assert json.loads(row["notes"])[0]["id"] == "new1"
+    history = polish_store.load_history(history_path)
+    assert history["entries"] == []   # žádná NOVÁ historie položka - text se nezměnil
+
+
+def test_save_chapter_409_on_cas_mismatch(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Něco jiného.", "text": "X", "findings": []})
+    assert r.status_code == 409
+
+
+def test_save_chapter_400_on_bad_shape(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={"cz_before": "Věta 1."})   # chybí text
+    assert r.status_code == 400
+
+
+# Následující 4 testy PORTUJÍ ochranné scénáře ze starého draft-based
+# `POST /api/polish/apply` (`tests/test_polish_server.py`, testy kolem
+# `test_apply_503_when_lock_lost_no_db_or_json_write`/`test_apply_corrupt_
+# history_returns_500_without_db_write`/`test_apply_pre_commit_failure_
+# returns_500_db_and_draft_unchanged`/`test_apply_post_commit_save_
+# failure_db_already_updated`) - Task 13 Step 1 tyhle staré testy MAŽE
+# (draft fronta končí), ale SAMOTNÁ OCHRANA, co testovaly, dál platí pro
+# nový endpoint a MUSÍ zůstat pokrytá - proto tady, ne zapomenutá.
+
+def test_save_chapter_503_when_lock_lost_no_db_write(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    app.state.require_lock = lambda: False
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Nová.", "findings": []})
+    assert r.status_code == 503
+    assert state.get_chapter(db, 1)["translated_text"] == "Věta 1."
+
+
+def test_save_chapter_corrupt_history_returns_500_without_db_write(tmp_path):
+    """Historie se validuje PŘED commitem (`_commit_polish_result`, kolo 2
+    BLOCKING) - poškozený `polish.history.json` nesmí nechat DB změněnou."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    open(history_path, "w", encoding="utf-8").write("{not valid json")
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Nová.", "findings": []})
+    assert r.status_code == 500
+    assert state.get_chapter(db, 1)["translated_text"] == "Věta 1."
+
+
+def test_save_chapter_pre_commit_failure_returns_500_db_unchanged(tmp_path, monkeypatch):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    monkeypatch.setattr(polish_server.state, "commit_chapter_result",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk full")))
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Nová.", "findings": []})
+    assert r.status_code == 500
+    assert "nebyl" in r.json()["error"].lower()
+    assert state.get_chapter(db, 1)["translated_text"] == "Věta 1."
+
+
+def test_save_chapter_post_commit_history_failure_db_already_updated(tmp_path, monkeypatch):
+    """Selhání ZÁPISU historie AŽ PO úspěšném DB commitu je jiná třída
+    chyby (`main.HistoryWriteFailedAfterCommit`) - DB SE ZMĚNILA a
+    zpráva to musí říct, ne tvrdit "nebyl uložen"."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    monkeypatch.setattr(polish_server.polish_store, "save_history",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Nová.", "findings": []})
+    assert r.status_code == 500
+    assert "uloži" in r.json()["error"].lower() or "ulož" in r.json()["error"].lower()
+    assert state.get_chapter(db, 1)["translated_text"] == "Nová."   # DB SE PŘESTO ZMĚNILA
+
+
+def test_save_chapter_keeps_resolved_true_even_with_stale_client_payload(tmp_path):
+    """Karta B mezitím vyřešila nález přes /api/findings/resolve; karta A
+    ukládá se STARÝM (resolved=False) stavem téhož nálezu - uložení
+    nesmí vyřešení ztratit."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET notes=? WHERE idx=1",
+                     (json.dumps([{"id": "f1", "resolved": True,
+                                  "source": "critic", "type": "fidelity"}]),))
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Jiná.",
+        "findings": [{"id": "f1", "resolved": False,
+                     "source": "critic", "type": "fidelity"}]})
+    assert r.status_code == 200
+    row = state.get_chapter(db, 1)
+    saved = json.loads(row["notes"])
+    assert next(f for f in saved if f["id"] == "f1")["resolved"] is True
+
+
+def test_save_chapter_server_resolved_false_wins_over_stale_client_true(tmp_path):
+    """Opačný směr téhož race (kolo 2 BLOCKING - kolo 1 chránilo jen
+    false→true): karta B nález ZNOVU OTEVŘELA (server má false), karta A
+    má ve své paměti STARÉ true a s ním uloží - server musí zůstat u
+    false, ne se nechat přepsat zastaralým true."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET notes=? WHERE idx=1",
+                     (json.dumps([{"id": "f1", "resolved": False,
+                                  "source": "critic", "type": "fidelity"}]),))
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Jiná.",
+        "findings": [{"id": "f1", "resolved": True,
+                     "source": "critic", "type": "fidelity"}]})
+    assert r.status_code == 200
+    row = state.get_chapter(db, 1)
+    saved = json.loads(row["notes"])
+    assert next(f for f in saved if f["id"] == "f1")["resolved"] is False
+
+
+def test_save_chapter_text_change_does_not_wipe_finding_added_via_light_write(tmp_path):
+    """Kolo 4 BLOCKING - karta B (lehká větev, text beze změny) přidá
+    nový nález; karta A pak uloží SKUTEČNOU změnu textu se STARÝM
+    (bez B's nálezu) seznamem findings - textový CAS na tohle nekouká,
+    ale merge-podle-id ho i tak musí zachovat."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    # Karta B: lehká větev přidá nález "b1" (text beze změny).
+    r1 = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Věta 1.",
+        "findings": [{"id": "b1", "resolved": False, "source": "critic", "type": "fidelity"}]})
+    assert r1.status_code == 200
+    # Karta A: STARÝ payload (bez b1), ale SKUTEČNÁ změna textu.
+    r2 = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Nový text A.", "findings": []})
+    assert r2.status_code == 200
+    row = state.get_chapter(db, 1)
+    saved_ids = {f["id"] for f in json.loads(row["notes"])}
+    assert "b1" in saved_ids   # PŘEŽILO, i když ho karta A vůbec neznala
+
+
+def test_save_chapter_400_on_invalid_finding_shape(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Jiná.", "findings": [None]})
+    assert r.status_code == 400
+
+
+def test_save_chapter_400_on_invalid_known_ids_shape(tmp_path):
+    """Kolo 20 BLOCKING - `known_ids` (nové, volitelné pole) musí být
+    pole stringů, pokud je PŘÍTOMNÉ - stejná disciplína jako `findings`."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Jiná.", "findings": [],
+        "known_ids": [1, 2]})
+    assert r.status_code == 400
+
+
+def test_save_chapter_400_on_falsy_but_present_known_ids(tmp_path):
+    """Kolo 21 NIT - `known_ids: false`/`0`/`""`/`{}` jsou PŘÍTOMNÉ, ale
+    ne-list hodnoty - musí dostat 400, ne se tiše proměnit na `[]`
+    (`payload.get("known_ids") or []` by tohle mylně propustilo)."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Jiná.", "findings": [],
+        "known_ids": False})
+    assert r.status_code == 400
+
+
+def test_save_chapter_missing_known_ids_defaults_to_empty(tmp_path):
+    """Kolo 20 BLOCKING - CHYBĚJÍCÍ `known_ids` (starší klient/API
+    volání) NESMÍ selhat ani nic ztratit - bezpečný fallback na `[]`
+    (= "nic neznámo", nic se nemaže, viz `_merge_findings_by_id`)."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Jiná.", "findings": []})
+    assert r.status_code == 200
+
+
+def test_save_chapter_allows_flagged_status(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET status='flagged' WHERE idx=1")
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Opraveno.", "findings": []})
+    assert r.status_code == 200
+    assert state.get_chapter(db, 1)["status"] == "done"
+
+
+def test_save_chapter_preserves_rendered_terms_from_history_not_narrowed_live_mentions(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    polish_store.save_history(history_path, {
+        "schema_version": 1, "entries": [{
+            "idx": 1, "applied_at": polish_store.utc_now_z(),
+            "cz_before": "Původní.", "cz_after": "Věta 1.", "styled_by_codex": "Věta 1.",
+            "title": "K1", "findings": [],
+            "rendered_terms": [{"term_id": "t/a", "cz_as_used": "Á", "scene_idx": 0},
+                               {"term_id": "t/b", "cz_as_used": "Bé", "scene_idx": 1}],
+            "source": "polish-batch", "draft_id": "d1"}]})
+    # živá `term_mentions` je ÚŽŠÍ (jen jeden termín) - simuluje předchozí
+    # commit, co glosářově zúžil hlášené tvary.
+    with state.connect(db) as conn:
+        conn.execute("INSERT INTO glossary (term_id,canonical_en,cz) VALUES ('t/a','A','Á')")
+    state.replace_term_mentions(db, 1, [
+        {"term_id": "t/a", "cz_form": "Á", "scene_idx": 0, "source": "rendered"}])
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Ještě lepší.", "findings": []})
+    assert r.status_code == 200
+    history = polish_store.load_history(history_path)
+    new_entry = history["entries"][-1]
+    assert len(new_entry["rendered_terms"]) == 2   # zachováno z historie, NE zúženo na 1
