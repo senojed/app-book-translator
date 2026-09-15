@@ -36,8 +36,9 @@ def _load_dotenv(path: str, env=None) -> None:
 # odkudkoli. Načítá se při importu, tedy dřív než se čte ANTHROPIC_API_KEY.
 _load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
-DATA_DIR = "data"
-OUTPUT_DIR = "output"
+PROJECT_DIR = os.environ.get("BOOK_TRANSLATOR_PROJECT_DIR", ".")
+DATA_DIR = os.path.join(PROJECT_DIR, "data")
+OUTPUT_DIR = os.path.join(PROJECT_DIR, "output")
 DB_PATH = os.path.join(DATA_DIR, "state.sqlite3")
 GUIDE_PATH = os.path.join(DATA_DIR, "guide.json")
 GUIDE_DRAFT_PATH = os.path.join(DATA_DIR, "guide.draft.json")
