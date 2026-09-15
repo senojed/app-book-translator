@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<title>Polish review - kapitoly</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 1.5rem;
+        background: #f7f7f5; color: #1a1a1a; }
+  h1 { font-size: 1.3rem; }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  td, th { padding: .4rem .6rem; border-bottom: 1px solid #eee; text-align: left; }
+  .status { font-weight: 600; }
+  .status-done { color: #1a6b3c; }
+  .status-flagged { color: #b35c00; }
+  .status-error, .status-needs_human { color: #b3261e; }
+  .status-pending, .status-processing { color: #888; }
+  .unresolved { font-weight: 600; }
+  .unresolved.zero { color: #888; font-weight: 400; }
+  button { cursor: pointer; border: 1px solid #ccc; background: #fff;
+          border-radius: 4px; padding: .35rem .7rem; font-size: .85rem; }
+  button.primary { background: #1a6b3c; color: #fff; border-color: #1a6b3c; }
+  .toolbar { display: flex; gap: .6rem; align-items: center; margin-bottom: 1rem; }
+  .msg { font-size: .85rem; margin-left: .5rem; }
+  .msg.error { color: #b3261e; }
+  .msg.ok { color: #1a6b3c; }
+</style>
+</head>
+<body>
+<h1>Polish review - kapitoly</h1>
+<div class="toolbar">
+  <button id="export-btn" class="primary">Export knihy</button>
+  <a href="/findings" target="_blank">Report nálezů</a>
+  <span id="toolbar-msg" class="msg"></span>
+</div>
+<table id="chapters-table">
+  <thead><tr><th>#</th><th>Název</th><th>Status</th>
+    <th>Nevyřešené nálezy</th><th>Naposled upraveno</th><th></th></tr></thead>
+  <tbody id="chapters-body"></tbody>
+</table>
+
+<script>
+function el(tag, opts, children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(opts || {})) {
+    if (k === 'class') e.className = v;
+    else if (k === 'text') e.textContent = v;
+    else e.setAttribute(k, v);
+  }
+  for (const c of children || []) e.appendChild(c);
+  return e;
+}
+
+async function load() {
+  const tbody = document.getElementById('chapters-body');
+  // Kolo 14 IMPORTANT - `fetch` samotný může selhat (síť/server nedostupný),
+  // ne jen vrátit non-ok status - bez `try/catch` by tenhle případ vyhodil
+  // NEZACHYCENOU výjimku (nezachycené promise rejection), seznam by
+  // zůstal navždy prázdný BEZ jakékoli chybové hlášky - stejný vzor jako
+  // `loadChapter()` v editoru (Task 14 Step 2).
+  let r, body;
+  try {
+    r = await fetch('/api/chapters');
+    body = await r.json().catch(() => ({}));
+  } catch (e) {
+    tbody.textContent = '';
+    tbody.appendChild(el('tr', {}, [el('td', {
+      colspan: '6', text: 'Síťová chyba, zkus stránku znovu načíst.' })]));
+    return;
+  }
+  tbody.textContent = '';
+  if (!r.ok) {
+    tbody.appendChild(el('tr', {}, [el('td', { colspan: '6', text: body.error || `HTTP ${r.status}` })]));
+    return;
+  }
+  for (const ch of body.chapters) {
+    const editBtn = el('button', { text: 'Editovat' });
+    editBtn.addEventListener('click', () => {
+      window.location.href = '/editor?idx=' + encodeURIComponent(ch.idx);
+    });
+    const unresolvedCls = 'unresolved' + (ch.unresolved_findings === 0 ? ' zero' : '');
+    tbody.appendChild(el('tr', {}, [
+      el('td', { text: String(ch.idx) }),
+      el('td', { text: ch.title }),
+      el('td', { class: 'status status-' + ch.status, text: ch.status }),
+      el('td', { class: unresolvedCls, text: String(ch.unresolved_findings) }),
+      el('td', { text: ch.updated_at || '' }),
+      el('td', {}, [editBtn]),
+    ]));
+  }
+}
+
+document.getElementById('export-btn').addEventListener('click', async () => {
+  const msg = document.getElementById('toolbar-msg');
+  msg.textContent = 'Exportuji...';
+  msg.className = 'msg';
+  // Kolo 14 IMPORTANT - stejný `try/catch` důvod jako `load()` výš -
+  // bez něj by síťová chyba nechala "Exportuji..." viset navždy, žádná
+  // chybová hláška, uživatel netuší, jestli export běží nebo spadl.
+  let r, body;
+  try {
+    r = await fetch('/api/export', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    body = await r.json().catch(() => ({}));
+  } catch (e) {
+    msg.textContent = 'Síťová chyba, zkus export znovu.';
+    msg.className = 'msg error';
+    return;
+  }
+  if (r.ok) {
+    const skippedNote = body.skipped && body.skipped.length
+      ? ` - vynecháno: ${body.skipped.join(', ')}` : '';
+    msg.textContent = `Hotovo: ${body.book_path} (+ ${body.findings_path})${skippedNote}`;
+    msg.className = 'msg ok';
+  } else {
+    msg.textContent = body.error || `HTTP ${r.status}`;
+    msg.className = 'msg error';
+  }
+});
+
+load();
+</script>
+</body>
+</html>

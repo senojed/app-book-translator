@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<title>Polish review - editor</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 1.5rem;
+        background: #f7f7f5; color: #1a1a1a; }
+  h1 { font-size: 1.3rem; }
+  a.back { font-size: .85rem; }
+  .findings { font-size: .85rem; color: #333; margin: .8rem 0; }
+  .findings li { margin-bottom: .3rem; display: flex; align-items: center; gap: .4rem; }
+  .findings li.resolved { color: #888; text-decoration: line-through; }
+  .panes { display: flex; gap: 1rem; align-items: stretch; margin-top: 1rem; }
+  .pane { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .pane h4 { margin: 0 0 .3rem; font-size: .8rem; text-transform: uppercase; color: #888; }
+  .pane-content { height: 400px; box-sizing: border-box; font-family: inherit;
+        font-size: .95rem; white-space: pre-wrap; padding: .5rem;
+        border: 1px solid #ccc; border-radius: 4px; overflow-y: auto; }
+  .pane pre.pane-content, .pane div.pane-content { background: #fafafa; margin: 0; }
+  .pane textarea.pane-content { background: #fff; width: 100%; resize: horizontal; }
+  .diff-box .diff-del { text-decoration: line-through; color: #b3261e; background: #fbe4e2; }
+  .diff-box .diff-add { color: #1a6b3c; background: #e3f3e9; }
+  .diff-too-big { color: #888; font-style: italic; margin: 0; }
+  .buttons { margin-top: .8rem; display: flex; gap: .5rem; flex-wrap: wrap; }
+  button { cursor: pointer; border: 1px solid #ccc; background: #fff;
+          border-radius: 4px; padding: .4rem .8rem; font-size: .85rem; }
+  button.primary { background: #1a6b3c; color: #fff; border-color: #1a6b3c; }
+  button:disabled { opacity: .5; cursor: default; }
+  .error { color: #b3261e; font-size: .85rem; margin-top: .3rem; }
+  #history table { width: 100%; border-collapse: collapse; font-size: .85rem; margin-top: .5rem; }
+  #history td, #history th { padding: .3rem .5rem; border-bottom: 1px solid #eee; text-align: left; }
+  .stale-msg { color: #b35c00; font-weight: 600; }
+</style>
+</head>
+<body>
+<a class="back" href="/">&larr; Seznam kapitol</a>
+<h1 id="chapter-title">Kapitola</h1>
+<ul id="findings" class="findings"></ul>
+<div class="panes">
+  <div class="pane"><h4>Originál EN</h4><pre id="en-pane" class="pane-content"></pre></div>
+  <div class="pane"><h4>Aktuální CZ</h4><pre id="cz-pane" class="pane-content"></pre></div>
+  <div class="pane"><h4>Návrh (editovatelné)</h4><textarea id="text-area" class="pane-content"></textarea></div>
+  <div class="pane"><h4>Rozdíl</h4><div id="diff-box" class="pane-content diff-box"></div></div>
+</div>
+<div class="buttons">
+  <button id="btn-orig">Vrať na originál</button>
+  <button id="btn-codex">Vrať na Codex</button>
+  <button id="btn-regen">Znovu polish</button>
+  <button id="btn-save" class="primary">Uložit</button>
+</div>
+<div id="err-box" class="error"></div>
+
+<h2>Historie téhle kapitoly</h2>
+<div id="history"></div>
+
+<script>
+function el(tag, opts, children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(opts || {})) {
+    if (k === 'class') e.className = v;
+    else if (k === 'text') e.textContent = v;
+    else e.setAttribute(k, v);
+  }
+  for (const c of children || []) e.appendChild(c);
+  return e;
+}
+
+const DIFF_TOKEN_CAP = 6000;
+function tokenizeWords(s) { return (s || '').split(/(\s+)/).filter(t => t.length > 0); }
+function diffWords(before, after) {
+  const a = tokenizeWords(before), b = tokenizeWords(after);
+  if (a.length > DIFF_TOKEN_CAP || b.length > DIFF_TOKEN_CAP) return null;
+  const n = a.length, m = b.length, w = m + 1;
+  const dp = new Uint16Array((n + 1) * w);
+  for (let i = 1; i <= n; i++) for (let j = 1; j <= m; j++) {
+    dp[i * w + j] = (a[i - 1] === b[j - 1]) ? dp[(i - 1) * w + (j - 1)] + 1
+      : Math.max(dp[(i - 1) * w + j], dp[i * w + (j - 1)]);
+  }
+  const ops = []; let i = n, j = m;
+  while (i > 0 && j > 0) {
+    if (a[i - 1] === b[j - 1]) { ops.push({ type: 'equal', text: a[i - 1] }); i--; j--; }
+    else if (dp[(i - 1) * w + j] >= dp[i * w + (j - 1)]) { ops.push({ type: 'del', text: a[i - 1] }); i--; }
+    else { ops.push({ type: 'add', text: b[j - 1] }); j--; }
+  }
+  while (i > 0) ops.push({ type: 'del', text: a[--i] });
+  while (j > 0) ops.push({ type: 'add', text: b[--j] });
+  ops.reverse();
+  return ops;
+}
+function renderDiff(container, before, after) {
+  container.textContent = '';
+  const ops = diffWords(before, after);
+  if (ops === null) {
+    container.appendChild(el('p', { class: 'diff-too-big',
+      text: 'Náhled rozdílu je pro tak dlouhý text vypnutý.' }));
+    return;
+  }
+  for (const op of ops) {
+    if (op.type === 'equal') container.appendChild(document.createTextNode(op.text));
+    else container.appendChild(el('span', { class: op.type === 'del' ? 'diff-del' : 'diff-add', text: op.text }));
+  }
+}
+
+const IDX = Number(new URLSearchParams(window.location.search).get('idx'));
+let CH = null;             // poslední GET /api/chapter/{idx} odpověď
+let CURRENT_FINDINGS = [];  // findings zobrazené TEĎ (může pocházet z regenerate)
+let CURRENT_STYLED_BY_CODEX = '';   // co poslat jako styled_by_codex při Uložit
+// `id`y nálezů, co UŽ existují v `chapters.notes` (z posledního GET) -
+// `toggleResolved` podle tohohle pozná, jestli smí zavolat server
+// (persistovaný nález), nebo jen změnit lokální stav (nález z čerstvé
+// regenerace, co se uloží AŽ při Uložit - server o něm zatím neví,
+// `/api/findings/resolve` by na něj vrátil 404, kolo 2 IMPORTANT).
+let PERSISTED_IDS = new Set();
+// `id`y nálezů, co MAJÍ probíhající /api/findings/resolve request (kolo
+// 4 IMPORTANT) - bez tohohle by dvě rychlá kliknutí na STEJNÝ checkbox
+// (nebo save uprostřed resolve requestu) mohla poslat dva souběžné
+// požadavky, nebo nechat checkbox zaškrtnutý+disabled navždy po síťové
+// chybě. `renderFindings`/`lockEditor` obě čtou tenhle set.
+let PENDING_RESOLVE_IDS = new Set();
+// `id` -> Promise probíhajícího `/api/findings/resolve` volání (kolo 8
+// IMPORTANT) - Uložit/revert MUSÍ počkat, až všechny doběhnou, PŘED
+// tím, než samy zavolají `loadChapter()`. Bez tohohle by pozdě příchozí
+// GET odpověď (vyvolaná Uložit) mohla PŘEPSAT `CURRENT_FINDINGS` daty
+// PŘED tím, než se resolve zápis na serveru vůbec stihl promítnout do
+// SELECTu, i když resolve odpověď klientovi dorazila dřív a kolo-7
+// oprava ji správně aplikovala - bezpodmínečné pole-přepsání uvnitř
+// `loadChapter()` by tu správnou aplikaci prostě přepsalo zpátky na
+// starou hodnotu.
+let PENDING_RESOLVE_PROMISES = new Map();
+// Editovatelné statusy (kolo 4 IMPORTANT) - ZRCADLÍ `_EDITABLE_STATUSES`
+// v `polish_server.py` (Task 9/10) - čistě klientská UX vrstva (server
+// je pořád jediný zdroj pravdy, viz 409 na save/regenerate), ať se
+// tlačítka nezobrazují jako použitelná pro `pending`/`processing`
+// kapitoly bez smysluplného textu.
+const EDITABLE_STATUSES = new Set(['done', 'flagged', 'needs_human', 'error']);
+
+function renderFindings() {
+  const root = document.getElementById('findings');
+  root.textContent = '';
+  for (const f of CURRENT_FINDINGS) {
+    const cb = el('input', { type: 'checkbox' });
+    cb.checked = !!f.resolved;
+    cb.dataset.findingId = f.id;   // `lockEditor` podle tohohle dohledá PENDING_RESOLVE_IDS
+    // Nové vykreslení respektuje probíhající operaci NA TOMHLE KONKRÉTNÍM
+    // nálezu (kolo 4 IMPORTANT - dřív jen `EDITOR_BUSY`, jeden probíhající
+    // resolve request by po libovolném překreslení "zapomněl", že ještě
+    // běží, a dovolil by druhé kliknutí na TENTÝŽ checkbox souběžně).
+    cb.disabled = EDITOR_BUSY || PENDING_RESOLVE_IDS.has(f.id);
+    cb.addEventListener('change', () => {
+      // Ulož Promise (kolo 8 IMPORTANT) - Uložit/revert na ni počkají
+      // PŘED svým vlastním `loadChapter()`, viz tamní handlery.
+      const p = toggleResolved(f, cb, cb.checked);
+      PENDING_RESOLVE_PROMISES.set(f.id, p);
+      p.finally(() => PENDING_RESOLVE_PROMISES.delete(f.id));
+    });
+    const li = el('li', { class: f.resolved ? 'resolved' : '' }, [cb,
+      document.createTextNode(`[${f.severity || '?'}] ${f.issue || '(bez popisu)'}`)]);
+    root.appendChild(li);
+  }
+}
+
+async function toggleResolved(finding, checkbox, resolved) {
+  // Nález z ČERSTVÉ regenerace (kolo 2 IMPORTANT) ještě neexistuje v
+  // `chapters.notes` - `/api/findings/resolve` by na jeho `id` vrátilo
+  // 404 (server ho nezná). Pro takový nález je zaškrtnutí čistě LOKÁLNÍ
+  // stav, persistuje se AŽ s "Uložit" (findings jedou v save payloadu
+  // celé). Server se volá JEN pro nálezy, co UŽ jsou uložené.
+  if (!PERSISTED_IDS.has(finding.id)) {
+    finding.resolved = resolved;
+    renderFindings();
+    return;
+  }
+  // `scope: 'notes'` VŽDY - editor zobrazuje JEN `chapters.notes` nálezy
+  // (Task 8 GET), nikdy historii (viz Task 7/8 - sloučení by zdvojilo
+  // nálezy). `finding.resolved` se mění AŽ PO potvrzeném úspěchu, ne
+  // předem - selhání (400/404/500/503, i síťová výjimka) se ukáže jako
+  // chyba a checkbox se vrátí do PŮVODNÍHO stavu, ne tiše předstírá
+  // úspěch ani nezůstane navždy zaškrtnutý+disabled (kolo 4 IMPORTANT -
+  // `PENDING_RESOLVE_IDS` brání souběžnému druhému kliknutí NA TENTÝŽ
+  // nález, dokud první request neskončí, ať uspěje nebo ne).
+  //
+  // POZOR (kolo 6 IMPORTANT): `checkbox` param je DOM reference
+  // zachycená PŘED prvním `await`. Zatímco TENHLE request čeká, jiný
+  // nález (jiné souběžné `toggleResolved` volání) může uspět a zavolat
+  // `renderFindings()` - to PŘESTAVÍ CELÝ seznam `<li>`/`<input>` prvků
+  // odznova, takže `checkbox` proměnná tady dál ukazuje na ODPOJENÝ
+  // (z DOM odstraněný) starý element. Zápis do `checkbox.disabled`/
+  // `.checked` PO `await` by pak neměl ŽÁDNÝ viditelný efekt - aktuálně
+  // zobrazený checkbox (nový, z toho mezitímního `renderFindings()`)
+  // by zůstal navždy disabled, i když `PENDING_RESOLVE_IDS`/`finding.
+  // resolved` jsou interně správně. Fix: PO `await` už se `checkbox`
+  // (parametr) nikdy nedotýkat přímo - vždy skrz `renderFindings()`,
+  // co vždycky vykreslí AKTUÁLNÍ stav ze zdrojových dat, ne skrz starou
+  // referenci. Synchronní `checkbox.disabled = true` HNED PO kliknutí
+  // (PŘED prvním `await`) zůstává bezpečné - v tu chvíli je to ještě
+  // jistě aktuální element.
+  PENDING_RESOLVE_IDS.add(finding.id);
+  checkbox.disabled = true;
+  try {
+    const r = await fetch('/api/findings/resolve', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: 'notes', idx: IDX, finding_id: finding.id, resolved }),
+    });
+    if (r.ok) {
+      // NEmutuj zachycený `finding` param přímo (kolo 7 IMPORTANT,
+      // stejná třída bugu jako kolo 6, teď na DATECH místo DOM) -
+      // zatímco tenhle request čekal, "Uložit" mohlo doběhnout DŘÍV a
+      // jeho `loadChapter()` nahradil CELÉ `CURRENT_FINDINGS` novými
+      // objekty. Mutace starého, už nepoužívaného objektu by byla
+      // neviditelná - `renderFindings()` čte AKTUÁLNÍ pole, ne tenhle
+      // uzavřený odkaz. Najdi aktuální nález podle `id` a uprav TEN.
+      const current = CURRENT_FINDINGS.find(f => f.id === finding.id);
+      if (current) current.resolved = resolved;
+      // `current` chybí = kapitola se mezitím kompletně reloadla a
+      // tenhle konkrétní nález už v novém seznamu není (řídký případ) -
+      // nic k opravě, zobrazený stav odpovídá poslednímu GET.
+    } else {
+      const body = await r.json().catch(() => ({}));
+      document.getElementById('err-box').textContent =
+        `Zaškrtnutí se neuložilo: ${body.error || 'HTTP ' + r.status}`;
+      // `finding.resolved` se NEMĚNÍ - `renderFindings()` níž ho
+      // vykreslí zpátky v PŮVODNÍM stavu.
+    }
+  } catch (e) {
+    // Kolo 19 IMPORTANT - `fetch` výjimka NEZNAMENÁ "neuloženo", server
+    // mohl zápis dokončit PŘED tím, než se odpověď ztratila cestou
+    // zpátky. Tichý návrat checkboxu do PŮVODNÍHO stavu by tady byl
+    // PŘÍMO ŠPATNĚ - kdyby zápis ve skutečnosti prošel, editor by
+    // ukazoval OPAK skutečného stavu. Radši nejistotu přiznat a vynutit
+    // reload, stejně jako Uložit/revert.
+    //
+    // Kolo 22 IMPORTANT - `window.location.reload()` NEZASTAVÍ synchronně
+    // běžící JS (navigace je asynchronní) - obyčejné `return` by tuhle
+    // Promise nechalo DOBĚHNOUT (vyřešenou), takže `Promise.all(PENDING_
+    // RESOLVE_PROMISES.values())` v Uložit/revert handleru (kolo 8) by
+    // DOKONČILO ČEKÁNÍ, a Uložit/revert by mohly poslat VLASTNÍ request
+    // JEŠTĚ PŘED tím, než reload skutečně proběhne - nad stavem, co
+    // právě přiznal nejistotu. Fix - NIKDY se z týhle větve nevracej
+    // (zavěšená Promise, co se nikdy nevyřeší) - `await` v Uložit/revert
+    // pak čeká DÁL, dokud stránka fakticky nenaviguje pryč.
+    alert('Síťová chyba - není jisté, jestli se zaškrtnutí na serveru '
+         + 'uložilo. Stránka se teď načte znovu.');
+    window.location.reload();
+    await new Promise(() => {});   // navždy visící - stránka mezitím reloadne
+  }
+  PENDING_RESOLVE_IDS.delete(finding.id);
+  renderFindings();   // JEDINÉ místo, co po `await` mění viditelný DOM
+}
+
+async function loadChapter() {
+  // BLOCKING oprava kola 3 - `fetch` samotný může selhat (síť), ne jen
+  // vrátit non-ok status - bez `try/catch` by tenhle případ vyhodil
+  // nezachycenou výjimku a `lockEditor(false)` (ani chybová hláška) by
+  // vůbec neproběhly, editor by zůstal navždy zamčený.
+  //
+  // Kolo 22 IMPORTANT - vrací `true`/`false` (dřív nic) - volající
+  // (Uložit/revert) volají TEHLE funkci AŽ PO potvrzeném serverovém
+  // commitu; když SAMOTNÝ reload selže, `CH`/`CURRENT_FINDINGS` zůstanou
+  // STARÉ (pre-commit), i když server UŽ MÁ nová data - další editace by
+  // buď skončila 409 (CAS na zastaralý `cz_before`), nebo hůř, tichým
+  // pokusem uložit NAD staré, kapitolu commitem beztak přepsané. Volající
+  // musí na `false` reagovat, ne to ignorovat (viz `btn-save`/`revert
+  // Chapter` níž).
+  let r, body;
+  try {
+    r = await fetch('/api/chapter/' + encodeURIComponent(IDX));
+    body = await r.json().catch(() => ({}));
+  } catch (e) {
+    document.getElementById('err-box').textContent = 'Síťová chyba, zkus stránku znovu načíst.';
+    lockEditor(false);
+    return false;
+  }
+  if (!r.ok) {
+    document.getElementById('err-box').textContent = body.error || `HTTP ${r.status}`;
+    // BLOCKING oprava kola 2 - dřív `loadChapter()` po úspěšném Uložit
+    // NIKDY textarea/tlačítka znovu neodemkla (`lockEditor(true)` z
+    // volajícího handleru zůstalo navždy aktivní). `loadChapter()` je
+    // teď JEDINÉ místo, co `lockEditor` VŽDY nuluje, ať skončí úspěchem
+    // nebo chybou - `lockEditor` je NULL-SAFE (viz níž), funguje i když
+    // `CH` je pořád `null` (úplně PRVNÍ načtení stránky selhalo).
+    lockEditor(false);
+    return false;
+  }
+  CH = body;
+  CURRENT_FINDINGS = body.findings;
+  PERSISTED_IDS = new Set(body.findings.map(f => f.id));
+  CURRENT_STYLED_BY_CODEX = body.styled_by_codex_latest || '';
+  document.getElementById('chapter-title').textContent = `#${body.idx} - ${body.title}`;
+  document.getElementById('en-pane').textContent = body.raw_text != null ? body.raw_text : '(originál nedostupný)';
+  document.getElementById('cz-pane').textContent = body.translated_text;
+  document.getElementById('text-area').value = body.translated_text;
+  renderFindings();
+  refreshDiff();
+  renderHistory(body.history);
+  lockEditor(false);   // odemkne text-area/btn-regen/btn-save + btn-orig/
+                       // btn-codex podle dostupnosti dat (viz `lockEditor`)
+  return true;
+}
+
+function refreshDiff() {
+  renderDiff(document.getElementById('diff-box'), CH.translated_text,
+             document.getElementById('text-area').value);
+}
+let diffTimer = null;
+document.getElementById('text-area').addEventListener('input', () => {
+  clearTimeout(diffTimer);
+  diffTimer = setTimeout(refreshDiff, 180);
+});
+
+document.getElementById('btn-orig').addEventListener('click', () => {
+  document.getElementById('text-area').value = CH.cz_before_original;
+  refreshDiff();
+});
+document.getElementById('btn-codex').addEventListener('click', () => {
+  document.getElementById('text-area').value = CH.styled_by_codex_latest;
+  refreshDiff();
+});
+
+// Textarea se BLOKUJE (ne jen tlačítka) během regenerace/uložení/revertu -
+// všechno jsou asynchronní HTTP volání, co můžou trvat vteřiny
+// (regenerace) i déle; bez zamčení textarey by psaní BĚHEM čekání
+// zmizelo pod odpovědí serveru, co dorazí později a text přepíše. Sdílený
+// `EDITOR_BUSY` flag (kolo 2 BLOCKING - dřív `revertChapter`/historie
+// tlačítka nezamykala VŮBEC, mohla běžet i SOUBĚŽNĚ se save/regenerate)
+// zabrání historickým tlačítkům (dynamicky vykreslovaným, `disabled`
+// atribut na nich `lockEditor` nemůže nastavit přímo, protože v době
+// volání ještě nemusí existovat v DOM) spustit revert, dokud cokoli
+// jiného běží.
+let EDITOR_BUSY = false;
+function lockEditor(locked) {
+  EDITOR_BUSY = locked;
+  // NULL-SAFE + STATUS-AWARE (kolo 4 BLOCKING, rozšíření kola 3) -
+  // `loadChapter()` volá `lockEditor(false)` i když PRVNÍ GET selhal
+  // (`CH` je pořád `null`) - kolo 3 tohle ošetřilo jen pro btn-orig/
+  // btn-codex, NE pro text-area/btn-regen/btn-save, které se tak po
+  // neúspěšném prvním načtení nesprávně ODEMKLY. `noEdit` sjednocuje
+  // VŠECHNY ovládací prvky na jedno pravidlo: zamčeno KDYŽ `locked`
+  // NEBO `CH` neexistuje NEBO status kapitoly není editovatelný.
+  // `translated_text == null` (kolo 5 IMPORTANT) - `status='error'` z
+  // `run`u nezaručuje reálný text (první neúspěšný pokus o překlad).
+  const noEdit = locked || !CH || !EDITABLE_STATUSES.has(CH.status)
+                || CH.translated_text === null;
+  document.getElementById('text-area').disabled = noEdit;
+  document.getElementById('btn-regen').disabled = noEdit;
+  document.getElementById('btn-save').disabled = noEdit;
+  document.getElementById('btn-orig').disabled = noEdit || CH.cz_before_original === null;
+  document.getElementById('btn-codex').disabled = noEdit || CH.styled_by_codex_latest === null;
+  // Zaškrtávátka nálezů (kolo 3/4 IMPORTANT) - dynamicky vykreslená
+  // `renderFindings`, `lockEditor` je musí dohledat v DOM přímo (nejsou
+  // v ní zavřená jako ostatní pevné prvky). `PENDING_RESOLVE_IDS`
+  // navíc drží zamčené konkrétní checkboxy s VLASTNÍM probíhajícím
+  // požadavkem, i když `locked` je zrovna `false` (viz `toggleResolved`).
+  for (const cb of document.querySelectorAll('#findings input[type=checkbox]')) {
+    cb.disabled = locked || PENDING_RESOLVE_IDS.has(cb.dataset.findingId);
+  }
+}
+
+document.getElementById('btn-regen').addEventListener('click', async () => {
+  const errBox = document.getElementById('err-box');
+  errBox.textContent = '';
+  lockEditor(true);
+  // `lockEditor(false)` VŽDY AŽ PO plném zpracování odpovědi (kolo 2
+  // BLOCKING - dřív se odemykalo HNED po `fetch` PŘED `r.json()`, což
+  // nechávalo krátké, ale reálné okno, kdy uživatel mohl začít psát
+  // těsně před tím, než `body.styled` textarea přepsal).
+  try {
+    const r = await fetch('/api/polish/regenerate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idx: IDX }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) { errBox.textContent = body.error || `HTTP ${r.status}`; return; }
+    document.getElementById('text-area').value = body.styled;
+    CURRENT_FINDINGS = body.findings;   // nové id NEJSOU v PERSISTED_IDS - správně, ještě neuložené
+    CURRENT_STYLED_BY_CODEX = body.styled;
+    renderFindings();
+    refreshDiff();
+  } catch (e) {
+    // Kolo 15 IMPORTANT - `fetch` samotný může selhat (síť) - `finally`
+    // níž `lockEditor(false)` proběhne i tak, ale BEZE ZACHYCENÍ by
+    // vznikla NEZACHYCENÁ promise rejection a `errBox` by zůstal
+    // prázdný, uživatel by nevěděl, proč se nic nestalo. Regenerace
+    // NIC nezapisuje do `chapters`/historie (Task 10 - "NIC nezapisuje")
+    // - na rozdíl od revertu níž tu NENÍ žádná nejistota o stavu na
+    // serveru, čistě zobraz chybu.
+    errBox.textContent = 'Síťová chyba, zkus to znovu.';
+  } finally {
+    lockEditor(false);
+  }
+});
+
+document.getElementById('btn-save').addEventListener('click', async () => {
+  const errBox = document.getElementById('err-box');
+  errBox.textContent = '';
+  lockEditor(true);
+  // Kolo 8 IMPORTANT - počkej na VŠECHNY rozpracované resolve požadavky
+  // PŘED vlastním save (a hlavně PŘED jeho `loadChapter()`). `lockEditor
+  // (true)` výš zamkl checkboxy PROTI NOVÝM kliknutím, ale požadavky
+  // odeslané PŘED tímhle klikem na Uložit dál běží na pozadí - bez
+  // čekání by pozdě příchozí GET (vyvolaný Uložit ÚSPĚCHEM) mohl
+  // přepsat `CURRENT_FINDINGS` stavem PŘED tím, než se resolve zápis na
+  // serveru vůbec promítl - i kdyby resolve odpověď klientovi dorazila
+  // dřív a kolo-7 oprava ji správně aplikovala, kolo-8 bezpodmínečné
+  // přepsání v `loadChapter()` by ji zase ztratilo.
+  await Promise.all(PENDING_RESOLVE_PROMISES.values());
+  // BLOCKING oprava kola 3 - `finally { await loadChapter() }` volalo
+  // reload i po 409/503/selhání PŘED commitem, což ZAHODILO rozepsaný
+  // text i lokální nálezy z regenerace, co se ještě nestihly uložit.
+  // Reload smí proběhnout JEN po potvrzeném úspěchu - jinak jen odemkni.
+  try {
+    const r = await fetch('/api/chapter/' + encodeURIComponent(IDX) + '/save', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        cz_before: CH.translated_text,
+        text: document.getElementById('text-area').value,
+        findings: CURRENT_FINDINGS,
+        styled_by_codex: CURRENT_STYLED_BY_CODEX,
+        // Kolo 20 BLOCKING - `known_ids` = co jsme znali PŘI NAČTENÍ
+        // (`PERSISTED_IDS`, nastavené v `loadChapter()` z GET) - server
+        // (Task 9) ho použije k rozlišení "tenhle starý nález klient
+        // znal a superseduje ho" (smaž) od "tenhle nález klient NIKDY
+        // neviděl, přidal ho někdo jiný mezitím" (zachovej) - viz
+        // `_merge_findings_by_id` docstring.
+        known_ids: Array.from(PERSISTED_IDS),
+      }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      errBox.textContent = body.error || `HTTP ${r.status}`;
+      lockEditor(false);   // odemkni, ale NEPŘEPISUJ rozepsaný text/nálezy reloadem
+      return;
+    }
+  } catch (e) {
+    // Kolo 19 IMPORTANT - `fetch` výjimka NEZNAMENÁ "neuloženo" - server
+    // MOHL zápis dokončit ještě PŘED tím, než síť spadla NA CESTĚ ZPÁTKY
+    // (odpověď se ztratila). "zkus to znovu" (staré chování) by v tom
+    // případě poslalo STEJNÉ `cz_before` znovu - CAS by ho odmítlo 409,
+    // protože server UŽ MÁ jiný `translated_text` - matoucí, protože
+    // uživatel neví, že se to prvně POVEDLO. Stejná zásada jako revert
+    // (kolo 15) - přiznej nejistotu, vynuť reload PŘED další úpravou, ať
+    // editor vždy ukazuje SKUTEČNÝ stav, ne uhádnutý.
+    alert('Síťová chyba - není jisté, jestli se uložení na serveru '
+         + 'provedlo. Stránka se teď načte znovu, zkontroluj text/nálezy '
+         + 'před další úpravou.');
+    window.location.reload();
+    return;
+  }
+  // Uspělo - TEĎ (a jen teď) načti čerstvý stav z DB.
+  const reloaded = await loadChapter();
+  if (!reloaded) {
+    // Kolo 22 IMPORTANT - commit JE potvrzený (dostali jsme 200 výš),
+    // ale SAMOTNÝ reload selhal - `CH`/`CURRENT_FINDINGS` zůstaly STARÉ,
+    // zatímco server UŽ MÁ nová data. `loadChapter()` už `lockEditor
+    // (false)` udělalo (editor je "použitelný", ale nad ZASTARALÝMI
+    // daty) - to by dovolilo další editaci, co skončí buď 409 (CAS), nebo
+    // hůř. Vynuť tvrdý reload celé stránky - ten buď uspěje (čerstvá
+    // data), nebo ukáže poctivou chybu prohlížeče, což je pravdivější
+    // než tichý zamčený-na-starých-datech stav.
+    alert('Uložení proběhlo, ale nepodařilo se načíst čerstvý stav. '
+         + 'Stránka se teď načte znovu.');
+    window.location.reload();
+  }
+});
+
+async function revertChapter(idx, to) {
+  if (EDITOR_BUSY) return;   // kolo 2 BLOCKING - historie tlačítka teď respektují zámek
+  lockEditor(true);
+  // Kolo 8 IMPORTANT - stejný důvod jako u Uložit výš: počkej na
+  // rozpracované resolve požadavky, ať revert svým `loadChapter()`
+  // nepřepíše čerstvě zapsaný resolved stav starou hodnotou.
+  await Promise.all(PENDING_RESOLVE_PROMISES.values());
+  try {
+    const r = await fetch('/api/polish/revert', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idx, to }),
+    });
+    if (r.ok) {
+      // Kolo 22 IMPORTANT - STEJNÝ důvod jako Uložit výš - commit JE
+      // potvrzený, ale když SAMOTNÝ reload selže, nesmí editor zůstat
+      // tiše odemčený nad zastaralými daty.
+      const reloaded = await loadChapter();
+      if (!reloaded) {
+        alert('Revert proběhl, ale nepodařilo se načíst čerstvý stav. '
+             + 'Stránka se teď načte znovu.');
+        window.location.reload();
+      }
+      return;
+    }
+    const body = await r.json().catch(() => ({}));
+    alert(body.error || `HTTP ${r.status}`);
+  } catch (e) {
+    // Kolo 15 IMPORTANT - `fetch` může selhat PŘED odesláním (nic se
+    // nestalo) NEBO PO tom, co server revert už zapsal, ale odpověď se
+    // ztratila cestou zpátky (síť spadla těsně po commitu) - na rozdíl
+    // od regenerace (čistě read-only, Task 10) TADY nejde z pouhé
+    // `fetch` výjimky poznat, který z těch dvou případů nastal. Radši
+    // NEJISTOTU přiznat a vynutit reload PŘED další úpravou, než mlčky
+    // předpokládat "nic se nestalo" (a nechat uživatele editovat NAD
+    // stavem, co server mezitím tiše změnil).
+    alert('Síťová chyba - není jisté, jestli se revert na serveru '
+         + 'provedl. Stránka se teď načte znovu, zkontroluj historii '
+         + 'před další úpravou.');
+    window.location.reload();
+    return;
+  } finally {
+    lockEditor(false);
+  }
+}
+
+function renderHistory(entries) {
+  const root = document.getElementById('history');
+  root.textContent = '';
+  if (!entries.length) {
+    root.appendChild(el('p', { text: 'Zatím žádná historie.' }));
+    return;
+  }
+  const table = el('table');
+  table.appendChild(el('tr', {}, [el('th', { text: 'Kdy' }), el('th', { text: 'Zdroj' }), el('th', {})]));
+  for (const e of entries) {
+    const btnCell = el('td');
+    // POZOR (kolo 4 NIT): `can_revert_previous`/`can_revert_original`
+    // (`_annotate_history`) NEZÁVISÍ na `stale` - obě hodnoty se počítají
+    // nezávisle na tom, jestli DB odpovídá historii. Tlačítko se tedy
+    // MŮŽE zobrazit i u `stale` záznamu. Bezpečnost tím netrpí - `POST
+    // /api/polish/revert` má VLASTNÍ CAS kontrolu, klik na tlačítko u
+    // rozjetého záznamu prostě dostane 409, nikdy tiše nepřepíše špatný
+    // text. VAROVÁNÍ (kolo 3 IMPORTANT) se zobrazuje VEDLE tlačítek, ne
+    // místo nich - dává uživateli echo "než klikneš, něco tu nesedí", ne
+    // tvrzení, že tlačítko nutně selže.
+    if (e.can_revert_previous) {
+      const b = el('button', { text: 'Vrať zpět' });
+      b.addEventListener('click', () => revertChapter(e.idx, 'previous'));
+      btnCell.appendChild(b);
+    }
+    if (e.can_revert_original) {
+      const b = el('button', { text: 'Vrať na původní' });
+      b.addEventListener('click', () => revertChapter(e.idx, 'original'));
+      btnCell.appendChild(b);
+    }
+    table.appendChild(el('tr', {}, [el('td', { text: e.applied_at }), el('td', { text: e.source }), btnCell]));
+    if (e.stale) {
+      table.appendChild(el('tr', {}, [el('td', { colspan: '3', class: 'stale-msg',
+        text: 'DB neodpovídá historii - poslední zápis do historie pravděpodobně '
+             + 'selhal PO uložení textu do knihy. Zkontroluj text ručně; revert '
+             + 'pro tuhle kapitolu nemusí fungovat spolehlivě, dokud nesoulad '
+             + 'nevyřešíš.' })]));
+    }
+  }
+  root.appendChild(table);
+}
+
+// Zamkni HNED (kolo 3 IMPORTANT) - dokud první `loadChapter()` nedoběhne,
+// `CH` je `null` a kliknutí na Uložit/Znovu-polish by na něm spadlo.
+lockEditor(true);
+loadChapter();
+</script>
+</body>
+</html>
