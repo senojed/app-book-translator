@@ -3,6 +3,8 @@ import os
 import threading
 import pytest
 from fastapi.testclient import TestClient
+import config
+import main
 from src import polish_store, state
 from src.review_ui import polish_server
 
@@ -1460,3 +1462,298 @@ def test_save_chapter_preserves_rendered_terms_from_history_not_narrowed_live_me
     history = polish_store.load_history(history_path)
     new_entry = history["entries"][-1]
     assert len(new_entry["rendered_terms"]) == 2   # zachováno z historie, NE zúženo na 1
+
+
+def test_regenerate_returns_styled_text_without_writing(tmp_path, monkeypatch):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    monkeypatch.setattr(config, "DB_PATH", db)   # `_client_factory` účtuje SEM
+                                                  # (main.py:56 - natvrdo
+                                                  # `config.DB_PATH`, ne
+                                                  # parametr), jinak by
+                                                  # `runs`/`llm_calls`
+                                                  # zápisy mířily do
+                                                  # SKUTEČNÉ projektové DB
+    monkeypatch.setattr("main._polish_preflight",
+                        lambda: ("m", ["codex"], None))
+    # Kolo 6 IMPORTANT oprava - endpoint teď volá `_polish_one_chapter`
+    # i s `rendered_terms=rt` (kolo 5) - mock BEZ tohohle keyword parametru
+    # by spadl na `TypeError: unexpected keyword argument`, endpoint by
+    # to zachytil a vrátil 500 místo očekávaných 200/styled dat.
+    seen = {}
+    def _fake_polish_one_chapter(c, gr, cf, db_, model, codex_cmd, rendered_terms=None):
+        seen["rendered_terms"] = rendered_terms
+        return {"idx": 1, "title": "K1", "cz_before": "Věta 1.",
+               "styled": "Vylepšená věta 1.", "revision_rounds": 0,
+               "reason_types": [], "findings": [], "rendered_terms": [],
+               "draft_id": "d1"}
+    monkeypatch.setattr("main._polish_one_chapter", _fake_polish_one_chapter)
+    client = TestClient(app)
+    r = client.post("/api/polish/regenerate", json={"idx": 1})
+    assert seen["rendered_terms"] == []   # `_preferred_rendered_terms` bez historie = živá DB (fixture prázdná)
+    assert r.status_code == 200
+    assert r.json()["styled"] == "Vylepšená věta 1."
+    row = state.get_chapter(db, 1)
+    assert row["translated_text"] == "Věta 1."   # NEZMĚNĚNO
+
+
+def test_regenerate_404_for_missing_chapter(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/polish/regenerate", json={"idx": 99})
+    assert r.status_code == 404
+
+
+def test_regenerate_400_for_pending_chapter(tmp_path):
+    """`pending` nemá smysluplný `translated_text` k polishi - `flagged`/
+    `needs_human`/`error` naopak PROJDOU (stejné `_EDITABLE_STATUSES`
+    jako Task 9 save)."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET status='pending' WHERE idx=1")
+    client = TestClient(app)
+    r = client.post("/api/polish/regenerate", json={"idx": 1})
+    assert r.status_code == 400
+
+
+def test_regenerate_400_for_error_status_without_translated_text(tmp_path):
+    """Kolo 5 IMPORTANT - `status='error'` je v `_EDITABLE_STATUSES`,
+    ale `run` ho může nastavit i s `translated_text=NULL` (první
+    neúspěšný pokus o překlad) - musí to dostat čitelnou 400, ne spadnout
+    hluboko v `_polish_one_chapter`."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET status='error', translated_text=NULL WHERE idx=1")
+    client = TestClient(app)
+    r = client.post("/api/polish/regenerate", json={"idx": 1})
+    assert r.status_code == 400
+
+
+def test_regenerate_503_on_preflight_failure(tmp_path, monkeypatch):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    monkeypatch.setattr("main._polish_preflight",
+                        lambda: (None, None, "Codex CLI není použitelné"))
+    client = TestClient(app)
+    r = client.post("/api/polish/regenerate", json={"idx": 1})
+    assert r.status_code == 503
+
+
+def test_regenerate_503_when_lock_lost_inside_polish_one_chapter(tmp_path, monkeypatch):
+    """Kolo 16 IMPORTANT (test OPRAVEN kolo 17 BLOCKING - dřív mockoval
+    `_polish_one_chapter` tak, aby `LockLostError` vyhodilo PŘÍMO, což
+    obcházelo REÁLNÉ `except FatalRunError` uvnitř tý funkce a skrylo
+    skutečný bug: ten blok `LockLostError` přebaloval na obyčejný
+    `FatalRunError`, typ se ztrácel, `except main.LockLostError` v
+    endpointu ho nikdy nechytilo. Tenhle test jde přes SKUTEČNOU
+    `_polish_one_chapter` → `PipelineLLMClient.complete()` → `require_
+    lock` kontrolu, aby tenhle konkrétní bug pokryl."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    monkeypatch.setattr(config, "DB_PATH", db)
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: "Jiná věta.")
+    from src.llm.client import FakeLLMClient
+    # `AnthropicClient()` nahrazen - `_client_factory` (main.py:52) ji
+    # volá NATVRDO uvnitř `factory(agent)`, i když se nikdy nepoužije
+    # (require_lock kontrola vyhodí LockLostError PŘED `self._inner.
+    # complete()`, viz PipelineLLMClient.complete() výš) - prázdná
+    # fronta odpovědí stačí, `FakeLLMClient([]).complete()` se nikdy
+    # nezavolá.
+    monkeypatch.setattr(main, "AnthropicClient", lambda: FakeLLMClient([]))
+    calls = {"n": 0}
+    def _require_lock():
+        calls["n"] += 1
+        return calls["n"] == 1   # True JEN napoprvé (start handleru)
+    app.state.require_lock = _require_lock
+    client = TestClient(app)
+    r = client.post("/api/polish/regenerate", json={"idx": 1})
+    assert r.status_code == 503
+    assert "Zámek ztracen" in r.json()["error"]
+
+
+def test_regenerate_returns_json_500_when_create_run_raises(tmp_path, monkeypatch):
+    """Kolo 14 IMPORTANT - `state.create_run` bylo mimo `try` - selhání
+    (SQLite chyba apod.) by propadlo jako NEZACHYCENÝ traceback (holý
+    500 bez JSON těla) místo řízené odpovědi jako u každého jiného
+    selhání v tomhle handleru."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    monkeypatch.setattr(config, "DB_PATH", db)
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    monkeypatch.setattr(state, "create_run",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk plný")))
+    client = TestClient(app)
+    r = client.post("/api/polish/regenerate", json={"idx": 1})
+    assert r.status_code == 500
+    assert "error" in r.json()   # řízená JSON odpověď, ne holý traceback
+
+
+def test_regenerate_503_and_no_run_created_when_lock_lost_before_create_run(tmp_path, monkeypatch):
+    """Kolo 13 IMPORTANT - `require_lock()` kontrola musí být POSLEDNÍ
+    věc PŘED `state.create_run(...)`, ne mít mezi sebou další volání
+    (`glossary.all_terms` bylo dřív AŽ PO kontrole - přesunuto PŘED).
+    Ověř, že `require_lock() == False` zastaví PŘED jakýmkoli zápisem -
+    žádný `runs` řádek nevznikne."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    monkeypatch.setattr(config, "DB_PATH", db)
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    app.state.require_lock = lambda: False
+    client = TestClient(app)
+    r = client.post("/api/polish/regenerate", json={"idx": 1})
+    assert r.status_code == 503
+    with state.connect(db) as conn:
+        rows = list(conn.execute("SELECT * FROM runs"))
+    assert rows == []   # `create_run` se vůbec nezavolalo
+
+
+def test_regenerate_uses_client_factory_with_require_lock_callback(tmp_path, monkeypatch):
+    """Kolo 11 BLOCKING - endpoint MUSÍ `_client_factory` zavolat s
+    `require_lock=app.state.require_lock`, jinak `PipelineLLMClient`
+    uvnitř `_polish_one_chapter` nemá jak zámek ověřit PŘED KAŽDÝM LLM
+    voláním (viz `tests/test_pipeline_client.py` pro samotné chování
+    `PipelineLLMClient` - tenhle test ověřuje jen DRÁTOVÁNÍ na úrovni
+    endpointu)."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    monkeypatch.setattr(config, "DB_PATH", db)
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    seen = {}
+    def _fake_client_factory(rid, *, interactive, require_lock=None):
+        seen["require_lock"] = require_lock
+        return lambda agent: None   # nepoužije se, _polish_one_chapter se mockuje níž
+    monkeypatch.setattr("main._client_factory", _fake_client_factory)
+    monkeypatch.setattr("main._polish_one_chapter",
+                        lambda c, gr, cf, db_, model, codex_cmd, rendered_terms=None:
+                            {"idx": c["idx"], "outcome": "unchanged"})
+    client = TestClient(app)
+    client.post("/api/polish/regenerate", json={"idx": 1})
+    assert seen["require_lock"] is app.state.require_lock
+
+
+def test_regenerate_skips_finish_run_when_lock_lost_during_codex_call(tmp_path, monkeypatch):
+    """Kolo 10 IMPORTANT - `require_lock()` na ZAČÁTKU handleru neručí za
+    vlastnictví O CHVÍLI POZDĚJI (dlouhé Codex volání mezitím). Druhé
+    volání (ve `finally`, těsně před `finish_run`) musí zámek ověřit
+    ZNOVU a auditní zápis PŘESKOČIT, pokud ho mezitím ztratil - jinak by
+    `runs`/`llm_calls` zápis proběhl bez ověřeného vlastnictví, což
+    odporuje Global Constraints invariantu."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    monkeypatch.setattr(config, "DB_PATH", db)
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    monkeypatch.setattr("main._polish_one_chapter",
+                        lambda c, gr, cf, db_, model, codex_cmd, rendered_terms=None:
+                            {"idx": c["idx"], "outcome": "unchanged"})
+    calls = {"n": 0}
+    def _require_lock():
+        calls["n"] += 1
+        return calls["n"] == 1   # True napoprvé (start handleru), False podruhé (finally)
+    app.state.require_lock = _require_lock
+    finish_run_calls = []
+    monkeypatch.setattr(state, "finish_run",
+                        lambda *a, **k: finish_run_calls.append(a))
+    client = TestClient(app)
+    r = client.post("/api/polish/regenerate", json={"idx": 1})
+    assert r.status_code == 422   # "unchanged" outcome, ale request se DOKONČÍ
+    assert finish_run_calls == []   # finish_run se NEZAVOLALO - zámek ztracen
+
+
+def test_regenerate_then_save_does_not_duplicate_old_resolved_finding(tmp_path, monkeypatch):
+    """Kolo 19 BLOCKING, `known_ids` design opraven kolo 20 BLOCKING -
+    `assign_ids` (Task 2) dává KAŽDÉ analýze nové náhodné `id` - "Znovu
+    polish" vrátí nález s ÚPLNĚ JINÝM `id`, i kdyby šlo sémanticky o
+    "podobný" problém jako dřív vyřešený nález (critic je navíc LLM, ne
+    deterministický - nejde spolehnout na shodu TEXTU). Integrační test
+    celého cyklu regenerate → save, co Task 9's `_merge_findings_by_id(
+    ..., known_ids=...)` oprava řeší - `known_ids` posílá KLIENTŮV
+    `PERSISTED_IDS` (co znal PŘI NAČTENÍ, viz Task 14 `btn-save`) -
+    ověřuje, že STARÝ (klientem ZNÁMÝ, osiřelý, jinak navždy "vyřešený"
+    na neexistujícím textu) nález NEPŘEŽIJE zápis skutečné textové
+    změny, zatímco marker ano (na rozdíl od `test_save_chapter_text_
+    change_does_not_wipe_finding_added_via_light_write`, kde starý
+    nález klient NIKDY neznal a MUSÍ přežít - viz tamní test)."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    monkeypatch.setattr(config, "DB_PATH", db)
+    # Simuluj PŘEDCHOZÍ uložení - kapitola má jeden reálný nález, už
+    # VYŘEŠENÝ (resolved=True), plus marker z předchozí stylizace.
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET notes=? WHERE idx=1", (json.dumps([
+            {"id": "old-f1", "resolved": True, "source": "critic",
+             "type": "fidelity", "issue": "stará výhrada, už vyřešená"},
+            {"id": "old-marker", "resolved": False, "source": "stylist",
+             "type": "polish", "issue": "stylizováno (model=m), ..."},
+        ]),))
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    fresh_finding = {"id": "new-f1", "resolved": False, "source": "critic",
+                     "type": "fidelity", "issue": "nový, jiný problém"}
+    monkeypatch.setattr(
+        "main._polish_one_chapter",
+        lambda c, gr, cf, db_, model, codex_cmd, rendered_terms=None: {
+            "idx": c["idx"], "title": "K1", "cz_before": c["translated_text"],
+            "styled": "Regenerovaná věta.", "revision_rounds": 0,
+            "reason_types": [], "findings": [dict(fresh_finding)],
+            "rendered_terms": [], "draft_id": "d1"})
+    client = TestClient(app)
+    r = client.post("/api/polish/regenerate", json={"idx": 1})
+    assert r.status_code == 200
+    regen_findings = r.json()["findings"]
+    assert [f["id"] for f in regen_findings] == ["new-f1"]   # NOVÉ id, nesouvisí se starým
+
+    # `known_ids: ["old-f1"]` - klient "old-f1" ZNAL (GET ho vrátil PŘED
+    # regenerací, viz `PERSISTED_IDS`) - proto superseduje, ne "nikdy
+    # neviděl" scénář z `test_save_chapter_text_change_does_not_wipe_...`.
+    r2 = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Regenerovaná věta.",
+        "findings": regen_findings, "styled_by_codex": "Regenerovaná věta.",
+        "known_ids": ["old-f1"]})
+    assert r2.status_code == 200
+    saved = json.loads(state.get_chapter(db, 1)["notes"])
+    non_marker = [f for f in saved if f["source"] != "stylist"]
+    marker = [f for f in saved if f["source"] == "stylist"]
+    assert len(non_marker) == 1   # starý "old-f1" NEPŘEŽIL - žádná duplicita
+    assert non_marker[0]["id"] == "new-f1"
+    assert non_marker[0]["resolved"] is False   # nový, nevyřešený - NENÍ tiše "vyřešený"
+    assert any(f["id"] == "old-marker" for f in marker)   # STARÝ marker zachován
+    # nový marker od `_commit_polish_result` PŘIBYDE navíc (STEJNÝ `type`,
+    # NOVÉ `id`) - staré markery se NIKDY nemažou, jen se hromadí, na
+    # rozdíl od reálných nálezů výš.
+    assert len(marker) == 2
+
+
+def test_regenerate_reject_candidate_then_light_save_does_not_duplicate(tmp_path, monkeypatch):
+    """Kolo 21 BLOCKING - STEJNÁ duplicitní chyba jako kolo 19/20, tentokrát
+    na LEHKÉ větvi (`text == cz_before`) - uživatel klikne "Znovu polish"
+    (fresh id nález), NEPŘIJME kandidát (textarea necha PŮVODNÍ text), ale
+    STEJNĚ uloží (např. jen zaškrtne nález) - `CURRENT_FINDINGS` na
+    klientovi pořád drží ČERSTVĚ regenerovaný nález (editor.html ho
+    nahradí při "Znovu polish" bez ohledu na to, jestli uživatel kandidát
+    later přijme). Bez `known_ids` i na lehké větvi by se osiřelý starý
+    nález hromadil vedle nového PŘI KAŽDÉM takovém cyklu."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    monkeypatch.setattr(config, "DB_PATH", db)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET notes=? WHERE idx=1", (json.dumps([
+            {"id": "old-f1", "resolved": True, "source": "critic",
+             "type": "fidelity", "issue": "stará výhrada, už vyřešená"},
+        ]),))
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    fresh_finding = {"id": "new-f1", "resolved": False, "source": "critic",
+                     "type": "fidelity", "issue": "nový, jiný problém"}
+    monkeypatch.setattr(
+        "main._polish_one_chapter",
+        lambda c, gr, cf, db_, model, codex_cmd, rendered_terms=None: {
+            "idx": c["idx"], "title": "K1", "cz_before": c["translated_text"],
+            "styled": "Odmítnutý kandidát.", "revision_rounds": 0,
+            "reason_types": [], "findings": [dict(fresh_finding)],
+            "rendered_terms": [], "draft_id": "d1"})
+    client = TestClient(app)
+    r = client.post("/api/polish/regenerate", json={"idx": 1})
+    assert r.status_code == 200
+    regen_findings = r.json()["findings"]
+
+    # Uživatel NEPŘIJAL kandidát - `text` je pořád PŮVODNÍ ("Věta 1."),
+    # ale `findings` posílá ČERSTVÉ (z odmítnuté regenerace, tak jak je
+    # editor.html drží v `CURRENT_FINDINGS`).
+    r2 = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Věta 1.",
+        "findings": regen_findings, "known_ids": ["old-f1"]})
+    assert r2.status_code == 200
+    saved = json.loads(state.get_chapter(db, 1)["notes"])
+    non_marker = [f for f in saved if f["source"] != "stylist"]
+    assert len(non_marker) == 1   # starý "old-f1" NEPŘEŽIL - žádná duplicita
+    assert non_marker[0]["id"] == "new-f1"

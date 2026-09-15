@@ -382,6 +382,112 @@ def build_app(db_path: str, draft_path: str, history_path: str, lock_path: str) 
                               "zkus to znovu."}, status_code=500)
         return {"ok": True}
 
+    @app.post("/api/polish/regenerate")
+    def post_regenerate(payload: dict):
+        idx_raw = payload.get("idx")
+        if type(idx_raw) is not int:
+            return JSONResponse({"error": "idx musí být int"}, status_code=400)
+        idx = idx_raw
+        import main
+        row = state.get_chapter(db_path, idx)
+        if row is None:
+            return JSONResponse({"error": "kapitola neexistuje"}, status_code=404)
+        # `status not in _EDITABLE_STATUSES` NESTAČÍ (kolo 5 IMPORTANT) -
+        # `run`/`_cmd_run` může nastavit `status="error"` PŘI PRVNÍM
+        # neúspěšném pokusu o překlad, s `translated_text` pořád `NULL`
+        # (main.py, `_cmd_run`/`pipeline.process_chapter`). `stylist.
+        # polish(en, cz, ...)` s `cz=None` by spadlo na typové chybě
+        # hluboko uvnitř `_polish_one_chapter`, ne na čitelné 400 tady.
+        if row["status"] not in _EDITABLE_STATUSES or row["translated_text"] is None:
+            return JSONResponse(
+                {"error": f"kapitola má status {row['status']!r} bez použitelného "
+                          "textu, nelze polishovat"}, status_code=400)
+        model, codex_cmd, preflight_err = main._polish_preflight()
+        if preflight_err:
+            return JSONResponse({"error": preflight_err}, status_code=503)
+        # Kolo 13 IMPORTANT - `glossary.all_terms` (čtení, žádný zápis)
+        # PŘESUNUTO PŘED kontrolu zámku, ne po ní - kontrola má být
+        # POSLEDNÍ věc před PRVNÍM zápisem (`create_run` níž), ne mít
+        # mezi sebou další volání (byť rychlé/lokální), co by teoreticky
+        # mohlo o chvilku prodloužit okno.
+        glossary_rows = glossary.all_terms(db_path)
+        # Levná kontrola vlastnictví zámku (NE `write_lock` - `runs`/
+        # `llm_calls` bookkeeping se nepřekrývá s kapitolovými zápisy
+        # jiných requestů, serializace by jen zbytečně blokovala save/
+        # export na JINÝCH kapitolách po dobu Codex volání).
+        if not app.state.require_lock():
+            return JSONResponse({"error": "zámek ztracen"}, status_code=503)
+
+        rid = None
+        status = "fatal"
+        try:
+            rid = state.create_run(db_path, "polish")
+            # `interactive=False` - NIKDY True na serveru (cost-guard
+            # `input()` by zablokoval HTTP request bez terminálu, viz
+            # "Poznámka k zámku"). `require_lock=app.state.require_lock`
+            # (kolo 11 BLOCKING) - `PipelineLLMClient` teď ověří zámek
+            # PŘED KAŽDÝM `.complete()` (kritik/stylist_check volání
+            # uvnitř `_polish_one_chapter`), ne jen jednou na začátku
+            # handleru.
+            cf = main._client_factory(rid, interactive=False,
+                                      require_lock=app.state.require_lock)
+            c = {"idx": row["idx"], "title": row["title"], "raw_text": row["raw_text"],
+                "translated_text": row["translated_text"],
+                "revision_rounds": row["revision_rounds"]}
+            # STEJNÁ `rendered_terms` volba jako dávka/save (kolo 5
+            # IMPORTANT konzistence, viz Task 3/5) - i PŘEDBĚŽNÝ náhled
+            # z regenerace má ukázat nálezy odpovídající tomu, co by
+            # SKUTEČNĚ zapsalo uložení téhle regenerace.
+            history, err = _try_load_history(history_path)
+            if err:
+                return err
+            rt = main._preferred_rendered_terms(
+                db_path, idx, row["translated_text"], history["entries"])
+            rec = main._polish_one_chapter(c, glossary_rows, cf, db_path, model, codex_cmd,
+                                           rendered_terms=rt)
+            # `status="ok"` i pro `rec["outcome"] == "failed"` (Codex CLI
+            # selhal, ne infrastruktura) - stejná konvence jako dávkový
+            # `_cmd_polish` (per-kapitolové selhání NEznamená `run_status
+            # ="fatal"`, jen `FatalRunError`/výjimka odsud výš to udělá).
+            status = "ok"
+        except main.LockLostError as e:
+            # Kolo 16 IMPORTANT - STEJNÁ podmínka jako startovní `require_
+            # lock()` kontrola výš (ta vrací 503) - ztráta zámku uvnitř
+            # `PipelineLLMClient.complete()` (kritik/stylist_check volání)
+            # musí dostat STEJNÝ kód, ne obecnou 500 z větve níž. `except`
+            # POŘADÍ je významné - specifičtější MUSÍ být PŘED obecným
+            # `except Exception`, jinak by ho ten odchytil dřív.
+            return JSONResponse({"error": f"Zámek ztracen: {e}"}, status_code=503)
+        except Exception as e:
+            return JSONResponse(
+                {"error": f"Regenerace selhala ({type(e).__name__}: {e})"},
+                status_code=500)
+        finally:
+            # `finish_run` selhání NESMÍ přebít odpověď výš (kolo 2
+            # BLOCKING) - výjimka vyhozená z `finally` by nahradila i
+            # `return` z `except` bloku nezachycenou 500 bez JSON těla.
+            # Bookkeeping chyba tu je jen diagnostická ztráta, ne důvod
+            # zahodit skutečný výsledek regenerace.
+            #
+            # Kolo 10 IMPORTANT - znovu ověř zámek TĚSNĚ PŘED zápisem -
+            # `_polish_one_chapter` (řádek výš) může u pomalé Codex
+            # odpovědi běžet dlouho - `require_lock()` na ZAČÁTKU handleru
+            # (výš) ověřilo vlastnictví PŘED voláním, ale samo o sobě
+            # nezaručuje, že ho pořád vlastníme O CHVÍLI POZDĚJI.
+            try:
+                if rid is not None and app.state.require_lock():
+                    state.finish_run(db_path, rid, status)
+            except Exception:
+                pass
+        if "outcome" in rec:
+            return JSONResponse(
+                {"error": f"Codex nenavrhl žádnou úpravu ({rec.get('outcome')})"
+                          if rec.get("outcome") == "unchanged"
+                          else f"Stylizace selhala ({rec.get('error')})"},
+                status_code=422)
+        return {"styled": rec["styled"], "findings": rec["findings"],
+                "reason_types": rec["reason_types"]}
+
     @app.get("/api/polish")
     def get_polish(idx: "int | None" = None):
         draft, err = _try_load_draft(draft_path)
