@@ -14,6 +14,15 @@ class FatalRunError(RuntimeError):
     """Chyba, po které nemá smysl pokračovat v běhu (auth, neznámý model, 400)."""
 
 
+class LockLostError(FatalRunError):
+    """Ztráta procesního zámku - podtřída `FatalRunError`, ať VŠECHNO,
+    co dnes odchytává `except FatalRunError` (CLI `_cmd_polish`'s
+    `except FatalRunError as fe: raise`), dál funguje beze změny, ale
+    server (Task 10) ji umí odchytit SAMOSTATNĚ a namapovat na 503
+    místo obecné 500 - stejný HTTP kód jako startovní `require_lock()`
+    kontrola pro STEJNOU podmínku."""
+
+
 @dataclass
 class Completion:
     text: str
@@ -106,7 +115,8 @@ class PipelineLLMClient:
     každého agenta - `agent` je jen label do logu."""
 
     def __init__(self, inner: LLMClient, *, run_id: int, agent: str,
-                 db_path: str, config_mod, confirm=input, interactive: bool = True):
+                 db_path: str, config_mod, confirm=input, interactive: bool = True,
+                 require_lock=None):
         self._inner = inner
         self._run_id = run_id
         self._agent = agent
@@ -114,6 +124,10 @@ class PipelineLLMClient:
         self._cfg = config_mod
         self._confirm = confirm
         self._interactive = interactive
+        self._require_lock = require_lock   # volitelný callback `() -> bool`;
+        # `None` (výchozí, `_cmd_run`/`scan`/`_cmd_polish_review` preflight)
+        # = žádná kontrola, beze změny dnešního chování. `_cmd_polish` a
+        # server (Task 10) ho předávají.
 
     def count_tokens(self, *, system: str, user: str, model: str) -> int:
         return self._inner.count_tokens(system=system, user=user, model=model)
@@ -166,13 +180,40 @@ class PipelineLLMClient:
                 continue
             if new_limit < need:
                 continue   # strop pod potřebu = nesmysl, reprompt
+            # Kontrola TĚSNĚ PŘED zápisem - `self._ask(...)` výš mohl
+            # čekat na uživatele libovolně dlouho, zámek mohl mezitím
+            # zmizet PRÁVĚ v tomhle okně.
+            if self._require_lock is not None and not self._require_lock():
+                raise LockLostError(
+                    "Zámek ztracen během čekání na potvrzení cost guardu "
+                    "- jiný proces teď píše do DB, zastavuji dřív, než "
+                    "se stihne zapsat nový strop bez ověřeného vlastnictví.")
             state.set_run_spend_ceiling(self._db, self._run_id, new_limit)
             return
         raise FatalRunError("Cost guard: nevalidní/nízký strop, zastavuji.")
 
     def complete(self, *, system: str, user: str, max_tokens: int, model: str) -> Completion:
         from src import state
+        # Kontrola PŘED `_guard()`, ne jen po ní - `_guard()` v
+        # interaktivním režimu (CLI `_cmd_polish`) může při překročení
+        # stropu vyzvat uživatele a na potvrzení zavolat `state.set_run_
+        # spend_ceiling` - skutečný DB zápis, co by bez tyhle kontroly
+        # proběhl bez ověřeného vlastnictví zámku. Kontrola PO `_guard()`
+        # (dál dole) zůstává taky - `_guard()` může (v interaktivním
+        # režimu) čekat na uživatelský vstup libovolně dlouho, zámek
+        # může zmizet právě během tohohle čekání, nezávisle na tom,
+        # jestli strop nakonec zapsala.
+        if self._require_lock is not None and not self._require_lock():
+            raise LockLostError(
+                "Zámek ztracen před LLM voláním - jiný proces teď píše "
+                "do DB, zastavuji dřív, než cost guard stihne zapsat "
+                "nový strop bez ověřeného vlastnictví.")
         self._guard(system, user, max_tokens, model)
+        if self._require_lock is not None and not self._require_lock():
+            raise LockLostError(
+                "Zámek ztracen během LLM volání - jiný proces teď píše "
+                "do DB, zastavuji dřív, než se stihne zapsat auditní "
+                "záznam bez ověřeného vlastnictví.")
         in_rate, out_rate = self._price(model)
         status, err, comp = "ok", None, None
         try:
@@ -188,9 +229,17 @@ class PipelineLLMClient:
             it = comp.input_tokens if comp else None
             ot = comp.output_tokens if comp else None
             cost = (it / 1e6 * in_rate + ot / 1e6 * out_rate) if comp else None
-            state.record_llm_call(
-                self._db, run_id=self._run_id, agent=self._agent,
-                provider=getattr(self._inner, "provider", "unknown"),
-                model=model, input_tokens=it, output_tokens=ot, cost_usd=cost,
-                truncated=bool(comp.truncated) if comp else False,
-                status=status, error_class=err)
+            # DRUHÁ kontrola, TĚSNĚ před zápisem - to síťové volání samo
+            # mohlo trvat dost dlouho na to, aby zámek mezitím zmizel.
+            # Na rozdíl od kontrol výš (kde ještě nic neproběhlo) TADY UŽ
+            # výsledek existuje (úspěch nebo chyba) - jen VYNECH auditní
+            # zápis, NEVYHAZUJ výjimku (ta by v `finally` přebila i
+            # úspěšný `return comp` výš a zahodila hotový, zaplacený
+            # výsledek jen kvůli neschopnosti zapsat diagnostický řádek).
+            if self._require_lock is None or self._require_lock():
+                state.record_llm_call(
+                    self._db, run_id=self._run_id, agent=self._agent,
+                    provider=getattr(self._inner, "provider", "unknown"),
+                    model=model, input_tokens=it, output_tokens=ot, cost_usd=cost,
+                    truncated=bool(comp.truncated) if comp else False,
+                    status=status, error_class=err)

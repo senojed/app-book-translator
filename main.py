@@ -32,7 +32,8 @@ from src import ingest, pipeline, polish_store, requeue, state
 from src import reference as reference_mod
 from src import reference_mine, textnorm
 from src.agents import scout, stylist
-from src.llm.client import AnthropicClient, FatalRunError, OutputTruncated, PipelineLLMClient
+from src.llm.client import (AnthropicClient, FatalRunError, LockLostError,
+                           OutputTruncated, PipelineLLMClient)
 
 _MUTATING = {"init", "scan", "run", "answer", "review", "reference", "polish",
             "polish-review"}
@@ -50,13 +51,27 @@ def _bootstrap_stdout() -> None:
             pass
 
 
-def _client_factory(run_id: int, *, interactive: bool):
+def _client_factory(run_id: int, *, interactive: bool, require_lock=None):
     """Klienta staví až při volání - `run` s fake pipeline nikdy nesáhne na API."""
     def factory(agent: str):
         return PipelineLLMClient(AnthropicClient(), run_id=run_id, agent=agent,
                                  db_path=config.DB_PATH, config_mod=config,
-                                 interactive=interactive)
+                                 interactive=interactive, require_lock=require_lock)
     return factory
+
+
+def _lock_still_owned(lock_path: str) -> bool:
+    """`require_lock`-styl helper pro CLI (`_cmd_polish`) - server má
+    vlastní `_require_lock` v `polish_server.py` (plus heartbeat vlákno
+    na pozadí), CLI žádné takové vlákno nemá - AKTIVNĚ obnovuje zámek
+    při KAŽDÉM volání (`state.refresh_lock`, ne jen pasivní kontrola),
+    ať se staleness okno vůbec neotvírá mezi dvěma po sobě jdoucími
+    LLM voláními uvnitř JEDNÉ kapitoly."""
+    try:
+        state.refresh_lock(lock_path)
+        return True
+    except state.LockError:
+        return False
 
 
 def _print_usage(db_path: str, run_id: int) -> None:
@@ -99,11 +114,13 @@ def _parse_findings(notes_json: str | None) -> list:
 
 
 def _already_styled(notes_json: str | None) -> bool:
-    """`type == "polish"` (ne jen `source == "stylist"`) - kolo 5/7:
-    revert marker a "kept_original" marker mají STEJNÝ source, ale JINÝ
-    type, aby po revertu / potvrzení originálu bylo možné `polish`
-    znovu nabídnout bez `--force`."""
-    return any(f.get("source") == "stylist" and f.get("type") == "polish"
+    """`type` je `"polish"` (skutečně přestylizováno) NEBO `"unchanged"`
+    (kolo 9 - Codex zkontroloval, nic neměnil, ale marker pořád znamená
+    "už řešeno, nezkoušej znovu bez --force"). Revert marker a
+    "kept_original" marker mají STEJNÝ source, ale JINÝ type, aby po
+    revertu / potvrzení originálu bylo možné `polish` znovu nabídnout
+    bez `--force`."""
+    return any(f.get("source") == "stylist" and f.get("type") in ("polish", "unchanged")
               for f in _parse_findings(notes_json))
 
 
@@ -138,6 +155,22 @@ def _kept_original_marker(text: str, model: str, draft_id: str) -> dict:
             "issue": f"potvrzeno ponechání originálu přes polish-review "
                     f"(model={model}), délka {len(text)} znaků, hash "
                     f"{hashlib.sha256(text.encode('utf-8')).hexdigest()}.",
+            "suggestion": None}
+
+
+def _unchanged_marker(model: str) -> dict:
+    """Kolo 9 IMPORTANT: `_polish_one_chapter` vrátí `outcome=="unchanged"`,
+    když Codex nenavrhl žádnou úpravu - beze zápisu markeru by
+    `_already_styled` zůstalo `False` a příští `polish` (i bez `--force`)
+    by kapitolu znovu poslal (a zaplatil) Codexu, donekonečna. Vlastní
+    `type` (ne `"polish"` jako `_stylist_marker`) - kapitola NENÍ
+    přepsaná, jen zkontrolovaná, report/UI to musí umět rozlišit, ale
+    `_already_styled` (main.py:100) obě hodnoty uznává stejně."""
+    return {"source": "stylist", "type": "unchanged", "severity": "info",
+            "action": "note", "term_id": None, "expected": None,
+            "actual": None, "cz_excerpt": None,
+            "issue": f"Codex zkontroloval (model={model}), žádná úprava "
+                    "nenavržena.",
             "suggestion": None}
 
 
@@ -646,6 +679,9 @@ def _polish_one_chapter(c, glossary_rows, cf, db, model: str,
         if not reasons:
             findings += stylist.check_meaning_preserved(cz, styled, cf("stylist_check"))
             reasons = _rejection_reasons(baseline_concordance, findings, cz, styled, glossary_rows)
+    except LockLostError:
+        raise   # zachovej typ, NEPŘEBALUJ (server potřebuje rozlišit
+        # LockLostError od obecné FatalRunError, viz Task 10)
     except FatalRunError as fe:
         raise FatalRunError(
             f"Kontrola stylizace kapitoly {idx} selhala fatálně "
@@ -1121,49 +1157,107 @@ def _cmd_export(args) -> int:
     return 0
 
 
-def _cmd_polish(args) -> int:
-    db = config.DB_PATH
-    # Bezpečnostní opt-in - ČASNÁ HLÁŠKA (kolo 19 BLOCKING, kolo 20 -
-    # závazná brána je teď PŘÍMO v `stylist.polish()`, tohle je jen hezčí
-    # UX: jeden srozumitelný výpis místo N per-kapitolových StylistError).
-    # `codex exec` má ověřeně neomezené ČTENÍ celého disku - prompt
-    # injection z textu knihy může exfiltrovat citlivý soubor dřív, než
-    # výstupní kontroly proběhnou. Kontrola JAKO PRVNÍ (před `CODEX_MODEL`).
+def _polish_preflight() -> tuple:
+    """Bezpečnostní + config kontroly sdílené `_cmd_polish` (dávka) a
+    `POST /api/polish/regenerate` (server, Task 10) - OBĚ cesty volají
+    Codex, obě musí projít STEJNOU bránou. Vrací `(model, codex_cmd, None)`
+    při úspěchu, `(None, None, chybová_hláška)` při selhání."""
     if config.STYLIST_ACCEPT_FS_RISK is not True:
-        _say(
+        return None, None, (
             "polish je vypnutý: spouští agentní `codex exec`, který má "
             "ČTECÍ přístup k CELÉMU disku (ověřeno). Prompt injection z "
             "textu knihy tak MŮŽE exfiltrovat citlivý soubor jako součást "
             "stylizovaného textu, dřív než guardraily proběhnou.\n"
             "Chceš-li to i tak spustit, nastav v config.py "
-            "`STYLIST_ACCEPT_FS_RISK = True`. Bezpečnější varianty "
-            "(neagentní API, kontejner) viz spec sekce "
-            "'Bezpečnostní rozhodnutí (kolo 19)'.")
-        return 1
+            "`STYLIST_ACCEPT_FS_RISK = True`.")
     model = (config.CODEX_MODEL or "").strip()
     if not model:
-        _say("Chybí config.CODEX_MODEL - nastav ho (audit stylizace musí "
-              "vědět, jaký model se skutečně použil).")
-        return 1
-    # Preflight: nevyřízený draft blokuje nový běh (spec kolo 1) - žádné
-    # tiché přepsání/sloučení dávky, co ještě čeká na `polish-review`.
-    # `PolishStoreError` (poškozený draft.json) se MUSÍ chytit tady (kolo
-    # 1 plán-ping-pongu BLOCKING - dřív mimo `try`, spadlo by jako
-    # nezachycený traceback místo čitelného `return 1`).
-    try:
-        draft_now = polish_store.load_draft(config.POLISH_DRAFT_PATH)
-    except polish_store.PolishStoreError as e:
-        _say(f"{config.POLISH_DRAFT_PATH} je poškozený ({e}) - oprav ho "
-             "ručně nebo smaž, pak zkus `polish` znovu.")
-        return 1
-    if draft_now["chapters"]:
-        _say(f"{len(draft_now['chapters'])} kapitol čeká na review, spusť "
-             "`python main.py polish-review` nejdřív.")
-        return 1
+        return None, None, ("Chybí config.CODEX_MODEL - nastav ho (audit "
+                            "stylizace musí vědět, jaký model se skutečně použil).")
     try:
         codex_cmd = stylist._resolve_codex_cmd(["codex"])
     except stylist.StylistError as e:
-        _say(f"Codex CLI není použitelné: {e}")
+        return None, None, f"Codex CLI není použitelné: {e}"
+    return model, codex_cmd, None
+
+
+class HistoryWriteFailedAfterCommit(Exception):
+    """DB commit UŽ proběhl (nevratně), tohle selhání je z JINÉ třídy
+    než selhání PŘED commitem - volající to MUSÍ hlásit jinak (stejný
+    princip jako `2026-09-11` spec's `apply`/`revert` "text SE uložil,
+    ale historie ne" rozlišení). BLOCKING oprava kola 2 - `_commit_
+    polish_result` dřív načítala/validovala historii AŽ PO DB commitu,
+    takže poškozený `polish.history.json` by nechal DB už změněnou, ale
+    volající by to nesprávně hlásil jako "text NEBYL uložen"."""
+
+
+def _commit_polish_result(db: str, history_path: str, idx: int, *, en: str,
+                          cz_before: str, final_text: str, findings: list,
+                          glossary_rows: list, revision_rounds: int, source: str,
+                          model_label: str, styled_by_codex: str,
+                          backup_state: dict, rendered_terms: "list | None" = None) -> None:
+    """Sdílený zápis "text se STÁVÁ finálním" - volá dávkový `_cmd_polish`
+    (`source="polish-batch"`) i editor "Uložit" endpoint (`polish_server.py`
+    Task 9, `source="polish-review"`). JEDNO místo pro DB commit +
+    historii, ať obě cesty zůstanou navždy v souladu (stejný vzor jako
+    dnešní `POST /api/polish/apply`, jen extrahovaný a sdílený). PŘEPISUJE
+    `chapters.notes` (nenačítá/nemergeuje předchozí obsah) - stejné chování
+    jako dnešní `apply` endpoint už dělá; report nálezů (Task 7/8) proto
+    čte JEN `chapters.notes` jako aktuální stav, ne merge s historií (viz
+    tamní poznámka o duplicitě).
+
+    Historie se NAČTE/OVĚŘÍ JAKO PRVNÍ krok, PŘED jakýmkoli zápisem do DB
+    (kolo 2 BLOCKING oprava) - poškozený `polish.history.json` tak zastaví
+    CELOU operaci dřív, než se text vůbec změní. Selhání SAMOTNÉHO zápisu
+    historie (`save_history` na konci, PO úspěšném DB commitu) je jiná
+    třída chyby - `HistoryWriteFailedAfterCommit` výš, volající ji MUSÍ
+    zachytit zvlášť.
+
+    `rendered_terms` je VOLITELNÝ (kolo 5 IMPORTANT, revize kola 2) -
+    když volající NEPŘEDÁ nic (`None`, Task 9 save endpoint - žádná
+    předchozí `_polish_one_chapter` analýza, se kterou by se muselo
+    shodovat), spočítá se TADY přes `_preferred_rendered_terms(db, idx,
+    cz_before, history["entries"])` (Task 4). Když volající HODNOTU
+    předá (dávka Task 5, `_polish_one_chapter` ji dostala STEJNOU - viz
+    Task 3), použije se BEZE ZMĚNY - analýza (concordance kontrola
+    uvnitř `_polish_one_chapter`) a zápis (`concordance.build_mentions`
+    tady) musí vidět STEJNOU množinu, jinak může kontrola podhodnotit
+    závažnost nálezu (`omission/minor` místo `inconsistency/critical`),
+    protože zápis mezitím do `term_mentions` prosadí JINOU sadu, než
+    jakou kontrola viděla (konkrétní reprodukce v plán-consensus logu,
+    kolo 5)."""
+    findings_to_store = findings_mod.assign_ids(
+        list(findings) + [_stylist_marker(final_text, model_label)])
+    history = polish_store.load_history(history_path)   # PŘED DB zápisem
+    if rendered_terms is None:
+        rendered_terms = _preferred_rendered_terms(db, idx, cz_before, history["entries"])
+    mentions = concordance.build_mentions(en, final_text, glossary_rows, rendered_terms)
+    _backup_db_once(db, backup_state)
+    row_before = state.get_chapter(db, idx)
+    title = row_before["title"] if row_before else f"Chapter {idx}"
+    state.commit_chapter_result(
+        db, idx, translated_text=final_text, revision_rounds=revision_rounds,
+        notes_json=json.dumps(findings_to_store, ensure_ascii=False), status="done",
+        new_candidates=[], mentions=mentions, questions=[])
+    # DB commit VÝŠ už proběhl a je NEODVOLATELNÝ - selhání NÍŽE je JINÁ
+    # třída chyby (kolo 2 BLOCKING), zabalená do `HistoryWriteFailedAfterCommit`.
+    history["entries"].append({
+        "idx": idx, "applied_at": polish_store.utc_now_z(),
+        "cz_before": cz_before, "cz_after": final_text,
+        "styled_by_codex": styled_by_codex, "title": title,
+        "findings": findings_to_store, "rendered_terms": rendered_terms,
+        "source": source, "draft_id": uuid.uuid4().hex})
+    try:
+        polish_store.save_history(history_path, history)
+    except Exception as e:
+        raise HistoryWriteFailedAfterCommit(str(e)) from e
+
+
+def _cmd_polish(args) -> int:
+    db = config.DB_PATH
+    model, codex_cmd, preflight_err = _polish_preflight()
+    if preflight_err:
+        _say(preflight_err)
         return 1
 
     rid = None
@@ -1172,7 +1266,17 @@ def _cmd_polish(args) -> int:
     planned_count = 0
     batch_completed = False
     run_error = None
-    draft_chapters = []   # akumulátor pro inkrementální zápis draftu (kolo 1)
+    backup_state = {"done": False, "snapshot_path": db + ".pre-polish-snapshot"}
+    # `_snapshot_db` selhání (`OSError`/`TimeoutError`) MUSÍ dostat
+    # ŘÍZENÉ ošetření - VLASTNÍ `try/except`, ne propad do hlavního
+    # `try:` bloku (ten se ještě nezačal). `main()` zachytává VÝHRADNĚ
+    # `state.LockError`, žádnou jinou výjimku.
+    try:
+        _snapshot_db(db, backup_state["snapshot_path"])
+    except (OSError, TimeoutError) as e:
+        _say(f"Záloha DB před polishem selhala ({type(e).__name__}: {e}) - "
+             "běh se nespouští, dokud se nedá udělat bezpečná záloha.")
+        return 1
     try:
         all_done = state.chapters_by_status(db, ("done",))
         chapters = all_done
@@ -1198,11 +1302,16 @@ def _cmd_polish(args) -> int:
 
         glossary_rows = glossary.all_terms(db)
         rid = state.create_run(db, "polish")
-        cf = _client_factory(rid, interactive=True)
+        cf = _client_factory(rid, interactive=True,
+                             require_lock=lambda: _lock_still_owned(config.LOCK_PATH))
         for c in chapters:
             rec = None
             try:
-                rec = _polish_one_chapter(c, glossary_rows, cf, db, model, codex_cmd)
+                history_for_rt = polish_store.load_history(config.POLISH_HISTORY_PATH)
+                rt = _preferred_rendered_terms(
+                    db, c["idx"], c["translated_text"], history_for_rt["entries"])
+                rec = _polish_one_chapter(c, glossary_rows, cf, db, model, codex_cmd,
+                                          rendered_terms=rt)
             except FatalRunError as fe:
                 rec = {"idx": c["idx"], "outcome": "fatal", "error": str(fe)}
                 raise
@@ -1221,46 +1330,129 @@ def _cmd_polish(args) -> int:
                     # DB stav, protože commit mohl proběhnout uprostřed).
                     rec = {"idx": c["idx"], "outcome": "interrupted"}
                 if "outcome" not in rec:
-                    # Draft dict - zapiš INKREMENTÁLNĚ (kolo 1 IMPORTANT),
-                    # ne až po celé smyčce.
-                    draft_chapters.append(rec)
+                    # Codex navrhl jinou stylizaci - ROVNOU zapiš jako
+                    # finální text (spec "Architektura" - žádná čekající
+                    # fronta). Obnov zámek PŘED KAŽDÝM zápisem - dlouhá
+                    # dávka (desítky kapitol, minuty Codex volání na
+                    # kapitolu) jinak riskuje překročení stálosti zámku
+                    # uprostřed běhu.
                     try:
-                        polish_store.save_draft(config.POLISH_DRAFT_PATH, {
-                            "schema_version": polish_store.DRAFT_SCHEMA_VERSION,
-                            "generated_at": polish_store.utc_now_z(),
-                            "codex_model": model, "chapters": list(draft_chapters)})
-                    except Exception as e:
-                        # Kolo 4 plán-ping-pongu IMPORTANT (dva body):
-                        # (1) `save_draft` může vyhodit `PolishStoreError`
-                        # (validace) nebo `TypeError` (json.dump), ne jen
-                        # `OSError` - VŠECHNY patří sem, ne do vnějšího
-                        # obecného handleru. (2) tenhle `except` je uvnitř
-                        # `finally` bloku smyčky - `raise` odsud přeskočí
-                        # řádek `report.append(rec)` NÍŽ úplně, takže by
-                        # tahle kapitola (a její zaplacená Codex práce)
-                        # zmizela z reportu beze stopy (attempted_count by
-                        # byl chybný). Záznam se proto připojí RUČNĚ tady,
-                        # PŘED propagací.
+                        state.refresh_lock(config.LOCK_PATH)
+                    except state.LockError as e:
                         report.append({"idx": rec["idx"], "outcome": "fatal",
-                                       "error": stylist._redact_detail(
-                                           f"{type(e).__name__}: {e}")})
+                                       "error": f"Zámek ztracen: {e}"})
                         raise FatalRunError(
-                            f"Zápis draftu selhal ({stylist._redact_detail(f'{type(e).__name__}: {e}')}) "
-                            "- infrastrukturní chyba, celý běh `polish` se "
-                            "zastavuje.") from e
-                    full = config.STYLIST_REPORT_REJECTED_TEXT is True
-                    report_rec = {"idx": rec["idx"], "outcome": "applied",
-                                 "reason_types": rec["reason_types"]}
-                    if full:
-                        report_rec["findings"] = rec["findings"]
-                        report_rec["styled"] = rec["styled"]
-                    rec = report_rec
+                            f"Zámek ztracen uprostřed dávky ({e}) - jiný "
+                            "proces teď píše do DB, běh se zastavuje.") from e
+                    # CAS - `en`/`cz_before` musí přijít ze STEJNÉHO `c`
+                    # objektu, ale DB se od zahájení smyčky mohla změnit
+                    # (i v rámci JEDNOHO zámku - obranná kontrola, ne jen
+                    # cross-proces). Neshoda → přeskoč TUHLE kapitolu,
+                    # nezastavuj celou dávku.
+                    row_now = state.get_chapter(db, c["idx"])
+                    if (row_now is None
+                            or row_now["translated_text"] != c["translated_text"]
+                            or row_now["status"] != "done"):
+                        rec = {"idx": c["idx"], "outcome": "failed",
+                               "error": "kapitola se mezitím změnila mimo "
+                                       "tenhle běh, přeskočeno"}
+                    else:
+                        findings_final = rec["findings"]
+                        try:
+                            _commit_polish_result(
+                                db, config.POLISH_HISTORY_PATH, c["idx"],
+                                en=c["raw_text"], cz_before=c["translated_text"],
+                                final_text=rec["styled"], findings=findings_final,
+                                glossary_rows=glossary_rows,
+                                revision_rounds=rec["revision_rounds"],
+                                source="polish-batch", model_label=model,
+                                styled_by_codex=rec["styled"],
+                                backup_state=backup_state,
+                                rendered_terms=rt)   # STEJNÁ hodnota jako
+                                # analýza výš (`_polish_one_chapter`
+                                # volání) - kolo 5 IMPORTANT konzistence.
+                        except HistoryWriteFailedAfterCommit as e:
+                            # Text UŽ JE v DB (kolo 2 BLOCKING rozlišení) -
+                            # jiná hláška než "nezapsáno", i když se běh
+                            # pořád zastavuje (historie je z tohohle místa
+                            # dál nekonzistentní, bezpečnější nepokračovat).
+                            report.append({"idx": rec["idx"], "outcome": "fatal",
+                                           "error": stylist._redact_detail(
+                                               f"HistoryWriteFailedAfterCommit: {e}")})
+                            raise FatalRunError(
+                                f"Kapitola {c['idx']}: text SE zapsal do knihy, ale "
+                                f"zápis do historie selhal ({stylist._redact_detail(str(e))}) "
+                                "- celý běh `polish` se zastavuje, zkontroluj "
+                                f"{config.POLISH_HISTORY_PATH} ručně.") from e
+                        except Exception as e:
+                            report.append({"idx": rec["idx"], "outcome": "fatal",
+                                           "error": stylist._redact_detail(
+                                               f"{type(e).__name__}: {e}")})
+                            raise FatalRunError(
+                                f"Zápis výsledku selhal ({stylist._redact_detail(f'{type(e).__name__}: {e}')}) "
+                                "- infrastrukturní chyba, celý běh `polish` se "
+                                "zastavuje.") from e
+                        _say(f"Kapitola {c['idx']}: stylizováno a zapsáno "
+                             f"({len(findings_final)} nálezů).")
+                        full = config.STYLIST_REPORT_REJECTED_TEXT is True
+                        report_rec = {"idx": rec["idx"], "outcome": "applied",
+                                     "reason_types": rec["reason_types"]}
+                        if full:
+                            report_rec["findings"] = rec["findings"]
+                            report_rec["styled"] = rec["styled"]
+                        rec = report_rec
+                elif rec.get("outcome") == "unchanged":
+                    # Marker zapiš i BEZE ZMĚNY textu (viz "_unchanged_
+                    # marker" docstring) - jinak `_already_styled` zůstane
+                    # `False` a příští `polish` bez `--force` kapitolu
+                    # znovu (a zbytečně) pošle Codexu. `_commit_polish_
+                    # result` se tu NEPOUŽÍVÁ (žádná VĚCNÁ změna textu,
+                    # historie by dostala zavádějící `cz_before ==
+                    # cz_after` záznam) - stejný lehký zápis jako Task 9's
+                    # notes-only větev.
+                    try:
+                        state.refresh_lock(config.LOCK_PATH)
+                    except state.LockError as e:
+                        report.append({"idx": rec["idx"], "outcome": "fatal",
+                                       "error": f"Zámek ztracen: {e}"})
+                        raise FatalRunError(
+                            f"Zámek ztracen uprostřed dávky ({e}) - jiný "
+                            "proces teď píše do DB, běh se zastavuje.") from e
+                    row_now = state.get_chapter(db, c["idx"])
+                    if (row_now is None
+                            or row_now["translated_text"] != c["translated_text"]
+                            or row_now["status"] != "done"):
+                        # Kapitola se mezitím změnila mimo tenhle běh -
+                        # na rozdíl od "applied" větve NENÍ text co
+                        # zahodit (nic se nezměnilo), marker jen zůstane
+                        # nezapsaný - příští `polish` to zkusí znovu na
+                        # AKTUÁLNÍM stavu kapitoly.
+                        pass
+                    else:
+                        marker = findings_mod.assign_ids([_unchanged_marker(model)])[0]
+                        current_notes = _parse_findings(row_now["notes"])
+                        try:
+                            _backup_db_once(db, backup_state)
+                            with state.connect(db) as conn:
+                                conn.execute(
+                                    "UPDATE chapters SET notes=?, "
+                                    "updated_at=CURRENT_TIMESTAMP WHERE idx=?",
+                                    (json.dumps(current_notes + [marker], ensure_ascii=False),
+                                     c["idx"]))
+                        except Exception as e:
+                            report.append({"idx": rec["idx"], "outcome": "fatal",
+                                           "error": stylist._redact_detail(
+                                               f"{type(e).__name__}: {e}")})
+                            raise FatalRunError(
+                                f"Zápis markeru selhal ({stylist._redact_detail(f'{type(e).__name__}: {e}')}) "
+                                "- infrastrukturní chyba, celý běh `polish` se "
+                                "zastavuje.") from e
                 report.append(rec)
         batch_completed = True
 
         tally = {k: sum(1 for rec in report if rec.get("outcome") == k)
                  for k in _REPORT_OUTCOMES}
-        _say(f"Navrženo k review: {tally['applied']}, beze změny: "
+        _say(f"Stylizováno a zapsáno: {tally['applied']}, beze změny: "
              f"{tally['unchanged']}, selhalo: {tally['failed']}")
         _print_usage(db, rid)
         if tally["failed"] == len(chapters) and tally["failed"] > 0:
@@ -1283,6 +1475,11 @@ def _cmd_polish(args) -> int:
         _say(f"Neočekávaná chyba: {type(e).__name__}: {e}")
         return 1
     finally:
+        if not backup_state["done"]:
+            try:
+                os.remove(backup_state["snapshot_path"])
+            except OSError:
+                pass
         if rid is not None:
             finalization_error = None
             try:

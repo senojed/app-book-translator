@@ -1097,6 +1097,11 @@ def test_discard_corrupt_draft_after_startup_returns_500(tmp_path):
     assert "draft" in r.json()["error"].lower()
 
 
+@pytest.mark.skip(reason="Testuje STAROU draft-frontu + /api/polish/apply "
+                        "(_cmd_polish teď píše přímo do DB - Task 5). Task 13 "
+                        "Step 1 ('Vyhledej zbývající odkazy na draft koncept') "
+                        "tenhle test odstraňuje/nahrazuje jako součást "
+                        "plánovaného úklidu staré draft fronty.")
 def test_end_to_end_polish_then_apply_writes_edited_text(tmp_path, monkeypatch):
     import argparse
     import config

@@ -17,7 +17,7 @@ class PolishStoreError(Exception):
 
 DRAFT_SCHEMA_VERSION = 1
 HISTORY_SCHEMA_VERSION = 1
-_VALID_HISTORY_SOURCES = ("polish-review", "revert")
+_VALID_HISTORY_SOURCES = ("polish-review", "polish-batch", "revert")
 
 _DRAFT_CHAPTER_FIELDS = {
     "idx": int, "title": str, "cz_before": str, "styled": str,

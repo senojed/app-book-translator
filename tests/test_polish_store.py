@@ -336,6 +336,13 @@ def test_load_history_rejects_non_dict_element_in_rendered_terms(tmp_path):
         ps.load_history(path)
 
 
+def test_save_history_accepts_polish_batch_source(tmp_path):
+    path = str(tmp_path / "h.json")
+    ps.save_history(path, _history([_entry(1, source="polish-batch")]))
+    loaded = ps.load_history(path)
+    assert loaded["entries"][0]["source"] == "polish-batch"
+
+
 def test_save_history_validates_before_writing(tmp_path):
     path = str(tmp_path / "polish.history.json")
     bad = _history([_entry(1, source="bogus")])

@@ -737,6 +737,63 @@ def test_preferred_rendered_terms_falls_back_to_live_when_history_stale(tmp_path
     assert out == []   # živá DB (žádné term_mentions ve fixture), NE stará historie
 
 
+def test_commit_polish_result_writes_db_and_history(tmp_path):
+    db = _polish_db(tmp_path)   # existující fixture main.py:666 - kapitola
+                                 # idx=1, status='done', translated_text='Původní věta.'
+    history_path = str(tmp_path / "polish.history.json")
+    snapshot_path = str(tmp_path / "snap.db")
+    main._snapshot_db(db, snapshot_path)   # backup_state vyžaduje HOTOVÝ snapshot
+    backup_state = {"done": False, "snapshot_path": snapshot_path}
+    main._commit_polish_result(
+        db, history_path, 1, en="EN text.", cz_before="Původní věta.",
+        final_text="Vylepšeno.", findings=[{"id": "f1", "resolved": False,
+                                            "source": "concordance", "type": "omission"}],
+        glossary_rows=[], revision_rounds=0,
+        source="polish-batch", model_label="m", styled_by_codex="Vylepšeno.",
+        backup_state=backup_state)
+
+    row = state.get_chapter(db, 1)
+    assert row["translated_text"] == "Vylepšeno."
+    assert row["status"] == "done"
+    saved_notes = json.loads(row["notes"])
+    assert saved_notes[0]["id"] == "f1"
+    assert any(f["source"] == "stylist" and f["type"] == "polish" for f in saved_notes)
+
+    history = polish_store.load_history(history_path)
+    assert len(history["entries"]) == 1
+    entry = history["entries"][0]
+    assert entry["idx"] == 1
+    assert entry["cz_before"] == "Původní věta."
+    assert entry["cz_after"] == "Vylepšeno."
+    assert entry["styled_by_codex"] == "Vylepšeno."
+    assert entry["source"] == "polish-batch"
+
+
+def test_polish_preflight_rejects_fs_risk_not_accepted(monkeypatch):
+    monkeypatch.setattr(config, "STYLIST_ACCEPT_FS_RISK", False)
+    model, codex_cmd, err = main._polish_preflight()
+    assert model is None and codex_cmd is None
+    assert "STYLIST_ACCEPT_FS_RISK" in err
+
+
+def test_polish_preflight_rejects_empty_model(monkeypatch):
+    monkeypatch.setattr(config, "STYLIST_ACCEPT_FS_RISK", True)
+    monkeypatch.setattr(config, "CODEX_MODEL", "")
+    model, codex_cmd, err = main._polish_preflight()
+    assert model is None
+    assert "CODEX_MODEL" in err
+
+
+def test_polish_preflight_ok(monkeypatch):
+    monkeypatch.setattr(config, "STYLIST_ACCEPT_FS_RISK", True)
+    monkeypatch.setattr(config, "CODEX_MODEL", "gpt-5.6-terra")
+    monkeypatch.setattr(main.stylist, "_resolve_codex_cmd", lambda base: ["codex"])
+    model, codex_cmd, err = main._polish_preflight()
+    assert model == "gpt-5.6-terra"
+    assert codex_cmd == ["codex"]
+    assert err is None
+
+
 def _cf_stub(agent):
     return object()
 
@@ -935,6 +992,9 @@ def _polish_env(tmp_path, monkeypatch, n_done=1):
     monkeypatch.setattr(config, "CODEX_MODEL", "gpt-5-codex")
     monkeypatch.setattr(config, "GUIDE_PATH", str(tmp_path / "guide.json"))
     monkeypatch.setattr(config, "POLISH_DRAFT_PATH", str(tmp_path / "polish.draft.json"))
+    monkeypatch.setattr(config, "POLISH_HISTORY_PATH", str(tmp_path / "polish.history.json"))
+    monkeypatch.setattr(config, "LOCK_PATH", str(tmp_path / ".lock"))
+    state.acquire_lock(config.LOCK_PATH)
     state.init_db(config.DB_PATH)
     with state.connect(config.DB_PATH) as conn:
         for i in range(1, n_done + 1):
@@ -948,8 +1008,38 @@ def _polish_env(tmp_path, monkeypatch, n_done=1):
     monkeypatch.setattr(main.concordance, "build_mentions", lambda *a, **k: [])
     monkeypatch.setattr(main.pipeline, "_run_critic", lambda *a, **k: ([], False))
     monkeypatch.setattr(main.stylist, "check_meaning_preserved", lambda *a, **k: [])
-    monkeypatch.setattr(main, "_client_factory", lambda rid, *, interactive: (lambda a: object()))
+    monkeypatch.setattr(main, "_client_factory",
+                        lambda rid, *, interactive, require_lock=None: (lambda a: object()))
     return config.DB_PATH
+
+
+def test_lock_still_owned_true_when_lock_held(tmp_path):
+    lock_path = str(tmp_path / ".lock")
+    state.acquire_lock(lock_path)
+    assert main._lock_still_owned(lock_path) is True
+
+
+def test_lock_still_owned_false_when_refresh_fails(tmp_path, monkeypatch):
+    lock_path = str(tmp_path / ".lock")
+    monkeypatch.setattr(state, "refresh_lock",
+                        lambda *a, **k: (_ for _ in ()).throw(state.LockError("ukraden")))
+    assert main._lock_still_owned(lock_path) is False
+
+
+def test_cmd_polish_passes_require_lock_callback_to_client_factory(tmp_path, monkeypatch):
+    """Kolo 13 IMPORTANT - drátování: `_cmd_polish` MUSÍ `_client_factory`
+    zavolat s `require_lock=...`, jinak `PipelineLLMClient` uvnitř
+    `_polish_one_chapter` nemá jak zámek ověřit PŘED KAŽDÝM LLM voláním
+    (viz Task 10 stejný vzor pro server)."""
+    db = _polish_env(tmp_path, monkeypatch, n_done=1)
+    monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: "Jiná věta.")
+    seen = {}
+    def _fake_client_factory(rid, *, interactive, require_lock=None):
+        seen["require_lock"] = require_lock
+        return lambda a: object()
+    monkeypatch.setattr(main, "_client_factory", _fake_client_factory)
+    main._cmd_polish(_Args(only=None, force=False))
+    assert callable(seen["require_lock"])
 
 
 def _report(db):
@@ -982,37 +1072,48 @@ def test_cmd_polish_preflight_failure_returns_1(tmp_path, monkeypatch):
     assert main._cmd_polish(_Args()) == 1
 
 
-def test_cmd_polish_preflight_rejects_pending_draft(tmp_path, monkeypatch):
-    db = _polish_env(tmp_path, monkeypatch)
-    polish_store.save_draft(config.POLISH_DRAFT_PATH, {
-        "schema_version": 1, "generated_at": polish_store.utc_now_z(),
-        "codex_model": "m", "chapters": [{
-            "idx": 99, "title": "Old", "cz_before": "a", "styled": "b",
-            "revision_rounds": 0, "reason_types": [], "findings": [],
-            "rendered_terms": [], "draft_id": "draft-99"}]})
-    def _boom(*a, **k): raise AssertionError("polish nemá běžet s nevyřízeným draftem")
-    monkeypatch.setattr(main.stylist, "polish", _boom)
-    assert main._cmd_polish(_Args()) == 1
+def test_cmd_polish_writes_directly_to_db(tmp_path, monkeypatch):
+    db = _polish_env(tmp_path, monkeypatch, n_done=1)
+    monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: "Jiná věta.")
+    main._cmd_polish(_Args(only=None, force=False))
+    row = state.get_chapter(db, 1)
+    assert row["translated_text"] == "Jiná věta."   # skutečně přepsáno
+    history = polish_store.load_history(config.POLISH_HISTORY_PATH)
+    assert history["entries"][0]["source"] == "polish-batch"
+    assert not os.path.exists(config.POLISH_DRAFT_PATH)   # draft soubor nevzniká
 
 
-def test_cmd_polish_preflight_corrupt_draft_returns_1_not_traceback(tmp_path, monkeypatch):
-    """Kolo 1 plán-ping-pongu BLOCKING - `PolishStoreError` z poškozeného
-    draftu se musí chytit v preflightu, ne propadnout jako traceback."""
-    db = _polish_env(tmp_path, monkeypatch)
-    open(config.POLISH_DRAFT_PATH, "w", encoding="utf-8").write("{not valid json")
-    def _boom(*a, **k): raise AssertionError("polish nemá běžet s poškozeným draftem")
-    monkeypatch.setattr(main.stylist, "polish", _boom)
-    assert main._cmd_polish(_Args()) == 1
+def test_cmd_polish_unchanged_chapter_marked_and_skipped_next_run(tmp_path, monkeypatch):
+    """Kolo 9 IMPORTANT - beze zápisu markeru by druhý běh kapitolu,
+    co Codex nechal beze změny, poslal Codexu ZNOVU (a znovu zaplatil).
+    `--force` musí i tak umět kapitolu vrátit zpátky do zpracování."""
+    db = _polish_env(tmp_path, monkeypatch, n_done=1)
+    calls = {"n": 0}
+
+    def fake_polish(en, cz, **k):
+        calls["n"] += 1
+        return cz   # Codex nenavrhuje žádnou úpravu
+
+    monkeypatch.setattr(main.stylist, "polish", fake_polish)
+    main._cmd_polish(_Args(only=None, force=False))
+    assert calls["n"] == 1
+    row = state.get_chapter(db, 1)
+    notes = main._parse_findings(row["notes"])
+    assert any(f["source"] == "stylist" and f["type"] == "unchanged" for f in notes)
+    assert main._already_styled(row["notes"]) is True
+
+    main._cmd_polish(_Args(only=None, force=False))
+    assert calls["n"] == 1   # druhý běh bez --force kapitolu PŘESKOČIL
+
+    main._cmd_polish(_Args(only=None, force=True))
+    assert calls["n"] == 2   # --force ji i tak zpracuje znovu
 
 
-def test_cmd_polish_survives_fatal_midbatch_draft_already_has_first_chapter(tmp_path, monkeypatch):
-    """Spec kolo 1 IMPORTANT - INKREMENTÁLNÍ zápis draftu musí přežít pád
-    UPROSTŘED dávky: kapitola 1 se stihne zapsat do polish.draft.json
-    dřív, než kapitola 2 shodí celý běh přes FatalRunError."""
+def test_cmd_polish_survives_fatal_midbatch_first_chapter_already_committed(tmp_path, monkeypatch):
+    """Stejný princip jako dřív u inkrementálního draftu, teď nad přímým
+    DB zápisem - kapitola 1 se stihne zapsat dřív, než kapitola 2 shodí
+    celý běh přes FatalRunError, a MUSÍ zůstat zapsaná i po pádu."""
     db = _polish_env(tmp_path, monkeypatch, n_done=2)
-    # Kapitola 1 projde normálně, kapitola 2 spadne přes kritika s
-    # `FatalRunError` - přesně cesta, co `_cmd_polish` propaguje ven
-    # z per-kapitolové smyčky a zastaví celou dávku.
     from src.llm.client import FatalRunError as _FRE
     seen = {"n": 0}
     def _crit(*a, **k):
@@ -1023,20 +1124,19 @@ def test_cmd_polish_survives_fatal_midbatch_draft_already_has_first_chapter(tmp_
     monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: cz + " uprav")
     monkeypatch.setattr(main.pipeline, "_run_critic", _crit)
     assert main._cmd_polish(_Args()) == 1
-    draft = polish_store.load_draft(config.POLISH_DRAFT_PATH)
-    assert {c["idx"] for c in draft["chapters"]} == {1}   # kapitola 1 PŘEŽILA pád na kapitole 2
+    assert state.get_chapter(db, 1)["translated_text"] == "Věta 1. uprav"
+    assert state.get_chapter(db, 2)["translated_text"] == "Věta 2."   # nedotčeno, spadlo dřív
 
 
-def test_cmd_polish_save_draft_non_oserror_failure_still_recorded_in_report(tmp_path, monkeypatch):
-    """Kolo 4 plán-ping-pongu IMPORTANT - `save_draft` selhání JINÉ než
-    `OSError` (např. `PolishStoreError`/`TypeError`) se musí zabalit do
-    `FatalRunError` STEJNĚ jako OSError, A kapitola musí i tak skončit
-    v reportu (jako `fatal`), ne beze stopy zmizet z attempted_count."""
+def test_cmd_polish_commit_failure_still_recorded_in_report(tmp_path, monkeypatch):
+    """Stejný princip jako dřív u `save_draft` selhání - selhání ZÁPISU
+    (teď přímo do DB přes `_commit_polish_result`) se musí zabalit do
+    `FatalRunError`, A kapitola musí i tak skončit v reportu (jako
+    `fatal`), ne beze stopy zmizet z attempted_count."""
     db = _polish_env(tmp_path, monkeypatch, n_done=1)
     monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: cz + " uprav")
-    monkeypatch.setattr(main.polish_store, "save_draft",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            main.polish_store.PolishStoreError("poškozená validace")))
+    monkeypatch.setattr(main.state, "commit_chapter_result",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk plný")))
     assert main._cmd_polish(_Args()) == 1
     r = _report(db)
     assert r["run_status"] == "fatal"
@@ -1044,16 +1144,15 @@ def test_cmd_polish_save_draft_non_oserror_failure_still_recorded_in_report(tmp_
     assert r["chapters"][0]["outcome"] == "fatal"
 
 
-def test_cmd_polish_happy_path_writes_draft_not_db_and_reports(tmp_path, monkeypatch):
+def test_cmd_polish_happy_path_writes_db_and_reports(tmp_path, monkeypatch):
     db = _polish_env(tmp_path, monkeypatch, n_done=2)
     monkeypatch.setattr(main.stylist, "polish",
                         lambda en, cz, **k: cz.replace("Věta", "Lepší věta"))
     assert main._cmd_polish(_Args()) == 0
-    # DB NETKNUTÁ - jen polish.draft.json nese návrh
-    assert state.get_chapter(db, 1)["translated_text"] == "Věta 1."
-    assert not os.path.exists(db + ".pre-polish-backup")
-    draft = polish_store.load_draft(config.POLISH_DRAFT_PATH)
-    assert {c["idx"] for c in draft["chapters"]} == {1, 2}
+    assert state.get_chapter(db, 1)["translated_text"] == "Lepší věta 1."
+    assert state.get_chapter(db, 2)["translated_text"] == "Lepší věta 2."
+    history = polish_store.load_history(config.POLISH_HISTORY_PATH)
+    assert {e["idx"] for e in history["entries"]} == {1, 2}
     r = _report(db)
     assert r["run_status"] == "ok" and r["batch_completed"] is True
     assert r["planned_count"] == 2 and r["attempted_count"] == 2
@@ -1166,7 +1265,7 @@ def test_cmd_polish_force_interrupt_before_new_commit_is_interrupted(tmp_path, m
 
 def test_cmd_polish_client_factory_failure_after_create_run_still_reports(tmp_path, monkeypatch):
     db = _polish_env(tmp_path, monkeypatch, n_done=2)
-    def _boom(rid, *, interactive):
+    def _boom(rid, *, interactive, require_lock=None):
         raise RuntimeError("no client")
     monkeypatch.setattr(main, "_client_factory", _boom)
     assert main._cmd_polish(_Args()) == 1
