@@ -1823,3 +1823,28 @@ def test_resolve_finding_400_bad_scope(tmp_path):
     r = client.post("/api/findings/resolve", json={
         "scope": "bogus", "idx": 1, "finding_id": "x", "resolved": True})
     assert r.status_code == 400
+
+
+def test_get_findings_page_renders_html(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET notes=? WHERE idx=1",
+                     (json.dumps([{"id": "f1", "resolved": False,
+                                  "source": "critic", "type": "fidelity",
+                                  "issue": "posun smyslu"}]),))
+    client = TestClient(app)
+    r = client.get("/findings")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+    assert "posun smyslu" in r.text
+
+
+def test_post_export_writes_book_and_findings_files(tmp_path, monkeypatch):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    monkeypatch.setattr("config.OUTPUT_TXT", str(tmp_path / "out.txt"))
+    client = TestClient(app)
+    r = client.post("/api/export", json={})
+    assert r.status_code == 200
+    body = r.json()
+    assert os.path.exists(body["book_path"])
+    assert os.path.exists(body["findings_path"])

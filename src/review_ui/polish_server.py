@@ -11,7 +11,7 @@ import webbrowser
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 
-from src import concordance, findings, glossary, polish_store, state
+from src import concordance, findings, findings_report, glossary, polish_store, state
 
 _STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -549,6 +549,34 @@ def build_app(db_path: str, draft_path: str, history_path: str, lock_path: str) 
                     {"error": f"Zápis nálezu selhal ({type(e).__name__}: {e})"},
                     status_code=500)
         return {"ok": True}
+
+    @app.get("/findings")
+    def get_findings_page():
+        from fastapi.responses import HTMLResponse
+        report = findings_report.build_findings_report(db_path)
+        return HTMLResponse(findings_report.render_findings_html(report))
+
+    @app.post("/api/export")
+    def post_export(payload: dict = None):
+        # `write_lock` - NENÍ tu zápis do DB, ale export musí vidět
+        # KONZISTENTNÍ snímek knihy (Global Constraints). Souběžný
+        # `POST /api/chapter/{idx}/save` (Task 9) běží uvnitř STEJNÉHO
+        # `write_lock` - bez obalení tady by export mohl přečíst část
+        # kapitol PŘED a část PO souběžném uložení, kniha+report by pak
+        # neodpovídaly ŽÁDNÉMU skutečnému stavu DB. `require_lock()`
+        # navíc odmítne export, když tenhle proces ztratil vlastnictví
+        # zámku (jiný proces teď legitimně píše mimo tenhle server).
+        with write_lock:
+            if not app.state.require_lock():
+                return JSONResponse({"error": "zámek ztracen"}, status_code=503)
+            import main
+            book_path, skipped = main.export_book(db_path, only_done=False)
+            report = findings_report.build_findings_report(db_path)
+            findings_path = os.path.splitext(book_path)[0] + ".findings.txt"
+            with open(findings_path, "w", encoding="utf-8") as f:
+                f.write(findings_report.render_findings_txt(report))
+        return {"book_path": book_path, "findings_path": findings_path,
+               "skipped": skipped}
 
     @app.get("/api/polish")
     def get_polish(idx: "int | None" = None):
