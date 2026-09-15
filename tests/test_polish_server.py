@@ -1757,3 +1757,69 @@ def test_regenerate_reject_candidate_then_light_save_does_not_duplicate(tmp_path
     non_marker = [f for f in saved if f["source"] != "stylist"]
     assert len(non_marker) == 1   # starý "old-f1" NEPŘEŽIL - žádná duplicita
     assert non_marker[0]["id"] == "new-f1"
+
+
+def test_resolve_finding_in_notes(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET notes=? WHERE idx=1",
+                     (json.dumps([{"id": "f1", "resolved": False,
+                                  "source": "critic", "type": "fidelity"}]),))
+    client = TestClient(app)
+    r = client.post("/api/findings/resolve", json={
+        "scope": "notes", "idx": 1, "finding_id": "f1", "resolved": True})
+    assert r.status_code == 200
+    row = state.get_chapter(db, 1)
+    assert json.loads(row["notes"])[0]["resolved"] is True
+
+
+def test_resolve_finding_400_for_history_scope(tmp_path):
+    """Kolo 17 IMPORTANT - `scope="history"` ODSTRANĚNA (byla dead code -
+    žádný UI prvek ji nikdy nevolal, `renderFindings`/`toggleResolved`
+    posílají VŽDY `scope: 'notes'`, viz Task 14). Editace `polish.
+    history.json` nezávisle na `chapters.notes` by vytvořila DIVERGENTNÍ
+    `resolved` hodnoty pro nález, co uživatel vnímá jako "stejný" - UI/
+    report čtou VÝHRADNĚ `chapters.notes` (Task 8/12 design), takže
+    "history" resolve by tiše vrátilo 200 a NIC viditelného by se
+    nezměnilo."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/findings/resolve", json={
+        "scope": "history", "idx": 1, "finding_id": "h1", "resolved": True})
+    assert r.status_code == 400
+
+
+def test_resolve_finding_calls_backup_db_once(tmp_path):
+    """Kolo 22 IMPORTANT - `_backup_db_once` CHYBĚLO v tomhle endpointu -
+    pokud je resolve PRVNÍ mutující operace session (uživatel otevře
+    editor a rovnou něco zaškrtne, nikdy neuloží/neregeneruje), startovní
+    snapshot by se při čistém vypnutí serveru smazal (`backup_state[
+    'done']` by zůstalo `False`), i když reálný DB zápis proběhl -
+    uživatel by přišel o obnovitelnou zálohu stavu PŘED touhle session."""
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET notes=? WHERE idx=1",
+                     (json.dumps([{"id": "f1", "resolved": False,
+                                  "source": "critic", "type": "fidelity"}]),))
+    assert app.state.backup_state["done"] is False
+    client = TestClient(app)
+    r = client.post("/api/findings/resolve", json={
+        "scope": "notes", "idx": 1, "finding_id": "f1", "resolved": True})
+    assert r.status_code == 200
+    assert app.state.backup_state["done"] is True
+
+
+def test_resolve_finding_404_when_not_found(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/findings/resolve", json={
+        "scope": "notes", "idx": 1, "finding_id": "nope", "resolved": True})
+    assert r.status_code == 404
+
+
+def test_resolve_finding_400_bad_scope(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/findings/resolve", json={
+        "scope": "bogus", "idx": 1, "finding_id": "x", "resolved": True})
+    assert r.status_code == 400

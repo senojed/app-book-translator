@@ -488,6 +488,68 @@ def build_app(db_path: str, draft_path: str, history_path: str, lock_path: str) 
         return {"styled": rec["styled"], "findings": rec["findings"],
                 "reason_types": rec["reason_types"]}
 
+    @app.post("/api/findings/resolve")
+    def post_resolve_finding(payload: dict):
+        scope = payload.get("scope")
+        idx_raw = payload.get("idx")
+        finding_id = payload.get("finding_id")
+        resolved = payload.get("resolved")
+        # Kolo 17 IMPORTANT - `scope="history"` ODSTRANĚNA. Editovala
+        # `polish.history.json` NEZÁVISLE na `chapters.notes`, co ale
+        # UI/report (Task 8 GET, Task 12 report) čtou jako JEDINÝ zdroj
+        # "aktuálního" stavu nálezů - "history" resolve by tiše vrátilo
+        # 200, žádný checkbox/počet by se ale NEZMĚNIL, a stejný nález
+        # (jiné `id`, protože `assign_ids` generuje NEZÁVISLE napříč
+        # `notes`/historií) by mohl mít DIVERGENTNÍ `resolved` hodnotu na
+        # dvou místech. Navíc ŽÁDNÝ prvek UI ji nikdy nevolal - `toggle
+        # Resolved` (Task 14) posílá VŽDY `scope: 'notes'` natvrdo -
+        # mrtvý, matoucí kód. `scope` pole v payloadu ZŮSTÁVÁ (ne
+        # zjednodušeno pryč) kvůli vpřed kompatibilitě kontraktu.
+        if (scope != "notes" or type(idx_raw) is not int
+                or not isinstance(finding_id, str) or not isinstance(resolved, bool)):
+            return JSONResponse(
+                {"error": "scope musí být notes, idx int, finding_id "
+                          "string, resolved bool"}, status_code=400)
+        idx = idx_raw
+
+        with write_lock:
+            if not app.state.require_lock():
+                return JSONResponse({"error": "zámek ztracen"}, status_code=503)
+            import main
+            row = state.get_chapter(db_path, idx)
+            if row is None:
+                return JSONResponse({"error": "kapitola neexistuje"}, status_code=404)
+            notes_findings = main._parse_findings(row["notes"])
+            if not findings.set_resolved(notes_findings, finding_id, resolved):
+                return JSONResponse({"error": "nález nenalezen"}, status_code=404)
+            try:
+                # Kolo 22 IMPORTANT - `_backup_db_once` CHYBĚLO - OBĚ
+                # větve Tasku 9 ho volají (přímo nebo přes `_commit_
+                # polish_result`), tenhle endpoint ne. Pokud je resolve
+                # PRVNÍ mutující operace v týhle serverové session (user
+                # otevře editor a rovnou něco zaškrtne, nikdy neuloží/
+                # neregeneruje), `backup_state["done"]` zůstane `False` -
+                # startovní snapshot (vytvořený PŘI STARTU serveru) se
+                # při čistém vypnutí smaže (`finally` v `run_polish_
+                # review_server`, "if not backup_state['done']: os.remove
+                # (...)") a uživatel PŘIJDE o obnovitelnou zálohu stavu
+                # PŘED touhle session, přestože reálný DB zápis proběhl.
+                main._backup_db_once(db_path, app.state.backup_state)
+                with state.connect(db_path) as conn:
+                    # Kolo 18 NIT - `updated_at=CURRENT_TIMESTAMP` chybělo -
+                    # seznam kapitol (Task 8/14) zobrazuje "Naposled
+                    # upraveno" z tohohle sloupce, bez aktualizace by po
+                    # zaškrtnutí nálezu ukazoval STARÝ čas, i když se
+                    # kapitola právě změnila.
+                    conn.execute("UPDATE chapters SET notes=?, "
+                                "updated_at=CURRENT_TIMESTAMP WHERE idx=?",
+                                (json.dumps(notes_findings, ensure_ascii=False), idx))
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"Zápis nálezu selhal ({type(e).__name__}: {e})"},
+                    status_code=500)
+        return {"ok": True}
+
     @app.get("/api/polish")
     def get_polish(idx: "int | None" = None):
         draft, err = _try_load_draft(draft_path)
