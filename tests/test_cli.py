@@ -1094,6 +1094,49 @@ def test_cmd_polish_writes_directly_to_db(tmp_path, monkeypatch):
     assert not os.path.exists(config.POLISH_DRAFT_PATH)   # draft soubor nevzniká
 
 
+def test_cmd_polish_includes_flagged_chapters(tmp_path, monkeypatch):
+    """`run` označí kapitolu `flagged`, když kritik něco namítne - to
+    NESMÍ znamenat, že ji `polish` navždy přeskočí. Uživatel chce
+    přeložit CELOU knihu, přes polish protáhnout VŠECHNO (i flagged),
+    a kritický nálezy si vyřešit ručně v editoru NAD hotovým textem -
+    ne aby dávka na flagged kapitole zůstala trčet navždy."""
+    db = _polish_env(tmp_path, monkeypatch, n_done=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET status='flagged' WHERE idx=1")
+    monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: "Jiná věta.")
+    assert main._cmd_polish(_Args(only=None, force=False)) == 0
+    row = state.get_chapter(db, 1)
+    assert row["translated_text"] == "Jiná věta."
+    assert row["status"] == "done"   # úspěšná stylizace kapitolu schválí
+
+
+def test_cmd_polish_includes_needs_human_chapters(tmp_path, monkeypatch):
+    db = _polish_env(tmp_path, monkeypatch, n_done=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET status='needs_human' WHERE idx=1")
+    monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: "Jiná věta.")
+    assert main._cmd_polish(_Args(only=None, force=False)) == 0
+    row = state.get_chapter(db, 1)
+    assert row["translated_text"] == "Jiná věta."
+    assert row["status"] == "done"
+
+
+def test_cmd_polish_still_skips_error_status_no_text(tmp_path, monkeypatch):
+    """`error` kapitola může mít `translated_text=NULL` (první neúspěšný
+    pokus o překlad, main.py `run`u `except Exception` větev) - na
+    rozdíl od `flagged`/`needs_human` (vždy mají reálný text z `pipeline.
+    process_chapter`) se NESMÍ zařadit do dávky, jinak spadne hluboko
+    ve `stylist.polish` na `None` textu."""
+    db = _polish_env(tmp_path, monkeypatch, n_done=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET status='error', translated_text=NULL WHERE idx=1")
+    monkeypatch.setattr(main.stylist, "polish",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("nemá se volat")))
+    assert main._cmd_polish(_Args(only=None, force=False)) == 0
+    row = state.get_chapter(db, 1)
+    assert row["status"] == "error"   # beze změny - nezařazeno do dávky
+
+
 def test_cmd_polish_unchanged_chapter_marked_and_skipped_next_run(tmp_path, monkeypatch):
     """Kolo 9 IMPORTANT - beze zápisu markeru by druhý běh kapitolu,
     co Codex nechal beze změny, poslal Codexu ZNOVU (a znovu zaplatil).

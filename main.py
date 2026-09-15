@@ -1263,15 +1263,25 @@ def _cmd_polish(args) -> int:
              "běh se nespouští, dokud se nedá udělat bezpečná záloha.")
         return 1
     try:
-        all_done = state.chapters_by_status(db, ("done",))
-        chapters = all_done
+        # `flagged`/`needs_human` mají VŽDY reálný `translated_text`
+        # (`pipeline.process_chapter` ho zapisuje pro všechny tři status
+        # větve stejně, viz `src/pipeline.py` - `commit_chapter_result`
+        # volání je JEDNO, `status` se jen liší). Dávka je NESMÍ navždy
+        # přeskakovat - uživatel chce přeložit/postylizovat CELOU knihu
+        # a kritický nálezy řešit ručně v editoru NAD hotovým textem, ne
+        # aby flagged kapitola zůstala trčet, dokud ji někdo neschválí.
+        # `error` (main.py's `except Exception` větev v `_cmd_run`) je
+        # JINÁ třída - `translated_text` tam může být `NULL` (první
+        # neúspěšný pokus), proto zůstává mimo dávku.
+        all_pending = state.chapters_by_status(db, ("done", "flagged", "needs_human"))
+        chapters = all_pending
         if args.only:
             wanted = set(args.only)
-            chapters = [c for c in all_done if c["idx"] in wanted]
+            chapters = [c for c in all_pending if c["idx"] in wanted]
             chybi = sorted(wanted - {c["idx"] for c in chapters})
             if chybi:
-                _say("Přeskočeno (nejsou 'done', nebo neexistují): "
-                     + ", ".join(str(i) for i in chybi))
+                _say("Přeskočeno (nejsou 'done'/'flagged'/'needs_human', "
+                     "nebo neexistují): " + ", ".join(str(i) for i in chybi))
         if not args.force:
             pred_force = len(chapters)
             chapters = [c for c in chapters if not _already_styled(c["notes"])]
@@ -1333,11 +1343,16 @@ def _cmd_polish(args) -> int:
                     # objektu, ale DB se od zahájení smyčky mohla změnit
                     # (i v rámci JEDNOHO zámku - obranná kontrola, ne jen
                     # cross-proces). Neshoda → přeskoč TUHLE kapitolu,
-                    # nezastavuj celou dávku.
+                    # nezastavuj celou dávku. Porovnání PROTI `c["status"]`
+                    # (stav PŘI ZAHÁJENÍ týhle kapitoly), NE natvrdo
+                    # `"done"` - dávka teď bere i `flagged`/`needs_human`
+                    # (viz `all_pending` výš), natvrdé `"done"` by
+                    # nesouhlasilo se STEJNÝM, nezměněným stavem a
+                    # falešně hlásilo "kapitola se mezitím změnila".
                     row_now = state.get_chapter(db, c["idx"])
                     if (row_now is None
                             or row_now["translated_text"] != c["translated_text"]
-                            or row_now["status"] != "done"):
+                            or row_now["status"] != c["status"]):
                         rec = {"idx": c["idx"], "outcome": "failed",
                                "error": "kapitola se mezitím změnila mimo "
                                        "tenhle běh, přeskočeno"}
