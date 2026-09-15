@@ -1122,22 +1122,24 @@ def _finding_summary(notes: str) -> str:
         return "neznámý nález"
     if isinstance(data, dict):
         return str(data.get("error") or "neznámý nález")
-    for f in data:
+    for f in _parse_findings(notes):   # bezpečné, jen dict prvky - main.py:84
         if f.get("issue"):
-            return f["issue"]
+            return str(f["issue"])
     return "neznámý nález"
 
 
-def _cmd_export(args) -> int:
-    db = config.DB_PATH
+def export_book(db_path: str, only_done: bool) -> tuple:
+    """Čistá funkce (žádný I/O na argparse `args`, žádný `print`) - sdíleno
+    CLI `_cmd_export` a novým `POST /api/export` (Task 12, tlačítko v UI).
+    Vrací `(cesta_k_výslednému_souboru, seznam_vynechaných_idx)`."""
     chapters = state.chapters_by_status(
-        db, ("pending", "processing", "done", "flagged", "needs_human", "error"))
+        db_path, ("pending", "processing", "done", "flagged", "needs_human", "error"))
     out_lines, skipped = [], []
     for ch in chapters:
         idx, st = ch["idx"], ch["status"]
         if st == "done":
             out_lines.append(f"\n\n{ch['title']}\n\n{ch['translated_text'] or ''}")
-        elif st == "flagged" and not args.only_done:
+        elif st == "flagged" and not only_done:
             out_lines.append(
                 f"\n\n[!! REVIDOVAT: {_finding_summary(ch['notes'])}]\n"
                 f"{ch['title']}\n\n{ch['translated_text'] or ''}")
@@ -1145,13 +1147,17 @@ def _cmd_export(args) -> int:
             skipped.append(idx)
         else:
             skipped.append(idx)
-            if not args.only_done:
-                # Kniha nesmí tiše přijít o kapitolu.
+            if not only_done:
                 out_lines.append(f"\n\n[!! CHYBÍ KAPITOLA {idx} - stav {st}]")
     os.makedirs(os.path.dirname(config.OUTPUT_TXT) or ".", exist_ok=True)
     with open(config.OUTPUT_TXT, "w", encoding="utf-8") as f:
         f.write("\n".join(out_lines).strip() + "\n")
-    print(f"Export: {config.OUTPUT_TXT}")
+    return config.OUTPUT_TXT, skipped
+
+
+def _cmd_export(args) -> int:
+    path, skipped = export_book(config.DB_PATH, args.only_done)
+    print(f"Export: {path}")
     if skipped:
         print("Vynechané kapitoly: " + ", ".join(str(i) for i in skipped))
     return 0

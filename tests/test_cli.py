@@ -1013,6 +1013,29 @@ def _polish_env(tmp_path, monkeypatch, n_done=1):
     return config.DB_PATH
 
 
+def test_export_book_writes_done_chapters(tmp_path, monkeypatch):
+    db = _polish_db(tmp_path)   # main.py fixture - idx=1, status='done'
+    monkeypatch.setattr(config, "OUTPUT_TXT", str(tmp_path / "out.txt"))
+    path, skipped = main.export_book(db, only_done=False)
+    assert path == str(tmp_path / "out.txt")
+    assert skipped == []
+    assert "K1" in open(path, encoding="utf-8").read()
+
+
+def test_export_book_skips_non_done_without_only_done_flag_marks_missing(tmp_path, monkeypatch):
+    db = _polish_db(tmp_path)
+    state.set_status(db, 1, "pending")
+    monkeypatch.setattr(config, "OUTPUT_TXT", str(tmp_path / "out.txt"))
+    path, skipped = main.export_book(db, only_done=False)
+    assert skipped == [1]
+    assert "CHYBÍ KAPITOLA 1" in open(path, encoding="utf-8").read()
+
+
+@pytest.mark.parametrize("bad_notes", ["null", "42", "[null]", "not json"])
+def test_finding_summary_does_not_crash_on_malformed_notes(bad_notes):
+    assert main._finding_summary(bad_notes) == "neznámý nález"
+
+
 def test_lock_still_owned_true_when_lock_held(tmp_path):
     lock_path = str(tmp_path / ".lock")
     state.acquire_lock(lock_path)
