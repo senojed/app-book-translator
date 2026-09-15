@@ -10,7 +10,7 @@ import webbrowser
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 
-from src import concordance, glossary, polish_store, state
+from src import concordance, findings, glossary, polish_store, state
 
 _STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -201,6 +201,50 @@ def build_app(db_path: str, draft_path: str, history_path: str, lock_path: str) 
     @app.get("/")
     def index():
         return FileResponse(os.path.join(_STATIC, "polish.html"))
+
+    @app.get("/api/chapters")
+    def get_chapters():
+        import main
+        rows = state.chapters_by_status(
+            db_path, ("pending", "processing", "done", "flagged",
+                     "needs_human", "error"))
+        out = []
+        for row in sorted(rows, key=lambda r: r["idx"]):
+            notes_findings = main._parse_findings(row["notes"])
+            out.append({"idx": row["idx"], "title": row["title"],
+                       "status": row["status"],
+                       "unresolved_findings": findings.count_unresolved(notes_findings),
+                       "updated_at": row["updated_at"]})
+        return {"chapters": out}
+
+    @app.get("/api/chapter/{idx}")
+    def get_chapter_detail(idx: int):
+        import main
+        row = state.get_chapter(db_path, idx)
+        if row is None:
+            return JSONResponse({"error": "kapitola neexistuje"}, status_code=404)
+        history, err = _try_load_history(history_path)
+        if err:
+            return err
+        entries = history["entries"]
+        latest = polish_store.find_latest(entries, idx)
+        chain_start = polish_store.find_chain_start(entries, idx)
+        # `notes` je JEDINÝ zdroj "aktuálních" nálezů (viz `build_findings_
+        # report` docstring, Task 7) - `_commit_polish_result` zapisuje
+        # STEJNÝ seznam do notes i do historie zároveň, sloučení by
+        # zdvojilo každý nález.
+        notes_findings = [f for f in main._parse_findings(row["notes"])
+                          if not findings.is_marker(f)]
+        own_history = [e for e in entries if e["idx"] == idx]
+        return {
+            "idx": row["idx"], "title": row["title"], "raw_text": row["raw_text"],
+            "translated_text": row["translated_text"], "status": row["status"],
+            "findings": notes_findings,
+            "cz_before_original": chain_start["cz_before"] if chain_start else None,
+            "styled_by_codex_latest": (latest["styled_by_codex"]
+                                       if latest and latest["styled_by_codex"] else None),
+            "history": _annotate_history(db_path, entries, own_history),
+        }
 
     @app.get("/api/polish")
     def get_polish(idx: "int | None" = None):

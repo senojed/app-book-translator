@@ -1152,3 +1152,52 @@ def test_end_to_end_polish_then_apply_writes_edited_text(tmp_path, monkeypatch):
     hist = polish_store.load_history(history_path)["entries"]
     assert hist[0]["styled_by_codex"] == "Návrh od Codexu."
     assert hist[0]["cz_after"] == "Ručně upravený text."
+
+
+# --- Task 8: GET /api/chapters + GET /api/chapter/{idx} ---------------------
+
+def test_get_chapters_lists_all_with_unresolved_count(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=2)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET notes=? WHERE idx=1",
+                     (json.dumps([{"id": "f1", "resolved": False,
+                                  "source": "critic", "type": "fidelity"}]),))
+    client = TestClient(app)
+    body = client.get("/api/chapters").json()
+    by_idx = {c["idx"]: c for c in body["chapters"]}
+    assert by_idx[1]["unresolved_findings"] == 1
+    assert by_idx[2]["unresolved_findings"] == 0
+
+
+def test_get_chapter_detail_returns_current_text_and_findings(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    body = client.get("/api/chapter/1").json()
+    assert body["idx"] == 1
+    assert body["translated_text"] == "Věta 1."
+    assert body["cz_before_original"] is None    # žádná historie zatím
+    assert body["styled_by_codex_latest"] is None
+
+
+def test_get_chapter_detail_404_for_missing_chapter(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.get("/api/chapter/99")
+    assert r.status_code == 404
+
+
+def test_get_chapter_detail_includes_history_baselines(tmp_path):
+    app, db, draft_path, history_path, lock_path = _app(tmp_path, chapters=1)
+    polish_store.save_history(history_path, {
+        "schema_version": 1, "entries": [{
+            "idx": 1, "applied_at": polish_store.utc_now_z(),
+            "cz_before": "Věta 1.", "cz_after": "Lepší věta.",
+            "styled_by_codex": "Lepší věta.", "title": "K1", "findings": [],
+            "rendered_terms": [], "source": "polish-batch", "draft_id": "d1"}]})
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET translated_text=? WHERE idx=1",
+                     ("Lepší věta.",))
+    client = TestClient(app)
+    body = client.get("/api/chapter/1").json()
+    assert body["cz_before_original"] == "Věta 1."
+    assert body["styled_by_codex_latest"] == "Lepší věta."
