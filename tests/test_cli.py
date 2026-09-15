@@ -1369,12 +1369,10 @@ def test_polish_review_command_registered_and_mutating():
 
 def test_cmd_polish_review_calls_server_with_configured_paths(tmp_path, monkeypatch):
     seen = {}
-    def _fake_run(db_path, draft_path, history_path, lock_path, **kw):
-        seen.update(db_path=db_path, draft_path=draft_path,
-                    history_path=history_path, lock_path=lock_path)
+    def _fake_run(db_path, history_path, lock_path, **kw):
+        seen.update(db_path=db_path, history_path=history_path, lock_path=lock_path)
         return 0
     monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "s.sqlite3"))
-    monkeypatch.setattr(config, "POLISH_DRAFT_PATH", str(tmp_path / "d.json"))
     monkeypatch.setattr(config, "POLISH_HISTORY_PATH", str(tmp_path / "h.json"))
     monkeypatch.setattr(config, "LOCK_PATH", str(tmp_path / ".lock"))
     import src.review_ui.polish_server as ps_module
@@ -1382,7 +1380,6 @@ def test_cmd_polish_review_calls_server_with_configured_paths(tmp_path, monkeypa
     rc = main._cmd_polish_review(argparse.Namespace())
     assert rc == 0
     assert seen["db_path"] == config.DB_PATH
-    assert seen["draft_path"] == config.POLISH_DRAFT_PATH
     assert seen["history_path"] == config.POLISH_HISTORY_PATH
     assert seen["lock_path"] == config.LOCK_PATH
 
@@ -1390,14 +1387,13 @@ def test_cmd_polish_review_calls_server_with_configured_paths(tmp_path, monkeypa
 def test_cmd_polish_review_reports_startup_failure_instead_of_traceback(
         tmp_path, monkeypatch, capsys):
     """`build_app` (uvnitř `run_polish_review_server`) může vyhodit
-    `PolishStoreError` (poškozený draft/historie) nebo `OSError`/
-    `TimeoutError` (`_snapshot_db` selhání) - `_cmd_polish_review`
-    tohle musí chytit a vrátit čitelné `return 1`, ne nechat traceback
-    propadnout až do `main()`."""
-    def _fake_run(db_path, draft_path, history_path, lock_path, **kw):
+    `PolishStoreError` (poškozená historie) nebo `OSError`/`TimeoutError`
+    (`_snapshot_db` selhání) - `_cmd_polish_review` tohle musí chytit a
+    vrátit čitelné `return 1`, ne nechat traceback propadnout až do
+    `main()`."""
+    def _fake_run(db_path, history_path, lock_path, **kw):
         raise polish_store.PolishStoreError("corrupt")
     monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "s.sqlite3"))
-    monkeypatch.setattr(config, "POLISH_DRAFT_PATH", str(tmp_path / "d.json"))
     monkeypatch.setattr(config, "POLISH_HISTORY_PATH", str(tmp_path / "h.json"))
     monkeypatch.setattr(config, "LOCK_PATH", str(tmp_path / ".lock"))
     import src.review_ui.polish_server as ps_module

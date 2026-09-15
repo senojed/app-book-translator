@@ -989,21 +989,18 @@ def _cmd_review(args) -> int:
 def _cmd_polish_review(args) -> int:
     from src.review_ui import polish_server
     # `run_polish_review_server` volá `build_app` PŘED svým vlastním
-    # try/finally - poškozený `polish.draft.json`/`polish.history.json`
-    # (`PolishStoreError`) nebo selhání startovního `_snapshot_db`
-    # (`TimeoutError` u dlouho zamčené DB, `OSError` u neprošlého
-    # integrity_check) by jinak propadly jako nezachycený traceback až
-    # sem - `main()`'s `except state.LockError` tyhle výjimky nechytá.
-    # Stejný vzor jako `_cmd_polish`'s draft-preflight výš: čitelná
-    # hláška + `return 1`, ne holý traceback.
+    # try/finally - poškozená `polish.history.json` (`PolishStoreError`)
+    # nebo selhání startovního `_snapshot_db` (`TimeoutError` u dlouho
+    # zamčené DB, `OSError` u neprošlého integrity_check) by jinak
+    # propadly jako nezachycený traceback až sem - `main()`'s `except
+    # state.LockError` tyhle výjimky nechytá. Čitelná hláška + `return 1`,
+    # ne holý traceback.
     try:
         return polish_server.run_polish_review_server(
-            config.DB_PATH, config.POLISH_DRAFT_PATH, config.POLISH_HISTORY_PATH,
-            config.LOCK_PATH)
+            config.DB_PATH, config.POLISH_HISTORY_PATH, config.LOCK_PATH)
     except (polish_store.PolishStoreError, OSError, TimeoutError) as e:
         _say(f"polish-review se nepodařilo spustit ({type(e).__name__}: {e}) - "
-             f"zkontroluj {config.POLISH_DRAFT_PATH}, "
-             f"{config.POLISH_HISTORY_PATH} a DB ({config.DB_PATH}), "
+             f"zkontroluj {config.POLISH_HISTORY_PATH} a DB ({config.DB_PATH}), "
              "případně poškozený soubor oprav nebo smaž.")
         return 1
 

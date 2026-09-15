@@ -15,15 +15,9 @@ class PolishStoreError(Exception):
     pokoušet pokračovat s částečně přečteným obsahem (spec kolo 3)."""
 
 
-DRAFT_SCHEMA_VERSION = 1
 HISTORY_SCHEMA_VERSION = 1
 _VALID_HISTORY_SOURCES = ("polish-review", "polish-batch", "revert")
 
-_DRAFT_CHAPTER_FIELDS = {
-    "idx": int, "title": str, "cz_before": str, "styled": str,
-    "revision_rounds": int, "reason_types": list, "findings": list,
-    "rendered_terms": list, "draft_id": str,
-}
 _HISTORY_ENTRY_FIELDS = {
     "idx": int, "applied_at": str, "cz_before": str, "cz_after": str,
     "styled_by_codex": str, "title": str, "findings": list,
@@ -126,83 +120,10 @@ def _is_exact_schema_version(value, expected: int) -> bool:
     return type(value) is int and value == expected
 
 
-def _validate_draft_payload(path: str, data) -> None:
-    """Sdílená validace pro `load_draft` (po čtení ze souboru) i
-    `save_draft` (PŘED zápisem, kolo 1 plán-ping-pongu NIT - caller
-    nemá jak vyrobit soubor, co by vlastní `load_draft` odmítl)."""
-    if not isinstance(data, dict):
-        raise PolishStoreError(f"{path}: kořen musí být objekt.")
-    if not _is_exact_schema_version(data.get("schema_version"), DRAFT_SCHEMA_VERSION):
-        raise PolishStoreError(f"{path}: neznámý/chybějící schema_version.")
-    if not _is_utc_z(data.get("generated_at")):
-        raise PolishStoreError(f"{path}: generated_at musí být UTC s koncovým "
-                               "'Z' (kolo 5/8, kolo 1 plán-ping-pongu IMPORTANT - "
-                               "dřív se validoval jen typ str, ne přesný tvar).")
-    if not isinstance(data.get("codex_model"), str) or not data["codex_model"]:
-        raise PolishStoreError(f"{path}: codex_model musí být neprázdný string.")
-    chapters = data.get("chapters")
-    if not isinstance(chapters, list):
-        raise PolishStoreError(f"{path}: chapters musí být pole.")
-    seen_idx = set()
-    for ch in chapters:
-        _validate_record(ch, _DRAFT_CHAPTER_FIELDS, what=f"{path}: draft záznam")
-        # Neprázdný `draft_id` (kolo 11 plán-ping-pongu IMPORTANT - `_validate_
-        # record`'s obecná `str` typová kontrola by prázdný `""` propustila,
-        # což by rozbilo garantovanou identitu KONKRÉTNÍHO rozhodnutí, na
-        # které se kept-original idempotence (kolo 9/10) spoléhá - VŠECHNY
-        # prázdné `draft_id` by si navzájem "kolidovaly"). Přesný
-        # `uuid.uuid4().hex` tvar se NEVYŽADUJE - testovací fixture čitelně
-        # používají vlastní ID (`"draft-1"` apod.), jen identita/neprázdnost
-        # je garance, na které skutečně závisí korektnost.
-        if not ch["draft_id"]:
-            raise PolishStoreError(f"{path}: draft_id nesmí být prázdný.")
-        # Element-level typy (kolo 1 plán-ping-pongu IMPORTANT - dřív jen
-        # `isinstance(x, list)`, obsah prvků nekontrolovaný):
-        _validate_str_list(ch["reason_types"], "reason_types", f"{path}: draft záznam")
-        _validate_dict_list(ch["findings"], "findings", f"{path}: draft záznam")
-        _validate_dict_list(ch["rendered_terms"], "rendered_terms", f"{path}: draft záznam")
-        if ch["idx"] in seen_idx:
-            raise PolishStoreError(f"{path}: duplicitní idx {ch['idx']}.")
-        seen_idx.add(ch["idx"])
-
-
-def load_draft(path: str) -> dict:
-    """Chybějící soubor = žádný draft (validní prázdný obal) - existující
-    soubor se VŽDY plně validuje, poškozený/cizí obsah nikdy neprojde
-    tiše (spec kolo 3)."""
-    if not os.path.exists(path):
-        # `generated_at`/`codex_model` musí projít VLASTNÍ validací
-        # (kolo plán-ping-pongu review nález IMPORTANT) - `""` u obou
-        # by `save_draft` rovnou odmítlo (`_is_utc_z("")` je `False`,
-        # `codex_model` musí být neprázdný string), takže `post_discard`
-        # na serveru startovaném BEZ draft souboru vůbec by po zavolání
-        # `save_draft` (jen aby se prázdný seznam kapitol zapsal) dostal
-        # matoucí 500 pro kapitolu, co nikdy nebyla ve frontě.
-        return {"schema_version": DRAFT_SCHEMA_VERSION, "generated_at": utc_now_z(),
-                "codex_model": "none", "chapters": []}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError) as e:
-        raise PolishStoreError(f"{path}: neplatný JSON ({e}).") from e
-    _validate_draft_payload(path, data)
-    return data
-
-
-def save_draft(path: str, data: dict) -> None:
-    """Validuje STEJNÝMI pravidly jako `load_draft` PŘED zápisem (kolo 1
-    plán-ping-pongu NIT)."""
-    _validate_draft_payload(path, data)
-    _atomic_write_json(path, data)
-
-
-def is_draft_pending(path: str) -> bool:
-    return bool(load_draft(path)["chapters"])
-
-
 def _validate_history_payload(path: str, data) -> None:
-    """Sdílená validace pro `load_history` i `save_history` - stejný
-    princip jako `_validate_draft_payload` (kolo 1 plán-ping-pongu NIT)."""
+    """Sdílená validace pro `load_history` i `save_history` (kolo 1
+    plán-ping-pongu NIT - caller nemá jak vyrobit soubor, co by vlastní
+    `load_history` odmítl)."""
     if not isinstance(data, dict):
         raise PolishStoreError(f"{path}: kořen musí být objekt.")
     if not _is_exact_schema_version(data.get("schema_version"), HISTORY_SCHEMA_VERSION):
@@ -212,16 +133,14 @@ def _validate_history_payload(path: str, data) -> None:
         raise PolishStoreError(f"{path}: entries musí být pole.")
     for e in entries:
         _validate_record(e, _HISTORY_ENTRY_FIELDS, what=f"{path}: historický záznam")
-        # Neprázdný `draft_id` (kolo 15 plán-ping-pongu IMPORTANT, stejný
-        # princip jako draftové `draft_id` - kolo 11) - `_stale_info`
-        # matchuje `already_committed_has_history` PODLE TOHOTO pole,
-        # aby se vyhnula stejné třídě kolize jako kolo 10 (nesouvisející
-        # starší záznam se STEJNÝM textem by jinak falešně "vysvětlil"
-        # DB stav pro CIZÍ draft).
+        # Neprázdný `draft_id` (kolo 15 plán-ping-pongu IMPORTANT) -
+        # `_annotate_history` (polish_server.py) matchuje
+        # `already_committed_has_history` PODLE TOHOTO pole, aby se
+        # vyhnula kolizi s nesouvisejícím starším záznamem se STEJNÝM
+        # výsledným textem.
         if not e["draft_id"]:
             raise PolishStoreError(f"{path}: draft_id nesmí být prázdný.")
-        # Element-level typy (kolo 1 plán-ping-pongu IMPORTANT, stejná
-        # mezera jako u draftu - viz `_validate_draft_payload`):
+        # Element-level typy (kolo 1 plán-ping-pongu IMPORTANT):
         _validate_dict_list(e["findings"], "findings", f"{path}: historický záznam")
         _validate_dict_list(e["rendered_terms"], "rendered_terms", f"{path}: historický záznam")
         if e["source"] not in _VALID_HISTORY_SOURCES:
