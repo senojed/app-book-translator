@@ -341,18 +341,6 @@ def test_already_styled_false_for_revert_marker():
     assert main._already_styled(notes) is False
 
 
-def test_already_styled_false_for_kept_original_marker():
-    notes = json.dumps([main._kept_original_marker("cz", "m", "draft-1")])
-    assert main._already_styled(notes) is False
-
-
-def test_kept_original_marker_shape():
-    m = main._kept_original_marker("text", "model-x", "draft-42")
-    assert m["source"] == "stylist" and m["type"] == "kept_original"
-    assert "model-x" in m["issue"]
-    assert m["draft_id"] == "draft-42"
-
-
 def test_revert_marker_carries_note_as_issue():
     m = main._revert_marker("vráceno na verzi před poslední stylizací")
     assert m["source"] == "stylist" and m["type"] == "revert"
@@ -861,8 +849,8 @@ def test_polish_one_chapter_returns_draft_dict_with_reason_types_when_rejected(t
 
 def test_polish_one_chapter_prints_critic_minor_findings_as_context(tmp_path, monkeypatch, capsys):
     # Kontextový výpis kritikových minor nálezů je pořád součástí "plného"
-    # konzolového detailu (`full`), stejně jako dřív - jen `polish.draft.json`
-    # je VŽDY plný (spec design.md:1113-1123), konzole zůstává gatovaná.
+    # konzolového detailu (`full`), stejně jako dřív - jen vrácený `rec`
+    # dict je VŽDY plný, konzole zůstává gatovaná.
     from src.llm.client import Completion, FakeLLMClient
     db = _polish_db(tmp_path)
     monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: "Jina uplne jina veta.")
@@ -899,8 +887,8 @@ def test_polish_one_chapter_rejected_full_detail_when_opted_in(tmp_path, monkeyp
 @pytest.mark.parametrize("flag", [False, 1, "False", None])
 def test_polish_one_chapter_rejected_detail_gated_console_only(tmp_path, monkeypatch, flag):
     """`STYLIST_REPORT_REJECTED_TEXT` teď gatuje jen KONZOLOVÝ výpis nálezů
-    (draft dict, co jde do `polish.draft.json`, je VŽDY plný - spec
-    Bezpečnost). Jen literál `True` odemkne detail na konzoli."""
+    (vrácený `rec` dict je VŽDY plný). Jen literál `True` odemkne detail
+    na konzoli."""
     db = _polish_db(tmp_path)
     monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Jiná věta se SECRET123.")
     monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])

@@ -116,10 +116,9 @@ def _parse_findings(notes_json: str | None) -> list:
 def _already_styled(notes_json: str | None) -> bool:
     """`type` je `"polish"` (skutečně přestylizováno) NEBO `"unchanged"`
     (kolo 9 - Codex zkontroloval, nic neměnil, ale marker pořád znamená
-    "už řešeno, nezkoušej znovu bez --force"). Revert marker a
-    "kept_original" marker mají STEJNÝ source, ale JINÝ type, aby po
-    revertu / potvrzení originálu bylo možné `polish` znovu nabídnout
-    bez `--force`."""
+    "už řešeno, nezkoušej znovu bez --force"). Revert marker má STEJNÝ
+    source, ale JINÝ type, aby po revertu bylo možné `polish` znovu
+    nabídnout bez `--force`."""
     return any(f.get("source") == "stylist" and f.get("type") in ("polish", "unchanged")
               for f in _parse_findings(notes_json))
 
@@ -137,24 +136,6 @@ def _stylist_marker(cz_before: str, model: str) -> dict:
             "issue": f"stylizováno přes Codex (model={model}), "
                     f"délka {len(cz_before)} znaků, hash "
                     f"{hashlib.sha256(cz_before.encode('utf-8')).hexdigest()}.",
-            "suggestion": None}
-
-
-def _kept_original_marker(text: str, model: str, draft_id: str) -> dict:
-    """Apply BEZ věcné změny (text == cz_before) - kolo 7: `type` musí
-    LIŠIT od `_stylist_marker`, jinak by `_already_styled` nepravdivě
-    tvrdilo, že kapitola byla stylizována, i když zůstala nezměněná.
-    `draft_id` je VLASTNÍ pole, NE součást `issue` textu (kolo 10
-    plán-ping-pongu BLOCKING) - `_stale_info`/`post_apply`'s idempotence
-    (kolo 6/9) musí porovnávat KONKRÉTNÍ draft, ne hash obsahu textu,
-    protože STEJNÝ `cz_before` se může legitimně opakovat napříč VÍCE
-    nezávislými `polish` běhy na kapitole, co zůstává nestylizovaná."""
-    return {"source": "stylist", "type": "kept_original", "severity": "info",
-            "action": "note", "term_id": None, "expected": None,
-            "actual": None, "cz_excerpt": None, "draft_id": draft_id,
-            "issue": f"potvrzeno ponechání originálu přes polish-review "
-                    f"(model={model}), délka {len(text)} znaků, hash "
-                    f"{hashlib.sha256(text.encode('utf-8')).hexdigest()}.",
             "suggestion": None}
 
 
@@ -625,15 +606,16 @@ def _preferred_rendered_terms(db: str, idx: int, current_text: str,
 
 def _polish_one_chapter(c, glossary_rows, cf, db, model: str,
                         codex_cmd: list, rendered_terms: "list | None" = None) -> dict:
-    """Vrací JEDEN záznam za kapitolu - NEcommituje nic do DB (spec
-    2026-09-11-polish-review-design.md - `_cmd_polish`/`polish-review`
-    apply endpoint dělají commit/zálohu teď, ne tahle funkce). Tvary:
+    """Vrací JEDEN záznam za kapitolu - NEcommituje nic do DB (`_cmd_polish`
+    Task 5 a server's `POST /api/polish/regenerate` Task 10 dělají
+    commit/zálohu SAMY, přímo do `chapters`/`polish.history.json`, žádná
+    draft fronta neexistuje). Tvary:
       - `{"idx", "outcome": "unchanged"}` / `{"idx", "outcome": "failed", "error"}`
         - beze změny oproti dřívějšku.
-      - draft dict BEZ klíče `"outcome"` (`idx`, `title`, `cz_before`,
+      - výsledek dict BEZ klíče `"outcome"` (`idx`, `title`, `cz_before`,
         `styled`, `revision_rounds`, `reason_types`, `findings`,
-        `rendered_terms`, `draft_id`) - volající (`_cmd_polish`) ho pozná podle
-        CHYBĚJÍCÍHO `"outcome"` a zapíše do `polish.draft.json`.
+        `rendered_terms`, `draft_id`) - volající ho pozná podle
+        CHYBĚJÍCÍHO `"outcome"` a zapíše přímo (`_commit_polish_result`).
         `reason_types` je JEN kontext pro člověka (prázdné = nic
         nenamítáno, neprázdné = kritik/konkordance/meaning-check něco
         našly) - nikdy negate ROZHODNUTÍ, to dělá teď `polish-review`.

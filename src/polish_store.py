@@ -1,7 +1,7 @@
 """JSON perzistence pro `polish` review workflow - drží schéma, validaci a
-atomický zápis `data/polish.draft.json` a `data/polish.history.json`.
-Izolováno od `main.py`/`polish_server.py` - obojí přes tenhle modul, nikdy
-přímo `open()`/`json.load` na tyhle dva soubory (spec kolo 1, 3, 13)."""
+atomický zápis `data/polish.history.json`. Izolováno od `main.py`/
+`polish_server.py` - obojí přes tenhle modul, nikdy přímo `open()`/
+`json.load` na tenhle soubor."""
 import datetime as _dt
 import json
 import os

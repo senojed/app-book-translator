@@ -1,5 +1,11 @@
 # Ruční review stylistického průchodu - design
 
+> **Nahrazeno** `docs/superpowers/specs/2026-09-14-batch-polish-reader-workflow-design.md`
+> (2026-09-14) - draft fronta popsaná tímhle dokumentem byla odstraněna,
+> `polish` teď zapisuje rovnou. Zámkový/CAS/atomický-zápis aparát popsaný
+> níž ZŮSTÁVÁ v platnosti beze změny, jen se přestal používat pro
+> draft-specifické endpointy (`apply`/`discard`/draft preflight).
+
 ## Kontext a cíl
 
 `polish` (viz `docs/superpowers/specs/2026-09-08-stylist-agent-design.md`,

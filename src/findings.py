@@ -86,9 +86,11 @@ def set_resolved(findings: list, finding_id: str, resolved: bool) -> bool:
 
 
 def is_marker(finding: dict) -> bool:
-    """Audit marker (`main._stylist_marker`/`_kept_original_marker`/
-    `_revert_marker`/`_unchanged_marker`) NENÍ nález k vyřešení - je to jen záznam "kdy/jak
-    se text změnil", uživatel ho nemá zaškrtávat.
+    """Audit marker (`main._stylist_marker`/`_revert_marker`/
+    `_unchanged_marker`, a historický `"kept_original"` typ ze staré,
+    už odstraněné draft-fronty - viz `_MARKER_TYPES`) NENÍ nález k
+    vyřešení - je to jen záznam "kdy/jak se text změnil", uživatel ho
+    nemá zaškrtávat.
 
     Obranné `isinstance` (kolo 4 IMPORTANT) - `source`/`type` u nálezů z
     `_run_critic`/`concordance` nejsou nikde vynuceně `str` (jen `Task 9`
