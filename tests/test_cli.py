@@ -677,6 +677,66 @@ def _c():
             "translated_text": "Původní věta.", "revision_rounds": 0, "notes": None}
 
 
+def test_rendered_terms_for_chapter_reads_rendered_source_mentions(tmp_path):
+    db = _polish_db(tmp_path)
+    with state.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO glossary (term_id,canonical_en,cz) VALUES ('term_x','X','Ix')")
+        conn.execute(
+            "INSERT INTO term_mentions (term_id,cz_form,chapter_idx,scene_idx,source) "
+            "VALUES ('term_x','Ix',1,NULL,'rendered')")
+        conn.execute(
+            "INSERT INTO term_mentions (term_id,cz_form,chapter_idx,scene_idx,source) "
+            "VALUES ('term_x','Ix',1,NULL,'detected')")
+    out = main._rendered_terms_for_chapter(db, 1)
+    assert out == [{"term_id": "term_x", "cz_as_used": "Ix", "scene_idx": None}]
+
+
+def test_polish_one_chapter_uses_passed_rendered_terms_not_live_db(tmp_path, monkeypatch):
+    db = _polish_db(tmp_path)
+    monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Vylepšená věta.")
+    monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
+    monkeypatch.setattr(main.pipeline, "_run_critic", lambda *a, **k: ([], False))
+    monkeypatch.setattr(main.stylist, "check_meaning_preserved", lambda *a, **k: [])
+    passed = [{"term_id": "t/a", "cz_as_used": "Á", "scene_idx": 0}]
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", ["codex"],
+                                   rendered_terms=passed)
+    assert rec["rendered_terms"] == passed   # ne živě odvozené (fixture nemá term_mentions)
+
+
+def test_polish_one_chapter_uses_passed_empty_list_not_live_db(tmp_path, monkeypatch):
+    """`rendered_terms=[]` MUSÍ zůstat `[]` (explicitní "žádné termíny"),
+    ne spadnout na živé odvození jen proto, že je to falsy hodnota."""
+    db = _polish_db(tmp_path)
+    with state.connect(db) as conn:
+        conn.execute("INSERT INTO glossary (term_id,canonical_en,cz) VALUES ('t/a','A','Á')")
+    state.replace_term_mentions(db, 1, [
+        {"term_id": "t/a", "cz_form": "Á", "scene_idx": 0, "source": "rendered"}])
+    monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Vylepšená věta.")
+    monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
+    monkeypatch.setattr(main.pipeline, "_run_critic", lambda *a, **k: ([], False))
+    monkeypatch.setattr(main.stylist, "check_meaning_preserved", lambda *a, **k: [])
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", ["codex"], rendered_terms=[])
+    assert rec["rendered_terms"] == []   # NE [{"term_id": "t/a", ...}] z živé DB
+
+
+def test_preferred_rendered_terms_uses_history_when_in_sync(tmp_path):
+    db = _polish_db(tmp_path)
+    entries = [{"idx": 1, "cz_after": "Původní věta.",
+               "rendered_terms": [{"term_id": "t/a", "cz_as_used": "Á", "scene_idx": 0}]}]
+    out = main._preferred_rendered_terms(db, 1, "Původní věta.", entries)
+    assert out == [{"term_id": "t/a", "cz_as_used": "Á", "scene_idx": 0}]
+
+
+def test_preferred_rendered_terms_falls_back_to_live_when_history_stale(tmp_path):
+    db = _polish_db(tmp_path)
+    entries = [{"idx": 1, "cz_after": "Stará verze (před novým run).",
+               "rendered_terms": [{"term_id": "t/stale", "cz_as_used": "X", "scene_idx": 0}]}]
+    # `current_text` NESEDÍ s historií - text mezitím prošel novým `run`
+    out = main._preferred_rendered_terms(db, 1, "Původní věta.", entries)
+    assert out == []   # živá DB (žádné term_mentions ve fixture), NE stará historie
+
+
 def _cf_stub(agent):
     return object()
 

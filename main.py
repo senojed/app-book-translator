@@ -559,8 +559,39 @@ def _write_polish_report(db: str, rid: int, report: list, *, codex_model: str,
                 pass
 
 
+def _rendered_terms_for_chapter(db: str, idx: int) -> list:
+    """Translatorem HLÁŠENÉ (ne jen detekované) formy termínů pro danou
+    kapitolu - vstup pro `concordance.build_mentions`/`check_chapter`,
+    sdíleno `_polish_one_chapter` (dávka) i editor "Uložit" endpointem
+    (Task 9, kapitola bez živého draftu potřebuje stejnou hodnotu)."""
+    prior = state.chapter_mentions(db, idx)
+    return [{"term_id": m["term_id"], "cz_as_used": m["cz_form"],
+            "scene_idx": m["scene_idx"]}
+           for m in prior
+           if m.get("cz_form") and m.get("source") == "rendered"]
+
+
+def _preferred_rendered_terms(db: str, idx: int, current_text: str,
+                              history_entries: list) -> list:
+    """Historie MÁ přednost před živou `term_mentions` (ta se PŘEPISUJE
+    při každém `commit_chapter_result` na základě `concordance.build_
+    mentions`, co může být UŽŠÍ množina, než co translator PŮVODNĚ
+    nahlásil při `run`u - opakované úpravy by jinak postupně "zapomínaly"
+    původně nahlášené tvary) - ALE JEN pokud poslední historie záznam
+    popisuje PRÁVĚ `current_text` (`cz_after == current_text`). Jinak
+    (žádná historie, nebo text mezitím prošel `run`/`answer` mimo
+    polish/editor) je živá DB jediný platný zdroj - stará historie by
+    patřila jiné verzi textu. `polish_store` už je importovaný na úrovni
+    modulu (main.py's existující `from src import ..., polish_store,
+    ...`), žádný nový import netřeba."""
+    latest = polish_store.find_latest(history_entries, idx)
+    if latest is not None and latest["cz_after"] == current_text:
+        return latest["rendered_terms"]
+    return _rendered_terms_for_chapter(db, idx)
+
+
 def _polish_one_chapter(c, glossary_rows, cf, db, model: str,
-                        codex_cmd: list) -> dict:
+                        codex_cmd: list, rendered_terms: "list | None" = None) -> dict:
     """Vrací JEDEN záznam za kapitolu - NEcommituje nic do DB (spec
     2026-09-11-polish-review-design.md - `_cmd_polish`/`polish-review`
     apply endpoint dělají commit/zálohu teď, ne tahle funkce). Tvary:
@@ -591,11 +622,8 @@ def _polish_one_chapter(c, glossary_rows, cf, db, model: str,
         _say(f"Kapitola {idx}: beze změny (Codex nenavrhl žádnou úpravu).")
         return {"idx": idx, "outcome": "unchanged"}
 
-    prior = state.chapter_mentions(db, idx)
-    rendered_terms = [{"term_id": m["term_id"], "cz_as_used": m["cz_form"],
-                       "scene_idx": m["scene_idx"]}
-                      for m in prior
-                      if m.get("cz_form") and m.get("source") == "rendered"]
+    if rendered_terms is None:
+        rendered_terms = _rendered_terms_for_chapter(db, idx)
 
     baseline_concordance = concordance.check_chapter(en, cz, glossary_rows, rendered_terms)
     findings = concordance.check_chapter(en, styled, glossary_rows, rendered_terms)
