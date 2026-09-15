@@ -257,12 +257,29 @@ def _pid_alive(pid: int) -> bool:
     if os.name == "nt":
         import ctypes
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
-        if handle:
-            ctypes.windll.kernel32.CloseHandle(handle)
-            return True
-        return False
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return False
+        try:
+            # `OpenProcess` samo o sobě NESTAČÍ - handle jde otevřít i na
+            # PID, co už skončil (objekt procesu ve Windows chvíli přežívá
+            # po ukončení, obzvlášť dokud na něj někdo jiný drží handle).
+            # Ověřeno reálně: zabitý `polish-review` server (killnutý
+            # `taskkill /F`) měl `OpenProcess` úspěšný ještě chvíli po
+            # smrti, `_lock_is_live` ho tak brala jako živý a `polish`
+            # se odmítal spustit "Běží jiný příkaz", i když zámek byl
+            # dávno mrtvý. Bez `GetExitCodeProcess` kontroly je tenhle
+            # check nespolehlivý.
+            exit_code = ctypes.c_ulong(0)
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True

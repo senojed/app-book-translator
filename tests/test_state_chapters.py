@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from src import state
 from src.state import LockError
@@ -65,6 +67,20 @@ def test_unparseable_lock_is_treated_as_stale(tmp_path):
     lp = str(tmp_path / ".lock")
     open(lp, "w").write("{tohle neni json")
     state.acquire_lock(lp)  # nesmí spadnout na parseru
+
+
+@pytest.mark.skipif(os.name != "nt", reason="test cílí na Windows _pid_alive větev")
+def test_pid_alive_false_for_exited_process_with_handle_still_open(tmp_path):
+    """`OpenProcess` může uspět i na PID, co už skončil - Windows drží
+    objekt procesu chvíli po smrti, obzvlášť dokud na něj někdo drží
+    handle (přesně tenhle test to dělá přes `Popen`, co handle nezavírá
+    sám od sebe po `wait()`). Bez `GetExitCodeProcess` kontroly by
+    `_pid_alive` tenhle mrtvý proces vyhodnotil jako živý."""
+    import subprocess
+    import sys
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    assert state._pid_alive(p.pid) is False
 
 
 def test_chapter_mentions_returns_only_that_chapter_in_insert_order(tmp_path):
