@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 from src import concordance, glossary
 from src import guide as guide_mod
+from src import findings as findings_mod
 from src import ingest, pipeline, polish_store, requeue, state
 from src import reference as reference_mod
 from src import reference_mine, textnorm
@@ -451,7 +452,7 @@ def _backup_db_once(db: str, backup_state: dict) -> None:
 _REPORT_SCHEMA_VERSION = 1
 
 
-_REPORT_OUTCOMES = ("drafted", "unchanged", "failed", "fatal", "interrupted")
+_REPORT_OUTCOMES = ("applied", "unchanged", "failed", "fatal", "interrupted")
 
 
 def _write_polish_report(db: str, rid: int, report: list, *, codex_model: str,
@@ -626,8 +627,7 @@ def _polish_one_chapter(c, glossary_rows, cf, db, model: str,
     reason_types = sorted({f"{r.get('source', '?')}/{r.get('type', '?')}"
                            for r in reasons}) if reasons else []
     if reasons:
-        _say(f"Kapitola {idx}: kontrola má výhrady ({', '.join(reason_types)}) "
-             "- půjde k ručnímu review.")
+        _say(f"Kapitola {idx}: kontrola má výhrady ({', '.join(reason_types)}).")
         full = config.STYLIST_REPORT_REJECTED_TEXT is True
         if full:
             for r in reasons:
@@ -642,7 +642,7 @@ def _polish_one_chapter(c, glossary_rows, cf, db, model: str,
                     _say(f"      - [{f.get('severity', '?')}] "
                          f"{f.get('issue') or '(bez popisu)'}")
     else:
-        _say(f"Kapitola {idx}: návrh připraven, žádné výhrady - půjde k ručnímu review.")
+        _say(f"Kapitola {idx}: návrh připraven, žádné výhrady.")
 
     # `draft_id` identifikuje TOHLE KONKRÉTNÍ rozhodnutí, NIKDY se
     # neodvozuje z obsahu textu (kolo 10 plán-ping-pongu BLOCKING - dřív
@@ -651,6 +651,7 @@ def _polish_one_chapter(c, glossary_rows, cf, db, model: str,
     # může mít STEJNÝ `cz_before` napříč VÍCE nezávislými `polish` běhy -
     # starý `kept_original` marker by pak falešně označil ÚPLNĚ NOVÝ,
     # nevyřízený draft jako už vyřízený).
+    findings = findings_mod.assign_ids(findings)
     return {"idx": idx, "title": c["title"], "cz_before": cz, "styled": styled,
             "revision_rounds": c["revision_rounds"], "reason_types": reason_types,
             "findings": findings, "rendered_terms": rendered_terms,
@@ -1220,7 +1221,7 @@ def _cmd_polish(args) -> int:
                             "- infrastrukturní chyba, celý běh `polish` se "
                             "zastavuje.") from e
                     full = config.STYLIST_REPORT_REJECTED_TEXT is True
-                    report_rec = {"idx": rec["idx"], "outcome": "drafted",
+                    report_rec = {"idx": rec["idx"], "outcome": "applied",
                                  "reason_types": rec["reason_types"]}
                     if full:
                         report_rec["findings"] = rec["findings"]
@@ -1231,7 +1232,7 @@ def _cmd_polish(args) -> int:
 
         tally = {k: sum(1 for rec in report if rec.get("outcome") == k)
                  for k in _REPORT_OUTCOMES}
-        _say(f"Navrženo k review: {tally['drafted']}, beze změny: "
+        _say(f"Navrženo k review: {tally['applied']}, beze změny: "
              f"{tally['unchanged']}, selhalo: {tally['failed']}")
         _print_usage(db, rid)
         if tally["failed"] == len(chapters) and tally["failed"] > 0:

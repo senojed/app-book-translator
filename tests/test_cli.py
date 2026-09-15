@@ -622,7 +622,7 @@ def _read_only_report(dirpath):
 
 def test_write_polish_report_shape(tmp_path):
     db = str(tmp_path / "state.sqlite3"); state.init_db(db)
-    report = [{"idx": 1, "outcome": "drafted", "reason_types": []},
+    report = [{"idx": 1, "outcome": "applied", "reason_types": []},
               {"idx": 2, "outcome": "unchanged"},
               {"idx": 3, "outcome": "failed", "error": "boom"}]
     main._write_polish_report(db, 7, report, codex_model="gpt-5-codex",
@@ -633,7 +633,7 @@ def test_write_polish_report_shape(tmp_path):
     assert r["planned_count"] == 4 and r["attempted_count"] == 3
     assert r["batch_completed"] is True and r["run_status"] == "ok"
     assert r["run_error"] is None and r["finalization_error"] is None
-    assert r["summary"] == {"drafted": 1, "unchanged": 1,
+    assert r["summary"] == {"applied": 1, "unchanged": 1,
                             "failed": 1, "fatal": 0, "interrupted": 0}
     assert r["generated_at"]
 
@@ -713,6 +713,17 @@ def test_polish_one_chapter_returns_draft_dict_when_no_reasons(tmp_path, monkeyp
     # NIC se nezapsalo do DB - to teď dělá jen `polish-review` apply endpoint
     assert state.get_chapter(db, 1)["translated_text"] == "Původní věta."
     assert not os.path.exists(db + ".pre-polish-backup")
+
+
+def test_polish_one_chapter_findings_have_ids(tmp_path, monkeypatch):
+    db = _polish_db(tmp_path)
+    monkeypatch.setattr(main.stylist, "polish", lambda *a, **k: "Jina uplne jina veta.")
+    monkeypatch.setattr(main.concordance, "check_chapter", lambda *a, **k: [])
+    monkeypatch.setattr(main.concordance, "build_mentions", lambda *a, **k: [])
+    monkeypatch.setattr(main.pipeline, "_run_critic", lambda *a, **k: ([], False))
+    monkeypatch.setattr(main.stylist, "check_meaning_preserved", lambda *a, **k: [])
+    rec = main._polish_one_chapter(_c(), [], _cf_stub, db, "m", ["codex"])
+    assert all("id" in f and "resolved" in f for f in rec["findings"])
 
 
 def test_polish_one_chapter_returns_draft_dict_with_reason_types_when_rejected(tmp_path, monkeypatch):
@@ -986,7 +997,7 @@ def test_cmd_polish_happy_path_writes_draft_not_db_and_reports(tmp_path, monkeyp
     r = _report(db)
     assert r["run_status"] == "ok" and r["batch_completed"] is True
     assert r["planned_count"] == 2 and r["attempted_count"] == 2
-    assert r["summary"]["drafted"] == 2
+    assert r["summary"]["applied"] == 2
     with state.connect(db) as conn:
         assert conn.execute("SELECT status FROM runs").fetchone()["status"] == "ok"
 
@@ -1037,7 +1048,7 @@ def test_cmd_polish_report_survives_broken_stdout(tmp_path, monkeypatch):
                         lambda *a, **k: (_ for _ in ()).throw(BrokenPipeError()))
     assert main._cmd_polish(_Args()) == 0
     r = _report(db)
-    assert r["summary"]["drafted"] == 1
+    assert r["summary"]["applied"] == 1
 
 
 def test_cmd_polish_keyboardinterrupt_during_chapter(tmp_path, monkeypatch):
@@ -1075,7 +1086,7 @@ def test_cmd_polish_generic_exception_is_failed_batch_continues(tmp_path, monkey
     r = _report(db)
     assert r["run_status"] == "ok" and r["batch_completed"] is True
     outcomes = {c["idx"]: c["outcome"] for c in r["chapters"]}
-    assert outcomes == {1: "drafted", 2: "failed", 3: "drafted"}
+    assert outcomes == {1: "applied", 2: "failed", 3: "applied"}
     assert "SECRET-boom" not in json.dumps(r) and "SECRET-boom" not in out
 
 
@@ -1119,7 +1130,7 @@ def test_cmd_polish_critic_fatalrunerror_stops_whole_batch(tmp_path, monkeypatch
     r = _report(db)
     assert r["run_status"] == "fatal" and r["batch_completed"] is False
     assert r["attempted_count"] == 2
-    assert [c["outcome"] for c in r["chapters"]] == ["drafted", "fatal"]
+    assert [c["outcome"] for c in r["chapters"]] == ["applied", "fatal"]
 
 
 def test_cmd_polish_report_records_every_iteration(tmp_path, monkeypatch):
@@ -1139,7 +1150,7 @@ def test_cmd_polish_report_records_every_iteration(tmp_path, monkeypatch):
     r = _report(db)
     assert [c["idx"] for c in r["chapters"]] == [1, 2, 3, 4]
     assert r["attempted_count"] == 4
-    assert r["summary"] == {"drafted": 2, "unchanged": 1, "failed": 1,
+    assert r["summary"] == {"applied": 2, "unchanged": 1, "failed": 1,
                             "fatal": 0, "interrupted": 0}
 
 
