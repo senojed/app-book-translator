@@ -178,6 +178,9 @@ def process_chapter(db_path: str, chapter: dict, *, client_factory, guide: dict)
     else:
         status = "done"
 
+    from src import findings as findings_mod
+    findings = findings_mod.assign_ids(findings)
+
     result = state.commit_chapter_result(
         db_path, idx, translated_text=cz, revision_rounds=rounds,
         notes_json=json.dumps(findings, ensure_ascii=False), status=status,

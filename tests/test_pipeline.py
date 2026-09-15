@@ -28,6 +28,25 @@ def test_clean_chapter_reaches_done(tmp_path, monkeypatch):
     assert state.get_chapter(db, 1)["translated_text"] == "Harry potkal Boba."
 
 
+def test_process_chapter_notes_have_finding_ids(tmp_path, monkeypatch):
+    db = _db(tmp_path)
+    monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
+        "špatný překlad", [], [], []))
+    monkeypatch.setattr(T, "revise_chapter", lambda *a, **k: T.TranslationResult(
+        "pořád špatný", [], [], []))
+    always_bad = [{"source": "critic", "type": "fidelity", "severity": "critical",
+                   "action": "revise", "term_id": None, "expected": None,
+                   "actual": None, "cz_excerpt": "x", "issue": "chyba", "suggestion": "y"}]
+    monkeypatch.setattr(C, "review", lambda *a, **k: always_bad)
+    ch = state.get_chapter(db, 1)
+    pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+        "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    row = state.get_chapter(db, 1)
+    saved = json.loads(row["notes"])
+    assert saved   # nálezy skutečně vznikly
+    assert all("id" in f and "resolved" in f for f in saved)
+
+
 def test_critical_finding_triggers_revision_then_flags_after_max(tmp_path, monkeypatch):
     db = _db(tmp_path)
     monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
