@@ -36,11 +36,20 @@ FS-risk varování jako `polish`).
   použít `CodexLLMClient.billed_model`, NE tenhle caller-supplied `model`
   (kolo 1 BLOCKING, plan-consensus) - jinak Task 1's `$0.0` ceny se
   nikdy nepoužijí a audit log lže o tom, jaký model běžel.
-- `StylistError` ze `_exec_codex` zůstává per-kapitolová chyba
-  (`_cmd_run`'s `except Exception: status="error"`), NENÍ `FatalRunError`
-  - stejný precedent jako `_polish_one_chapter`'s zpracování stejné
-  třídy chyby z `stylist.polish()`. Vědomé rozhodnutí (kolo 1 IMPORTANT,
-  plan-consensus - zdůvodnění v Tasku 2), ne mezera.
+- `StylistError` ze `_exec_codex` se v `CodexLLMClient.complete()`
+  přebaluje na `FatalRunError` - CELÝ `run` se zastaví hned při první
+  selhávající Codex exekuci (kolo 2 BLOCKING, plan-consensus - `state.
+  queue_for_run` automaticky ZNOVU zkouší `error` kapitoly PŘI KAŽDÉM
+  příštím `run`u, na rozdíl od `flagged`/`needs_human`, co čekají na
+  člověka; bez týhle opravy by rozbitý Codex CLI/auth potichu opakovaně
+  selhávalo přes libovolně mnoho budoucích běhů, ne jen jednou).
+- ŽÁDNÝ proaktivní limit velikosti promptu pro Codex-translator (na
+  rozdíl od `polish`'s `STYLIST_MAX_CHARS`) - zvažováno a ZAMÍTNUTO
+  (kolo 2 IMPORTANT, plan-consensus - viz Task 2 "Známý limit"):
+  deterministický guard by SPOLEHLIVĚ zahazoval hotový scénový překlad
+  při selhání revizní fáze delší kapitoly (`pipeline.process_chapter`'s
+  revizní smyčka nemá checkpoint PŘED revizí). `CODEX_TRANSLATE_
+  TIMEOUT_SECONDS` je jediná (méně přesná, ale bezpečnější) pojistka.
 
 ---
 
@@ -51,7 +60,6 @@ FS-risk varování jako `polish`).
 
 **Interfaces:**
 - Produces: `config.CODEX_TRANSLATE_TIMEOUT_SECONDS` (int),
-  `config.CODEX_TRANSLATE_MAX_CHARS` (int),
   `config.PRICE_IN_PER_MTOK[config.CODEX_MODEL] == 0.0`,
   `config.PRICE_OUT_PER_MTOK[config.CODEX_MODEL] == 0.0`.
 
@@ -66,11 +74,6 @@ def test_codex_model_has_zero_price_entries():
 def test_codex_translate_timeout_seconds_is_positive_int():
     assert isinstance(config_module.CODEX_TRANSLATE_TIMEOUT_SECONDS, int)
     assert config_module.CODEX_TRANSLATE_TIMEOUT_SECONDS > 0
-
-
-def test_codex_translate_max_chars_is_positive_int():
-    assert isinstance(config_module.CODEX_TRANSLATE_MAX_CHARS, int)
-    assert config_module.CODEX_TRANSLATE_MAX_CHARS > 0
 ```
 
 Přidej do `tests/test_config.py` (existující soubor z Tasku 1 dřívějšího
@@ -80,10 +83,9 @@ tyhle dva testy ho nepotřebují, čtou jen statickou hodnotu).
 
 - [ ] **Step 2: Ověř selhání**
 
-Run: `pytest tests/test_config.py -k "codex_model_has_zero_price or codex_translate_timeout or codex_translate_max_chars" -v`
+Run: `pytest tests/test_config.py -k "codex_model_has_zero_price or codex_translate_timeout" -v`
 Expected: FAIL - `AttributeError`/`KeyError` (config.py ještě nemá ani
-`CODEX_TRANSLATE_TIMEOUT_SECONDS`/`CODEX_TRANSLATE_MAX_CHARS`, ani ceny
-pro `CODEX_MODEL`)
+`CODEX_TRANSLATE_TIMEOUT_SECONDS`, ani ceny pro `CODEX_MODEL`)
 
 - [ ] **Step 3: Implementuj**
 
@@ -106,17 +108,11 @@ Najdi `STYLIST_TIMEOUT_SECONDS = 180` a přidej vedle:
 # Spike test (2026-09-16, data/spikes/) - jednotlivá volání trvala
 # 70-120s (přímý překlad i polish), 300s je rezerva na delší scény
 # (kapitoly nad CHAPTER_SPLIT_WORD_THRESHOLD se dělí na víc scén, každá
-# JEDNO volání zvlášť).
+# JEDNO volání zvlášť). ŽÁDNÝ proaktivní znakový limit navíc (na rozdíl
+# od `polish`'s `STYLIST_MAX_CHARS`) - zvažováno a zamítnuto (kolo 2
+# IMPORTANT, plan-consensus, viz `CodexLLMClient` docstring v `src/llm/
+# client.py`) - tenhle timeout je JEDINÁ pojistka proti oversized promptu.
 CODEX_TRANSLATE_TIMEOUT_SECONDS = 300
-
-# Kolo 1 IMPORTANT (plan-consensus) - `stylist.polish()` má VLASTNÍ
-# `STYLIST_MAX_CHARS` guard (stylist.py:514), ale ten běží AŽ UVNITŘ
-# `polish()`, PŘED voláním `_exec_codex()` - `CodexLLMClient.complete()`
-# (Task 2) volá `_exec_codex()` PŘÍMO, takže tenhle guard nedědí.
-# Samostatná konstanta (NE reuse `STYLIST_MAX_CHARS`) - jiná kompozice
-# promptu (systém+návod+glosář+scéna, nebo EN+předchozí CZ+nálezy u
-# revize), ne jen EN+CZ jako u polish.
-CODEX_TRANSLATE_MAX_CHARS = 60_000
 ```
 
 - [ ] **Step 4: Ověř úspěch**
@@ -143,12 +139,15 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 - Test: `tests/test_pipeline_client.py`
 
 **Interfaces:**
-- Consumes: `stylist._exec_codex` (lokální import uvnitř `complete()`,
-  ne na úrovni modulu - viz Global Constraints v designu, vrstvení).
+- Consumes: `stylist._exec_codex`, `stylist.StylistError` (lokální
+  import uvnitř `complete()`, ne na úrovni modulu - viz Global
+  Constraints v designu, vrstvení).
 - Produces: `CodexLLMClient(codex_cmd: list[str], codex_model: str,
   timeout: int | None = None)` - `complete()`/`count_tokens()` stejný
   `LLMClient` protokol jako `AnthropicClient`, `.provider == "codex"`,
   `.billed_model == codex_model` (kolo 1 BLOCKING - viz níž, PROČ).
+  `complete()` přebaluje `stylist.StylistError` na `FatalRunError`
+  (kolo 2 BLOCKING - viz níž, PROČ).
 
 **Kolo 1 BLOCKING (plan-consensus) - proč `billed_model`:** `pipeline.
 process_chapter` volá `translator.translate_scene(scene, guide_block,
@@ -176,6 +175,27 @@ pro `AnthropicClient`; `CodexLLMClient` ho stejně ignoruje - viz jeho
 atribut - `getattr(..., None)` tam spadne na `model` param, NULOVÁ změna
 chování pro existující Claude cestu (proto testy níž ověřují OBOJÍ -
 Codex cestu i že Claude cesta zůstala nedotčená).
+
+**Kolo 2 BLOCKING (plan-consensus) - proč `StylistError` → `FatalRunError`:**
+`state.queue_for_run()` (main.py `_cmd_run`'s vlastní fronta) vrací
+`chapters_by_status(db_path, ("pending", "error"))` s docstringem "error
+= automatický retry" (`src/state.py:179-182`) - na rozdíl od `flagged`/
+`needs_human`, co čekají na ČLOVĚKA (`--retry-flagged`), `error` kapitola
+se AUTOMATICKY zkusí znovu PŘI KAŽDÉM příštím `run`u, i budoucím, i na
+jiných kapitolách. Kdyby `CodexLLMClient.complete()` nechal `_exec_codex`'s
+`StylistError` (rozbitý CLI, vypršelá autentizace, timeout) propadnout
+jako obyčejnou výjimku, `_cmd_run`'s `except Exception: status="error"`
+(main.py:1015-1019) by ji potichu zpracoval PER KAPITOLA a běh by
+pokračoval na DALŠÍ kapitole se STEJNOU rozbitou cestou - N kapitol by
+skončilo `error` za sebou, a KAŽDÝ příští `run` (třeba za týden, na
+úplně jiných kapitolách) by tu samou příčinu tiše zkoušel znovu, dokud
+by si toho uživatel nevšiml. Přebalení na `FatalRunError` využije
+existující `_cmd_run`'s `except FatalRunError: raise` (main.py:1013-1014,
+BEZE ZMĚNY) - CELÝ běh se zastaví HNED při první selhávající Codex
+exekuci, s jasnou hláškou, ne tiše na pozadí. (`_polish_one_chapter`'s
+per-kapitolové zpracování STEJNÉ třídy chyby ze `stylist.polish()`
+zůstává beze změny - `polish` nechá kapitolu v bezpečném `done` stavu,
+architektonicky jiná situace, ŽÁDNÝ přenositelný precedent na `run`.)
 
 - [ ] **Step 1: Napiš test**
 
@@ -227,17 +247,20 @@ def test_codex_llm_client_billed_model_is_codex_model_not_caller_model():
     assert c.billed_model == "gpt-5.6-terra"
 
 
-def test_codex_llm_client_rejects_prompt_over_max_chars(monkeypatch):
+def test_codex_llm_client_wraps_stylist_error_as_fatal_run_error(monkeypatch):
+    """Kolo 2 BLOCKING (plan-consensus) - viz vysvětlení výš u Tasku 2 -
+    `_exec_codex` selhání (rozbitý CLI, timeout, špatný exit kód) NESMÍ
+    propadnout jako obyčejná výjimka, co by `_cmd_run` zpracoval jako
+    per-kapitolový `error` (automaticky retrying přes `state.queue_for_
+    run`) - musí zastavit CELÝ běh."""
     from src.llm.client import CodexLLMClient
-    import config
-    monkeypatch.setattr(config, "CODEX_TRANSLATE_MAX_CHARS", 10)
+    from src.agents.stylist import StylistError
     def boom(*a, **k):
-        raise AssertionError("_exec_codex se nemá volat na moc velký prompt")
+        raise StylistError("codex exec skončil s kódem 1: auth expired")
     monkeypatch.setattr("src.agents.stylist._exec_codex", boom)
     c = CodexLLMClient(["codex"], "m")
-    from src.agents.stylist import StylistError
-    with pytest.raises(StylistError, match="CODEX_TRANSLATE_MAX_CHARS"):
-        c.complete(system="123456", user="7890AB", max_tokens=10, model="m")   # 12 > 10
+    with pytest.raises(FatalRunError, match="auth expired"):
+        c.complete(system="s", user="u", max_tokens=10, model="m")
 
 
 def test_pipeline_client_uses_billed_model_for_price_not_caller_model(monkeypatch, tmp_path):
@@ -283,6 +306,8 @@ padne jinak - `AttributeError: 'FakeCodexInner' object has no attribute`
 NEBO projde náhodou, pokud `PipelineLLMClient` ještě `billed_model`
 nezná a prostě použije `model` beze změny → `row["model"] ==
 "claude-sonnet-5"`, ne `"codex-x"` → assert selže. Obojí je platné FAIL.)
+`test_codex_llm_client_wraps_stylist_error_as_fatal_run_error` padne
+stejně na `ImportError` (`CodexLLMClient` ještě neexistuje).
 
 - [ ] **Step 3: Implementuj**
 
@@ -326,27 +351,39 @@ class CodexLLMClient:
         # complete()`'s `from src import state`).
         import config
         from src.agents import stylist
-        # Kolo 1 IMPORTANT (plan-consensus) - `stylist.polish()` má
-        # VLASTNÍ `STYLIST_MAX_CHARS` guard, ale ten běží AŽ UVNITŘ
-        # `polish()`, PŘED `_exec_codex()` voláním - tady voláme
-        # `_exec_codex()` PŘÍMO, takže ho nedědíme. Bez týhle kontroly
-        # by extrémně dlouhý prompt (dlouhá scéna + velký glosář, nebo
-        # celá kapitola EN+CZ+nálezy u revize) stejně pravděpodobně
-        # vyčerpal `timeout` a dal jen obecnou `StylistError` o
-        # timeoutu, ne jasnou zprávu proč (stejné zdůvodnění jako
-        # `stylist.polish()`'s vlastní guard, `stylist.py:494-499`).
-        combined_len = len(system) + len(user)
-        if combined_len > config.CODEX_TRANSLATE_MAX_CHARS:
-            raise stylist.StylistError(
-                f"prompt pro Codex translator je moc velký ({combined_len} "
-                f"znaků, limit config.CODEX_TRANSLATE_MAX_CHARS="
-                f"{config.CODEX_TRANSLATE_MAX_CHARS}) - přeskakuji, aby "
-                "se nečekalo na jistý timeout.")
         prompt = f"{system}\n\n{user}"
         timeout = self._timeout or config.CODEX_TRANSLATE_TIMEOUT_SECONDS
-        text = stylist._exec_codex(prompt, codex_cmd=self._codex_cmd,
-                                   codex_model=self._codex_model,
-                                   timeout=timeout, label="translator")
+        # Kolo 2 BLOCKING (plan-consensus) - `_exec_codex`'s `StylistError`
+        # (rozbitý CLI, vypršelá autentizace, špatný exit kód, timeout,
+        # prázdná/rozbitá odpověď) se přebaluje na `FatalRunError`, ne
+        # necháváme propadnout jako obyčejnou výjimku. `state.queue_for_
+        # run()` (main.py `_cmd_run`'s fronta) automaticky ZNOVU zkouší
+        # `error` kapitoly PŘI KAŽDÉM příštím `run`u (na rozdíl od
+        # `flagged`/`needs_human`, co čekají na člověka) - bez tyhle
+        # opravy by rozbitá Codex cesta potichu selhávala kapitolu po
+        # kapitole, běh po běhu, dokud by si toho uživatel nevšiml.
+        # `FatalRunError` využije existující `_cmd_run`'s `except
+        # FatalRunError: raise` (main.py, BEZE ZMĚNY) - celý běh se
+        # zastaví HNED, s jasnou hláškou. ŽÁDNÝ proaktivní limit
+        # velikosti promptu navíc (na rozdíl od `polish`'s `STYLIST_
+        # MAX_CHARS`) - zvažováno a ZAMÍTNUTO (kolo 2 IMPORTANT,
+        # plan-consensus): `pipeline.process_chapter`'s revizní smyčka
+        # nemá checkpoint PŘED revizí (`revise_chapter()` volání NENÍ
+        # obalené v `pipeline.py`), takže výjimka BĚHEM revize zahodí i
+        # KOMPLETNÍ, validní scénový překlad - deterministický guard by
+        # tohle SPOLEHLIVĚ trefil u delší kapitoly (glosář roste s
+        # postupem knihy), zatímco `timeout` (jediná pojistka, co
+        # zůstává) je vzácnější spouštěč stejného starého architektonického
+        # rizika (stejné riziko existuje latentně i pro Claude - `revise_
+        # chapter` může selhat na síťové chybě/`FatalRunError` úplně
+        # stejně, tenhle plán ho nezavádí nově, jen ho nezhoršuje novým,
+        # spolehlivě-se-spouštějícím guardem).
+        try:
+            text = stylist._exec_codex(prompt, codex_cmd=self._codex_cmd,
+                                       codex_model=self._codex_model,
+                                       timeout=timeout, label="translator")
+        except stylist.StylistError as e:
+            raise FatalRunError(str(e)) from e
         # `truncated` VŽDY False (zdokumentovaný limit, viz spec "Známé
         # limity") - Codex nedává spolehlivý signál o useknutí na limitu
         # jako Claude `stop_reason`. Skutečné useknutí spíš spadne na
@@ -431,6 +468,12 @@ PipelineLLMClient.complete() teď používá inner klienta 'billed_model'
 translator.py vždy defaultuje na config.MODEL_TRANSLATOR bez ohledu na
 skutečně použitý backend, takže bez týhle opravy by Codex volání
 dostala cenu/audit záznam Claude modelu (plan-consensus kolo 1 BLOCKING).
+
+CodexLLMClient.complete() přebaluje stylist.StylistError na
+FatalRunError - state.queue_for_run() automaticky retryuje 'error'
+kapitoly při každém příštím run, takže rozbitá Codex cesta (CLI/auth)
+by jinak potichu selhávala napříč libovolně mnoha budoucími běhy
+(plan-consensus kolo 2 BLOCKING).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
@@ -720,6 +763,9 @@ prostý `cp` databáze (kolo 1 IMPORTANT, plan-consensus - `run`/`state.
 connect` by furt mířily na `data/state.sqlite3` v aktuálním adresáři,
 kopie by se nikdy nepoužila):
 
+Bash (Git Bash/WSL - stejné nástroje, co používá tenhle plán i celá
+testovací sada):
+
 ```bash
 mkdir -p /tmp/codex-translator-smoke/data
 cp data/state.sqlite3 /tmp/codex-translator-smoke/data/state.sqlite3
@@ -730,13 +776,26 @@ BOOK_TRANSLATOR_PROJECT_DIR=/tmp/codex-translator-smoke \
   python main.py status
 ```
 
+PowerShell (kolo 2 IMPORTANT, plan-consensus - projekt běží primárně na
+Windows/PowerShell, `mkdir -p`/inline `VAR=val` je bash-only syntax):
+
+```powershell
+$smoke = "$env:TEMP\codex-translator-smoke"
+New-Item -ItemType Directory -Force "$smoke\data" | Out-Null
+Copy-Item data\state.sqlite3 "$smoke\data\state.sqlite3"
+Copy-Item data\guide.json "$smoke\data\guide.json"
+$env:BOOK_TRANSLATOR_PROJECT_DIR = $smoke
+python main.py run --translator codex --only <idx>
+python main.py status
+```
+
 Zkontroluj: kapitola má rozumný český text, `new_terms`/`questions` (pokud
-kapitola nějaké má) vypadají smysluplně,
-`BOOK_TRANSLATOR_PROJECT_DIR=/tmp/codex-translator-smoke python main.py
-polish --only <idx>` (Codex, beze změny) na výsledku projde stejně jako
-dřív. Teprve PO tomhle ověření zkus `--translator codex` i nad reálnou
-`data/state.sqlite3` (bez `BOOK_TRANSLATOR_PROJECT_DIR`), na jedné
-konkrétní `pending` kapitole.
+kapitola nějaké má) vypadají smysluplně, `python main.py polish --only
+<idx>` (Codex, beze změny, se stejným `BOOK_TRANSLATOR_PROJECT_DIR`
+nastaveným) na výsledku projde stejně jako dřív. Teprve PO tomhle ověření
+zkus `--translator codex` i nad reálnou `data/state.sqlite3` (bez
+`BOOK_TRANSLATOR_PROJECT_DIR`/po zavření PowerShell session, co proměnnou
+nastavila), na jedné konkrétní `pending` kapitole.
 
 - [ ] **Step 3: Invoke `superpowers:finishing-a-development-branch`**
 

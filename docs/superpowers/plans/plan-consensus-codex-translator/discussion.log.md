@@ -16,3 +16,15 @@ IMPORTANT (Task 5 Step 2 přepsán na reálný BOOK_TRANSLATOR_PROJECT_DIR
 postup). Odmítnuto s odůvodněním: IMPORTANT "StylistError vždy fatal" -
 existující precedent (_polish_one_chapter) už stejnou třídu chyby řeší
 jako per-kapitolovou.
+
+## Round 2
+
+- Codex: [round-2-codex.md](round-2-codex.md) — CHANGES_NEEDED
+- Claude: [round-2-claude.md](round-2-claude.md) — CHANGES_NEEDED
+
+Opraveno: OBRÁCENO kolo-1 rozhodnutí o StylistError (nový fakt -
+state.queue_for_run automaticky retryuje 'error' kapitoly - CodexLLMClient
+teď přebaluje StylistError na FatalRunError, celý běh se zastaví).
+CODEX_TRANSLATE_MAX_CHARS guard z kola 1 ZRUŠEN (mohl by zahodit hotovou
+scénovou práci při selhání revizní fáze - pipeline.process_chapter nemá
+checkpoint před revizí). Task 5 Step 2 doplněn o PowerShell variantu.
