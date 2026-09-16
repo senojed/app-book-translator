@@ -662,10 +662,11 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   timeout: int | None = None)` - `complete()`/`count_tokens()` stejný
   `LLMClient` protokol jako `AnthropicClient`, `.provider == "codex"`,
   `.billed_model == codex_model` (kolo 1 BLOCKING - viz níž, PROČ).
-  `complete()` přebaluje `stylist.StylistError` na `FatalRunError`
-  (kolo 2 BLOCKING - viz níž, PROČ). `complete()`'s `Completion.
-  input_tokens`/`output_tokens` NENULOVÝ konzervativní odhad, ne natvrdo
-  `0` (kolo 5 IMPORTANT - viz níž, PROČ).
+  `complete()` přebaluje `stylist.StylistError`/`OSError`/`UnicodeError`
+  na `FatalRunError` (kolo 2 BLOCKING + kolo 7 IMPORTANT - viz níž,
+  PROČ). `complete()`'s `Completion.input_tokens`/`output_tokens`
+  NENULOVÝ konzervativní odhad, ne natvrdo `0` (kolo 5 IMPORTANT - viz
+  níž, PROČ).
 
 **Kolo 5 IMPORTANT (plan-consensus) - proč `input_tokens`/`output_tokens`
 nesmí být natvrdo `0`:** `PipelineLLMClient.complete()` (`src/llm/
@@ -730,6 +731,19 @@ per-kapitolové zpracování STEJNÉ třídy chyby ze `stylist.polish()`
 zůstává beze změny - `polish` nechá kapitolu v bezpečném `done` stavu,
 architektonicky jiná situace, ŽÁDNÝ přenositelný precedent na `run`.)
 
+**Kolo 7 IMPORTANT (plan-consensus) - proč i `OSError`/`UnicodeError`:**
+`_exec_codex()` (`src/agents/stylist.py:426-427`) čte výstupní soubor -
+`with open(out_path, "r", encoding="utf-8") as f: result = f.read()
+.strip()` - BEZ VLASTNÍHO try/except, MIMO `StylistError` kontrakt (ten
+pokrývá jen `Popen`/`communicate`/exit kód/prázdnou odpověď/markdown
+obal, ne SAMOTNÉ čtení souboru). Poškozený zápis (špatné kódování) by
+vyhodil `UnicodeDecodeError`, zámek/oprávnění na dočasném souboru
+`OSError` - obojí by unikly z `except stylist.StylistError` beze
+povšimnutí a propadly by STEJNOU cestou jako `InvalidTranslationOutput`
+před kolem 6 opravou: obyčejná výjimka, `_cmd_run`'s generický `except
+Exception` → per-kapitolový `error` → `state.queue_for_run`'s
+automatický retry navěky.
+
 - [ ] **Step 1: Napiš test**
 
 Přidej do `tests/test_pipeline_client.py` (existující soubor - `_db`
@@ -745,7 +759,13 @@ def test_codex_llm_client_calls_exec_codex_and_wraps_result(monkeypatch):
         return "===PREKLAD===\ntext\n===METADATA===\n{}"
     monkeypatch.setattr("src.agents.stylist._exec_codex", fake_exec)
     c = CodexLLMClient(["codex"], "gpt-5.6-terra", timeout=42)
-    comp = c.complete(system="SYS", user="USR", max_tokens=1000, model="gpt-5.6-terra")
+    # Kolo 7 IMPORTANT (plan-consensus) - `model=` ÚMYSLNĚ JINÝ než
+    # `codex_model` ("claude-sonnet-5", přesně to, co translator.py
+    # reálně posílá vždy - žádný explicitní model= argument z
+    # pipeline.py). Test se STEJNÝM modelem na obou místech by nezachytil
+    # regresi, kdy implementace omylem použije caller-supplied `model`
+    # místo `self._codex_model` pro `_exec_codex()`'s `codex_model=`.
+    comp = c.complete(system="SYS", user="USR", max_tokens=1000, model="claude-sonnet-5")
     assert comp.text == "===PREKLAD===\ntext\n===METADATA===\n{}"
     assert comp.truncated is False
     # Kolo 5 IMPORTANT (plan-consensus) - NENULOVÝ odhad (konzervativní,
@@ -804,6 +824,24 @@ def test_codex_llm_client_wraps_stylist_error_as_fatal_run_error(monkeypatch):
     c = CodexLLMClient(["codex"], "m")
     with pytest.raises(FatalRunError, match="auth expired"):
         c.complete(system="s", user="u", max_tokens=10, model="m")
+
+
+def test_codex_llm_client_wraps_os_and_unicode_errors_as_fatal_run_error(monkeypatch):
+    """Kolo 7 IMPORTANT (plan-consensus) - `_exec_codex()`'s výstupní
+    soubor se čte BEZ vlastního try/except, mimo `StylistError`
+    kontrakt - `OSError` (zámek/oprávnění) i `UnicodeDecodeError`
+    (poškozený zápis) musí projít STEJNOU cestou jako `StylistError`
+    výš, jinak by unikly jako obyčejná výjimka a `state.queue_for_run`
+    by je tiše retryovalo navěky."""
+    from src.llm.client import CodexLLMClient
+    for exc in (OSError("soubor je zamčený"),
+               UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")):
+        def boom(*a, _exc=exc, **k):
+            raise _exc
+        monkeypatch.setattr("src.agents.stylist._exec_codex", boom)
+        c = CodexLLMClient(["codex"], "m")
+        with pytest.raises(FatalRunError):
+            c.complete(system="s", user="u", max_tokens=10, model="m")
 
 
 def test_pipeline_client_uses_billed_model_for_price_not_caller_model(monkeypatch, tmp_path):
@@ -920,7 +958,18 @@ class CodexLLMClient:
             text = stylist._exec_codex(prompt, codex_cmd=self._codex_cmd,
                                        codex_model=self._codex_model,
                                        timeout=timeout, label="translator")
-        except stylist.StylistError as e:
+        except (stylist.StylistError, OSError, UnicodeError) as e:
+            # Kolo 7 IMPORTANT (plan-consensus) - `_exec_codex()`'s
+            # výstupní soubor se čte (`open(out_path, encoding="utf-8")
+            # .read()`) BEZ VLASTNÍHO try/except, MIMO `StylistError`
+            # kontrakt - `OSError` (zámek/oprávnění na dočasném souboru)
+            # nebo `UnicodeDecodeError` (poškozený zápis, špatné kódování)
+            # by jinak unikly jako obyčejná výjimka, propadly by až do
+            # `_cmd_run`'s generické větve jako per-kapitolový `error`, a
+            # `state.queue_for_run` by je tiše retryovalo navěky - STEJNÉ
+            # riziko jako `StylistError` výš, jen jiný zdroj. `_exec_codex`/
+            # `stylist.py` samotné zůstávají beze změny (mimo rozsah, viz
+            # spec) - širší `except` tady stačí.
             raise FatalRunError(str(e)) from e
         # `truncated` VŽDY False (zdokumentovaný limit, viz spec "Známé
         # limity") - Codex nedává spolehlivý signál o useknutí na limitu
@@ -1026,6 +1075,12 @@ CodexLLMClient.complete() vrací nenulový konzervativní odhad
 input_tokens/output_tokens (ne natvrdo 0) - main._print_usage() by
 jinak po zpracování celé knihy ukázalo "0 tokenů", i když cena $0 je
 správně (plan-consensus kolo 5 IMPORTANT).
+
+complete() teď přebaluje i OSError/UnicodeError na FatalRunError, ne
+jen StylistError - _exec_codex()'s čtení výstupního souboru není
+vlastním try/except kryté, poškozený zápis/zámek na souboru by jinak
+unikl stejnou dírou, co kolo 2 opravilo pro StylistError (plan-consensus
+kolo 7 IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
@@ -1593,6 +1648,16 @@ prostý `cp` databáze (kolo 1 IMPORTANT, plan-consensus - `run`/`state.
 connect` by furt mířily na `data/state.sqlite3` v aktuálním adresáři,
 kopie by se nikdy nepoužila):
 
+**`<idx>` MUSÍ být `pending` (nebo `error`) kapitola** (kolo 7 IMPORTANT,
+plan-consensus) - `--only` filtruje `state.queue_for_run()`'s frontu
+(`chapters_by_status(db, ("pending", "error"))`); na `done`/`flagged`
+kapitole `--only <idx>` NIC nespustí (`queue` po filtru vyjde prázdná -
+eager preflight z Tasku 5 sice ještě proběhne, ale `process_chapter` se
+nezavolá) a `python main.py status` pak ukáže STARÝ (Claude) překlad,
+ne omyl v Codex cestě. Zjisti si `pending` `<idx>` PŘED spuštěním -
+`python main.py status` (v izolované kopii, ne v `data/state.sqlite3` -
+viz níž) vypíše stav všech kapitol, vyber jednu s `[ ]`/pending značkou.
+
 Bash (Git Bash/WSL - stejné nástroje, co používá tenhle plán i celá
 testovací sada):
 
@@ -1601,9 +1666,13 @@ mkdir -p /tmp/codex-translator-smoke/data
 cp data/state.sqlite3 /tmp/codex-translator-smoke/data/state.sqlite3
 cp data/guide.json /tmp/codex-translator-smoke/data/guide.json
 BOOK_TRANSLATOR_PROJECT_DIR=/tmp/codex-translator-smoke \
+  python main.py status   # najdi pending <idx>
+BOOK_TRANSLATOR_PROJECT_DIR=/tmp/codex-translator-smoke \
   python main.py run --translator codex --only <idx>
 BOOK_TRANSLATOR_PROJECT_DIR=/tmp/codex-translator-smoke \
   python main.py status
+sqlite3 /tmp/codex-translator-smoke/data/state.sqlite3 \
+  "SELECT provider, model, cost_usd FROM llm_calls WHERE agent='translator' ORDER BY id DESC LIMIT 5;"
 ```
 
 PowerShell (kolo 2 IMPORTANT, plan-consensus - projekt běží primárně na
@@ -1615,17 +1684,22 @@ New-Item -ItemType Directory -Force "$smoke\data" | Out-Null
 Copy-Item data\state.sqlite3 "$smoke\data\state.sqlite3"
 Copy-Item data\guide.json "$smoke\data\guide.json"
 $env:BOOK_TRANSLATOR_PROJECT_DIR = $smoke
+python main.py status   # najdi pending <idx>
 python main.py run --translator codex --only <idx>
 python main.py status
+sqlite3 "$smoke\data\state.sqlite3" "SELECT provider, model, cost_usd FROM llm_calls WHERE agent='translator' ORDER BY id DESC LIMIT 5;"
 ```
 
 Zkontroluj: kapitola má rozumný český text, `new_terms`/`questions` (pokud
-kapitola nějaké má) vypadají smysluplně, `python main.py polish --only
-<idx>` (Codex, beze změny, se stejným `BOOK_TRANSLATOR_PROJECT_DIR`
-nastaveným) na výsledku projde stejně jako dřív. Teprve PO tomhle ověření
-zkus `--translator codex` i nad reálnou `data/state.sqlite3` (bez
-`BOOK_TRANSLATOR_PROJECT_DIR`/po zavření PowerShell session, co proměnnou
-nastavila), na jedné konkrétní `pending` kapitole.
+kapitola nějaké má) vypadají smysluplně, `llm_calls` řádek pro
+`agent='translator'` má `provider='codex'` a `cost_usd=0.0` (kolo 7
+IMPORTANT - ověřuje kolo 1's `billed_model` opravu na reálném běhu, ne
+jen v testech), `python main.py polish --only <idx>` (Codex, beze
+změny, se stejným `BOOK_TRANSLATOR_PROJECT_DIR` nastaveným) na výsledku
+projde stejně jako dřív. Teprve PO tomhle ověření zkus `--translator
+codex` i nad reálnou `data/state.sqlite3` (bez `BOOK_TRANSLATOR_PROJECT_
+DIR`/po zavření PowerShell session, co proměnnou nastavila), na jedné
+konkrétní `pending` kapitole.
 
 - [ ] **Step 3: Invoke `superpowers:finishing-a-development-branch`**
 

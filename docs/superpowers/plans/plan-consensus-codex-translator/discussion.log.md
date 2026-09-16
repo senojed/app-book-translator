@@ -86,3 +86,16 @@ queue_for_run by ho tiše retryoval navěky při formát-driftu Codexu;
 nová InvalidTranslationOutput podtřída ValueError, --translator codex
 ji dělá fatální stejně jako kolo-2's StylistError fix). Přidány
 negativní testy pro duplicitní PREKLAD/METADATA marker a špatné pořadí.
+
+## Round 7
+
+- Codex: [round-7-codex.md](round-7-codex.md) — CHANGES_NEEDED
+- Claude: [round-7-claude.md](round-7-claude.md) — CHANGES_NEEDED
+
+Opraveno: 3x IMPORTANT. CodexLLMClient.complete() teď zachytává i
+OSError/UnicodeError (_exec_codex()'s výstupní-soubor čtení není kryté
+vlastním try/except, stejná díra jako kolo 6 řešilo jinde). Task 3's
+klíčový test opraven - používal stejnou hodnotu pro model i codex_model,
+nezachytil by regresi při záměně. Task 6's manuální ověření zpřesněno -
+explicitní pending-kapitola instrukce + llm_calls SQL kontrola
+provider='codex'/cost_usd=0.0.
