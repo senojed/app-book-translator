@@ -66,7 +66,11 @@ FS-risk varování jako `polish`).
   jen syntaxi (kolo 12 IMPORTANT, plan-consensus - viz Task 2) -
   syntakticky validní, ale špatně tvarované JSON (`[]`, `{"new_terms":
   "x"}`) by jinak spadlo na neklasifikovanou `AttributeError`, ne
-  `InvalidTranslationOutput`.
+  `InvalidTranslationOutput`. Validace jde ještě hlouběji na typ
+  OČEKÁVANÝCH textových polí UVNITŘ každé položky (`term_en`/`cz`/
+  `scope_key`/atd. - kolo 14 IMPORTANT, plan-consensus - viz Task 2) -
+  "seznam objektů" samo nestačí, `{"term_en": 1}` je seznam s dict
+  položkou, ale `pipeline.py`'s `.strip()` na INTU stejně spadne.
 - `pipeline.process_chapter`'s revizní smyčka NEZAHODÍ hotový scénový
   překlad, když `revise_chapter()` selže (kolo 3 IMPORTANT, plan-
   consensus - viz Task 2) - `FatalRunError` PŘED propagací ULOŽÍ
@@ -115,6 +119,18 @@ FS-risk varování jako `polish`).
   je před-existující chování, mimo rozsah týhle plánu, a NESMÍ dostat
   stejné zacházení jen proto, že translator backend je nastavený na
   `codex`.
+- `CodexLLMClient.complete()` má VLASTNÍ `config.STYLIST_ACCEPT_FS_RISK`
+  kontrolu, nezávislou na `_client_factory`'s `_polish_preflight()`
+  gate (kolo 14 IMPORTANT, plan-consensus - viz Task 3) - stejný vzor
+  jako `stylist.polish()`'s vlastní kontrola (`src/agents/stylist.py:
+  505-511`) - obrana do hloubky proti přímé konstrukci/zavolání
+  `CodexLLMClient` mimo `_client_factory`.
+- `translator._parse()` validuje i typ OČEKÁVANÝCH textových polí
+  UVNITŘ každé `new_terms`/`rendered_terms`/`questions` položky
+  (`term_en`/`cz`/`scope_key`/atd.), ne jen že položka JE `dict` (kolo
+  14 IMPORTANT, plan-consensus - viz Task 2) - `{"term_en": 1}` by
+  jinak prošlo a spadlo na neklasifikovanou `AttributeError` v
+  `pipeline.py`'s `.strip()` volání.
 
 ---
 
@@ -555,6 +571,20 @@ def test_metadata_field_items_not_dicts_raises():
     with pytest.raises(translator.InvalidTranslationOutput):
         translator.translate_scene("x", "g", "gl",
                                    FakeLLMClient([Completion(raw, False, 5, 5)]))
+
+
+def test_metadata_field_new_term_item_wrong_type_raises():
+    """Kolo 14 IMPORTANT (plan-consensus) - "seznam objektů" samo
+    nestačí - `term_en` uvnitř JE v dictu, ale je to int, ne string.
+    `pipeline.py`'s `(nt.get("term_en") or "").strip()` by na INTU
+    spadl na `AttributeError` (1 je truthy, `or ""` fallback se
+    nepoužije)."""
+    raw = ('===PREKLAD===\nText.\n===METADATA===\n'
+           '{"new_terms": [{"term_en": 1, "cz": "X", "note": "", "type": "term"}]}'
+           '\n===KONEC===')
+    with pytest.raises(translator.InvalidTranslationOutput):
+        translator.translate_scene("x", "g", "gl",
+                                   FakeLLMClient([Completion(raw, False, 5, 5)]))
 ```
 
 Přidej do `tests/test_pipeline.py` (vzor existujícího
@@ -773,6 +803,26 @@ def _parse(raw: str) -> TranslationResult:
             raise InvalidTranslationOutput(
                 f"Metadata pole '{key}' musí být seznam objektů, "
                 f"ne {type(value).__name__}.")
+    # Kolo 14 IMPORTANT (plan-consensus) - "seznam objektů" (výš) samo
+    # nestačí - `{"new_terms": [{"term_en": 1}]}` projde touhle kontrolou
+    # (je to seznam, položka JE dict), ale `pipeline.py`'s `(nt.get(
+    # "term_en") or "").strip()` na INTU spadne na `AttributeError`
+    # (`1` je truthy, `or ""` fallback se nepoužije). Validuj typ
+    # OČEKÁVANÝCH textových polí uvnitř každé položky - musí být string
+    # nebo `None`/chybí, jinak STEJNÁ třída "formát driftl".
+    _STRING_FIELDS = {
+        "new_terms": ("term_en", "cz", "note", "type"),
+        "rendered_terms": ("term_id", "cz_as_used"),
+        "questions": ("kind", "scope_key", "guess_answer", "text", "severity"),
+    }
+    for key, fields in _STRING_FIELDS.items():
+        for item in meta.get(key) or []:
+            for field in fields:
+                value = item.get(field)
+                if value is not None and not isinstance(value, str):
+                    raise InvalidTranslationOutput(
+                        f"Metadata '{key}' pole '{field}' musí být řetězec "
+                        f"nebo null, ne {type(value).__name__}.")
     return TranslationResult(
         translation=translation,
         new_terms=list(meta.get("new_terms") or []),
@@ -924,6 +974,12 @@ jako flagged PŘED re-raise fatalni chyby behem revize, ne jen po
 propagaci - bez tohohle byl _cmd_run's flagged status kosmeticky,
 translated_text zustaval ztraceny (plan-consensus kolo 13 IMPORTANT).
 
+_parse() validuje i typ ocekavanych textovych poli uvnitr kazde
+new_terms/rendered_terms/questions polozky (term_en, cz, scope_key,
+atd.) - "seznam objektu" samo nestaci, {"term_en": 1} projde touhle
+kontrolou, ale pipeline.py's .strip() na intu stejne spadne (plan-
+consensus kolo 14 IMPORTANT).
+
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
 
@@ -956,7 +1012,10 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   timeout: int | None = None)` - `complete()`/`count_tokens()` stejný
   `LLMClient` protokol jako `AnthropicClient`, `.provider == "codex"`,
   `.billed_model == codex_model` (kolo 1 BLOCKING - viz níž, PROČ).
-  `complete()` přebaluje `stylist.StylistError`/`OSError`/`UnicodeError`
+  `complete()` ODMÍTNE (`CodexTranslatorFatalError`), pokud `config.
+  STYLIST_ACCEPT_FS_RISK is not True` - VLASTNÍ kontrola, nezávislá na
+  volajícím (kolo 14 IMPORTANT - viz níž, PROČ, stejný vzor jako
+  `stylist.polish()`). `complete()` přebaluje `stylist.StylistError`/`OSError`/`UnicodeError`
   na `CodexTranslatorFatalError` (kolo 2 BLOCKING + kolo 7 IMPORTANT +
   kolo 11 IMPORTANT - viz níž, PROČ), zprávu redaguje přes `stylist.
   _redact_detail()` (kolo 8 IMPORTANT) - ALE `stylist.StylistTimeoutError`
@@ -1075,6 +1134,24 @@ existující `raise` na jednom řádku přepnutý na podtřídu) - NEDOTÝKÁ SE
 subprocess mechaniky (`Popen`/`communicate`/`_kill_process_tree`/timeout
 hodnota samotná), jen JEJÍ TYPOVÁNÍ. Existující `except StylistError`
 volající kód (`_polish_one_chapter` atd.) funguje beze změny (podtřída).
+
+**Kolo 14 IMPORTANT (plan-consensus) - proč `CodexLLMClient.complete()`
+potřebuje VLASTNÍ `STYLIST_ACCEPT_FS_RISK` kontrolu:** `_client_factory`
+(Task 4) volá `_polish_preflight()` (kontroluje `STYLIST_ACCEPT_FS_RISK`)
+PŘED zkonstruováním `CodexLLMClient` - to je JEDINÁ existující brána.
+`stylist.polish()` (`src/agents/stylist.py:505-511`) má ALE STEJNOU
+kontrolu UVNITŘ SEBE, nezávisle na volajícím - `polish()` funguje
+bezpečně, i kdyby ho někdo zavolal přímo, mimo `_cmd_polish`. `CodexLLMClient`
+tenhle vzor nedodržoval - dalo by se ho zkonstruovat a zavolat `.complete()`
+PŘÍMO (test, budoucí kód, jiný volající), úplně mimo `_client_factory`,
+a spustit FS-risk Codex exec BEZ opt-inu vůbec ověřeného.
+
+**Oprava:** `complete()` zkontroluje `config.STYLIST_ACCEPT_FS_RISK is
+not True` JAKO PRVNÍ krok (PŘED sestavením promptu/voláním `_exec_codex`)
+a vyhodí `CodexTranslatorFatalError`, pokud opt-in chybí - stejný vzor
+jako `stylist.polish()`, jen jiný výjimkový typ (`CodexTranslatorFatalError`
+místo `StylistError`, protože tenhle kontrakt patří `CodexLLMClient`,
+ne `stylist.py`).
 
 - [ ] **Step 1: Napiš test**
 
@@ -1222,6 +1299,21 @@ def test_codex_llm_client_does_not_wrap_timeout_as_fatal_run_error(monkeypatch):
     monkeypatch.setattr("src.agents.stylist._exec_codex", boom)
     c = CodexLLMClient(["codex"], "m")
     with pytest.raises(StylistTimeoutError):
+        c.complete(system="s", user="u", max_tokens=10, model="m")
+
+
+def test_codex_llm_client_refuses_without_fs_risk_optin(monkeypatch):
+    """Kolo 14 IMPORTANT (plan-consensus) - obrana do hloubky -
+    CodexLLMClient jde zkonstruovat a zavolat PŘÍMO, mimo `_client_
+    factory`'s `_polish_preflight()` gate (Task 4) - `complete()` musí
+    mít VLASTNÍ kontrolu, stejný vzor jako `stylist.polish()`."""
+    from src.llm.client import CodexLLMClient, CodexTranslatorFatalError
+    monkeypatch.setattr(config, "STYLIST_ACCEPT_FS_RISK", False)
+    def boom(*a, **k):
+        raise AssertionError("_exec_codex se nemá volat bez FS_RISK opt-inu")
+    monkeypatch.setattr("src.agents.stylist._exec_codex", boom)
+    c = CodexLLMClient(["codex"], "m")
+    with pytest.raises(CodexTranslatorFatalError):
         c.complete(system="s", user="u", max_tokens=10, model="m")
 
 
@@ -1402,6 +1494,21 @@ class CodexLLMClient:
         # complete()`'s `from src import state`).
         import config
         from src.agents import stylist
+        # Kolo 14 IMPORTANT (plan-consensus) - `stylist.polish()` má
+        # TENHLE check UVNITŘ SEBE (`src/agents/stylist.py:505-511`),
+        # nezávisle na volajícím - `CodexLLMClient` by bez týhle kontroly
+        # šlo zkonstruovat a zavolat PŘÍMO (test, budoucí kód), obejít
+        # `_client_factory`'s `_polish_preflight()` gate ÚPLNĚ, a spustit
+        # Codex exec (FS-risk agent) bez opt-inu. Obrana do hloubky -
+        # `_client_factory` (Task 4) tohle za normálních okolností už
+        # nikdy nepustí sem s `False`, ale kontrakt musí platit i pro
+        # PŘÍMOU konstrukci `CodexLLMClient`, ne jen přes tenhle jeden
+        # vstupní bod.
+        if config.STYLIST_ACCEPT_FS_RISK is not True:
+            raise CodexTranslatorFatalError(
+                "CodexLLMClient.complete() vyžaduje "
+                "config.STYLIST_ACCEPT_FS_RISK = True (stejné riziko "
+                "jako stylist.polish(), viz config.py).")
         prompt = f"{system}\n\n{user}"
         timeout = self._timeout or config.CODEX_TRANSLATE_TIMEOUT_SECONDS
         # Kolo 2 BLOCKING (plan-consensus) - `_exec_codex`'s `StylistError`
@@ -1683,6 +1790,11 @@ translator volání (plan-consensus kolo 11 IMPORTANT).
 Zpřísněn tests/test_stylist.py::test_polish_raises_on_timeout na
 StylistTimeoutError - reálná subprocess.TimeoutExpired větev, ne mock,
 ověřuje SKUTEČNOU raise-site opravu (plan-consensus kolo 11 IMPORTANT).
+
+CodexLLMClient.complete() ma vlastni STYLIST_ACCEPT_FS_RISK kontrolu,
+nezavislou na volajicim - stejny vzor jako stylist.polish(), obrana do
+hloubky proti primemu zkonstruovani/zavolani mimo _client_factory's
+gate (plan-consensus kolo 14 IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
@@ -2487,12 +2599,22 @@ ne omyl v Codex cestě. Zjisti si `pending` `<idx>` PŘED spuštěním -
 `python main.py status` (v izolované kopii, ne v `data/state.sqlite3` -
 viz níž) vypíše stav všech kapitol, vyber jednu s `[ ]`/pending značkou.
 
+**Kopie DB PŘES `.backup`, NE prostý `cp`/`Copy-Item`** (kolo 14
+IMPORTANT, plan-consensus) - `state.sqlite3` NENÍ quiescent, pokud
+souběžně běží (nebo nedávno běžel a má rozdělané zápisy) jiný proces -
+prostý souborový `cp` může zkopírovat DB uprostřed zápisu (nekonzistentní/
+useknutý snapshot). SQLite's `.backup` dot-command (přes `sqlite3` CLI,
+stejný nástroj, co plán stejně používá níž na `SELECT` dotaz) dělá
+konzistentní kopii i nad aktivní DB. `guide.json` (obyčejný JSON soubor,
+ne SQLite) zůstává prostý `cp`/`Copy-Item` - bez souběžných zapisovačů
+za normálního použití.
+
 Bash (Git Bash/WSL - stejné nástroje, co používá tenhle plán i celá
 testovací sada):
 
 ```bash
 mkdir -p /tmp/codex-translator-smoke/data
-cp data/state.sqlite3 /tmp/codex-translator-smoke/data/state.sqlite3
+sqlite3 data/state.sqlite3 ".backup '/tmp/codex-translator-smoke/data/state.sqlite3'"
 cp data/guide.json /tmp/codex-translator-smoke/data/guide.json
 BOOK_TRANSLATOR_PROJECT_DIR=/tmp/codex-translator-smoke \
   python main.py status   # najdi pending <idx>
@@ -2510,7 +2632,7 @@ Windows/PowerShell, `mkdir -p`/inline `VAR=val` je bash-only syntax):
 ```powershell
 $smoke = "$env:TEMP\codex-translator-smoke"
 New-Item -ItemType Directory -Force "$smoke\data" | Out-Null
-Copy-Item data\state.sqlite3 "$smoke\data\state.sqlite3"
+sqlite3 data\state.sqlite3 ".backup '$smoke\data\state.sqlite3'"
 Copy-Item data\guide.json "$smoke\data\guide.json"
 $env:BOOK_TRANSLATOR_PROJECT_DIR = $smoke
 python main.py status   # najdi pending <idx>

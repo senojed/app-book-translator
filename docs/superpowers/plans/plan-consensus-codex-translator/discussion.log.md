@@ -181,3 +181,19 @@ ztraceny. Existujici test dokonce assertoval opak zamysleneho chovani
 (status != flagged) - dukaz, ze bug byl od kola 10 nezpozorovany.
 Opraveno: revizni smycka ulozi posledni platny cz PRED re-raise
 fatalni chyby, minimalni transakce B. Existujici test prepsan.
+
+## Round 14
+
+- Codex: [round-14-codex.md](round-14-codex.md) — CHANGES_NEEDED
+- Claude: [round-14-claude.md](round-14-claude.md) — CHANGES_NEEDED
+
+Opraveno: 2x IMPORTANT plne (_parse() validuje typ poli UVNITR
+new_terms/rendered_terms/questions polozek, ne jen ze polozka je dict;
+CodexLLMClient ma vlastni STYLIST_ACCEPT_FS_RISK kontrolu nezavislou
+na _client_factory, stejny vzor jako stylist.polish()). 1x IMPORTANT
+castecne - DB kopie v Task 6 opravena na SQLite .backup (konzistentni
+snapshot), ale tvrzeni "polish odmita flagged kapitolu" overeno proti
+main.py a vyvraceno - _cmd_polish EXPLICITNE zahrnuje flagged/
+needs_human (zamerny, drivejsi design fix tohohle projektu). Prvni
+pripad v tomhle plan-consensus, kdy Codexovo tvrzeni bylo v rozporu se
+skutecnym kodem.
