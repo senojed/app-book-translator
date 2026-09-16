@@ -664,9 +664,14 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   `.billed_model == codex_model` (kolo 1 BLOCKING - viz níž, PROČ).
   `complete()` přebaluje `stylist.StylistError`/`OSError`/`UnicodeError`
   na `FatalRunError` (kolo 2 BLOCKING + kolo 7 IMPORTANT - viz níž,
-  PROČ). `complete()`'s `Completion.input_tokens`/`output_tokens`
+  PROČ), zprávu redaguje přes `stylist._redact_detail()` (kolo 8
+  IMPORTANT). `complete()`'s `Completion.input_tokens`/`output_tokens`
   NENULOVÝ konzervativní odhad, ne natvrdo `0` (kolo 5 IMPORTANT - viz
-  níž, PROČ).
+  níž, PROČ). `PipelineLLMClient._guard()` (cost-limit kontrola PŘED
+  voláním) používá `effective_model` STEJNĚ jako `_price()`/audit (už
+  součást kolo-1 opravy níž) - ověřeno samostatným testem (kolo 8
+  IMPORTANT - existující test kryl jen výsledný audit řádek, ne
+  `_guard()` samotný).
 
 **Kolo 5 IMPORTANT (plan-consensus) - proč `input_tokens`/`output_tokens`
 nesmí být natvrdo `0`:** `PipelineLLMClient.complete()` (`src/llm/
@@ -815,9 +820,33 @@ def test_codex_llm_client_wraps_stylist_error_as_fatal_run_error(monkeypatch):
     `_exec_codex` selhání (rozbitý CLI, timeout, špatný exit kód) NESMÍ
     propadnout jako obyčejná výjimka, co by `_cmd_run` zpracoval jako
     per-kapitolový `error` (automaticky retrying přes `state.queue_for_
-    run`) - musí zastavit CELÝ běh."""
+    run`) - musí zastavit CELÝ běh.
+
+    Kolo 8 IMPORTANT (plan-consensus) - zpráva jde přes `stylist.
+    _redact_detail()`, takže defaultně (`STYLIST_REPORT_REJECTED_TEXT`
+    `False`, test fixture default) NEOBSAHUJE raw text - ověřuje
+    REDIGOVANOU podobu, ne `match="auth expired"` (to ověřuje samostatný
+    test níž s explicitním opt-inem)."""
     from src.llm.client import CodexLLMClient
     from src.agents.stylist import StylistError
+    def boom(*a, **k):
+        raise StylistError("codex exec skončil s kódem 1: auth expired")
+    monkeypatch.setattr("src.agents.stylist._exec_codex", boom)
+    c = CodexLLMClient(["codex"], "m")
+    with pytest.raises(FatalRunError) as exc_info:
+        c.complete(system="s", user="u", max_tokens=10, model="m")
+    assert "auth expired" not in str(exc_info.value)
+    assert "potlačeny" in str(exc_info.value)
+
+
+def test_codex_llm_client_fatal_error_shows_detail_when_report_rejected_text_true(
+        monkeypatch):
+    """Kolo 8 IMPORTANT (plan-consensus) - explicitní opt-in
+    (`config.STYLIST_REPORT_REJECTED_TEXT = True`) ukáže PŮVODNÍ zprávu -
+    stejná brána, co `_cmd_polish`'s chybové cesty už používají."""
+    from src.llm.client import CodexLLMClient
+    from src.agents.stylist import StylistError
+    monkeypatch.setattr(config, "STYLIST_REPORT_REJECTED_TEXT", True)
     def boom(*a, **k):
         raise StylistError("codex exec skončil s kódem 1: auth expired")
     monkeypatch.setattr("src.agents.stylist._exec_codex", boom)
@@ -876,11 +905,45 @@ def test_pipeline_client_uses_billed_model_for_price_not_caller_model(monkeypatc
         row = conn.execute("SELECT * FROM llm_calls").fetchone()
     assert row["model"] == "codex-x"        # NE "claude-sonnet-5"
     assert row["cost_usd"] == 0.0            # nulová cena z `billed_model`
+
+
+def test_pipeline_client_guard_uses_billed_model_price_not_caller_model(
+        monkeypatch, tmp_path):
+    """Kolo 8 IMPORTANT (plan-consensus) - test výš ověřuje jen VÝSLEDNÝ
+    audit řádek (`llm_calls`), ne že `_guard()` (cost-limit kontrola
+    PŘED voláním) taky použije `effective_model`. Bez týhle části opravy
+    by `_guard()` mohl počítat s Claude cenou pro Codex volání a
+    zbytečně/chybně zastavit běh (false-positive cost-limit stop), i
+    když efektivní cena Codexu je $0."""
+    db = _db(tmp_path)
+    rid = state.create_run(db, "run")
+    monkeypatch.setattr(config, "PRICE_IN_PER_MTOK",
+                        {**config.PRICE_IN_PER_MTOK, "codex-x": 0.0})
+    monkeypatch.setattr(config, "PRICE_OUT_PER_MTOK",
+                        {**config.PRICE_OUT_PER_MTOK, "codex-x": 0.0})
+    monkeypatch.setattr(config, "MAX_SPEND_USD", 0.0)
+
+    class FakeCodexInner:
+        provider = "codex"
+        billed_model = "codex-x"
+        def complete(self, *, system, user, max_tokens, model):
+            return Completion(text="ok", truncated=False, input_tokens=100, output_tokens=50)
+        def count_tokens(self, *, system, user, model):
+            return 10
+
+    c = PipelineLLMClient(FakeCodexInner(), run_id=rid, agent="translator",
+                          db_path=db, config_mod=config, interactive=False)
+    # NESMÍ vyhodit FatalRunError - s effective_model="codex-x" (cena $0)
+    # je odhad $0, MAX_SPEND_USD=0.0 projde. Kdyby _guard() použil
+    # "claude-sonnet-5" (nenulová cena) místo effective_model, velký
+    # max_tokens by vygeneroval nenulový odhad a FatalRunError by
+    # vyletěl i s $0 utraceno.
+    c.complete(system="s", user="u", max_tokens=100000, model="claude-sonnet-5")
 ```
 
 - [ ] **Step 2: Ověř selhání**
 
-Run: `pytest tests/test_pipeline_client.py -k "codex_llm_client or pipeline_client_uses_billed_model" -v`
+Run: `pytest tests/test_pipeline_client.py -k "codex_llm_client or pipeline_client_uses_billed_model or guard_uses_billed_model or fatal_error_shows_detail" -v`
 Expected: FAIL - `ImportError: cannot import name 'CodexLLMClient'`
 (a `test_pipeline_client_uses_billed_model_for_price_not_caller_model`
 padne jinak - `AttributeError: 'FakeCodexInner' object has no attribute`
@@ -970,7 +1033,23 @@ class CodexLLMClient:
             # riziko jako `StylistError` výš, jen jiný zdroj. `_exec_codex`/
             # `stylist.py` samotné zůstávají beze změny (mimo rozsah, viz
             # spec) - širší `except` tady stačí.
-            raise FatalRunError(str(e)) from e
+            #
+            # Kolo 8 IMPORTANT (plan-consensus) - `stylist._redact_detail()`
+            # PŘES CELOU zprávu, ne jen `str(e)` přímo - `_cmd_run`'s
+            # outer `except FatalRunError` (main.py) tiskne zprávu PŘÍMO
+            # na konzoli (main.py:1037 `print(f"Fatální chyba běhu:
+            # {e}")`), bez další redakce. `_redact_detail`'s VLASTNÍ
+            # docstring (`src/agents/stylist.py:206-215`) výslovně jmenuje
+            # "`str(e)` neočekávané výjimky" jako jednu z kategorií, co
+            # redaguje - `OSError`/`UnicodeDecodeError` z čtení výstupního
+            # souboru jsou přesně tenhle případ. `StylistError`'s zprávy
+            # bývají ČÁSTEČNĚ pre-redagované (stderr uvnitř `_exec_codex`
+            # už prošel `_redact_detail`), ale ne VŽDY (statické hlášky
+            # typu "auth expired" z Popen selhání nesou syrový text OS
+            # chyby) - jednotná redakce na výstupu z `CodexLLMClient` je
+            # bezpečnější než spoléhat na to, že KAŽDÁ cesta uvnitř
+            # `_exec_codex` redakci nezapomene.
+            raise FatalRunError(stylist._redact_detail(str(e))) from e
         # `truncated` VŽDY False (zdokumentovaný limit, viz spec "Známé
         # limity") - Codex nedává spolehlivý signál o useknutí na limitu
         # jako Claude `stop_reason`. Skutečné useknutí spadne na
@@ -1081,6 +1160,15 @@ jen StylistError - _exec_codex()'s čtení výstupního souboru není
 vlastním try/except kryté, poškozený zápis/zámek na souboru by jinak
 unikl stejnou dírou, co kolo 2 opravilo pro StylistError (plan-consensus
 kolo 7 IMPORTANT).
+
+FatalRunError zprávy teď jdou přes stylist._redact_detail() - _cmd_run's
+outer handler je tiskne přímo na konzoli bez další redakce, a
+_redact_detail()'s vlastní docstring jmenuje "str(e) neočekávané
+výjimky" jako kategorii, co má krýt (plan-consensus kolo 8 IMPORTANT).
+Přidán test ověřující, že i PipelineLLMClient._guard() (cost-limit
+kontrola PŘED voláním, ne jen výsledný audit log) použije
+effective_model, ne caller-supplied model (plan-consensus kolo 8
+IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
@@ -1230,8 +1318,10 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   `claude`). `_cmd_run` předá `args.translator` do `_client_factory`
   jako `translator_backend`.
 - Produces: `_cmd_run` ověří `--translator codex`'s preflight (`_polish_
-  preflight()`) HNED na začátku, PŘED frontou - i s prázdnou/vyfiltrovanou
-  frontou (kolo 3 IMPORTANT, plan-consensus).
+  preflight()`) na začátku, PŘED frontou - i s prázdnou/vyfiltrovanou
+  frontou (kolo 3 IMPORTANT, plan-consensus) - ALE AŽ PO `state.
+  recover_processing(db)`, ne před ní (kolo 8 IMPORTANT, plan-consensus -
+  recovery je vždy úplně první krok KAŽDÉHO `run`u, beze změny).
 - Produces: `_cmd_run`'s `except Exception` větev redaguje chybovou
   hlášku přes `stylist._redact_detail()`, když `args.translator ==
   "codex"` (kolo 3 IMPORTANT, plan-consensus).
@@ -1251,12 +1341,32 @@ kapitol), bez jakékoli indikace, že backend nebyl vůbec ověřený.
 `_cmd_polish` má PŘESNĚ opačný, existující precedent - volá `_polish_
 preflight()` HNED na začátku, PŘED čímkoliv (main.py:1243).
 
-**Oprava:** `_cmd_run` přidá stejnou eager kontrolu na úplný začátek,
-PŘED `state.create_run`. Duplicitní volání `_polish_preflight()`
+**Oprava:** `_cmd_run` přidá stejnou eager kontrolu na začátek, PŘED
+`state.create_run` - ALE PO `state.recover_processing(db)` (kolo 8
+IMPORTANT - viz níž, PROČ). Duplicitní volání `_polish_preflight()`
 (jednou tady jen na ověření, podruhé uvnitř líné `factory()` kvůli
 resolvnutému `model`/`codex_cmd`) je levné (žádný subprocess, jen
 config/`shutil.which`-styl kontrola) - nekomplikuje `_client_factory`'s
 existující cachovací/lazy design (beze změny z Tasku 4).
+
+**Kolo 8 IMPORTANT (plan-consensus) - proč `recover_processing` MUSÍ
+být PŘED preflight, ne po něm:** Původní pořadí (preflight jako úplně
+první krok) by pro `--translator codex` s nesplněnou podmínkou (FS_RISK/
+CODEX_MODEL/CLI) vrátilo `1` HNED, PŘED `state.recover_processing(db)`.
+Kapitoly uvízlé v `processing` z dřívějšího pádu (jiného běhu, klidně i
+`--translator claude`) by tak zůstaly uvízlé - `state.queue_for_run()`
+vrací jen `("pending", "error")`, NIKDY `"processing"`, takže by byly
+neviditelné pro VŠECHNY budoucí `run`y (i `--translator claude`), dokud
+by nějaký `run` konečně prošel PŘES preflight (nebo uživatel nespustil
+`--translator claude`, co preflight vůbec nekontroluje). To je regrese
+oproti KAŽDÉMU jinému `run` (i dnešnímu, PŘED tímhle plánem) - recovery
+byla VŽDY úplně první krok, bez výjimky.
+
+**Oprava:** `state.recover_processing(db)` zůstává úplně první (beze
+změny pořadí vůči dnešku), eager preflight kontrola jde AŽ PO ní (pořád
+PŘED `state.create_run`/frontou, takže kolo-3's původní záměr - ověřit
+DŘÍV, než cokoli začne - zůstává zachovaný, jen ne PŘED recovery, co je
+levná/backend-nezávislá a nemá důvod čekat).
 
 **Kolo 3 IMPORTANT (plan-consensus) - proč redakce chyb:**
 `translator._parse()`/`extract_json()` (`src/llm/parsing.py:25-37`) dá
@@ -1376,6 +1486,23 @@ def test_run_translator_codex_without_fs_risk_optin_is_fatal(tmp_path, monkeypat
     monkeypatch.setattr(config, "STYLIST_ACCEPT_FS_RISK", False)
     assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
     assert state.get_chapter("data/state.sqlite3", 1)["status"] in ("pending", "processing")
+
+
+def test_run_translator_codex_preflight_failure_still_recovers_processing(
+        tmp_path, monkeypatch):
+    """Kolo 8 IMPORTANT (plan-consensus) - kapitola uvízlá v `processing`
+    z dřívějšího pádu MUSÍ být zotavená (vrácená do `pending`) i když
+    `--translator codex` preflight selže - `state.recover_processing`
+    je vždy úplně první krok KAŽDÉHO `run`, bez výjimky (jinak by
+    zůstala navěky neviditelná pro `queue_for_run`, co vrací jen
+    "pending"/"error", nikdy "processing")."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    state.set_status("data/state.sqlite3", 1, "processing")
+    monkeypatch.setattr(config, "STYLIST_ACCEPT_FS_RISK", False)
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
+    assert state.get_chapter("data/state.sqlite3", 1)["status"] == "pending"
 
 
 def test_run_translator_codex_fs_risk_checked_even_with_empty_queue(tmp_path, monkeypatch):
@@ -1506,6 +1633,15 @@ nahraď:
 ```python
 def _cmd_run(args) -> int:
     db = config.DB_PATH
+    # Kolo 8 IMPORTANT (plan-consensus) - `recover_processing` MUSÍ
+    # proběhnout PŘED eager preflight (ne po něm) - jinak by `--translator
+    # codex` s nesplněnou podmínkou (FS_RISK/CLI) vrátilo 1 HNED, a
+    # kapitoly uvízlé v `processing` z dřívějšího pádu by zůstaly uvízlé
+    # (queue_for_run vrací jen "pending"/"error", NE "processing") - na
+    # rozdíl od KAŽDÉHO jiného `run` (i `--translator claude`), co
+    # recovery dělá VŽDY jako úplně první krok. Recovery je levná a
+    # backend-nezávislá - nemá důvod čekat na preflight.
+    state.recover_processing(db)
     if args.translator == "codex":
         # Kolo 3 IMPORTANT (plan-consensus) - eager, PŘED frontou (stejný
         # vzor jako `_cmd_polish`) - `_client_factory` je líná, takže bez
@@ -1516,7 +1652,6 @@ def _cmd_run(args) -> int:
         if preflight_err:
             _say(preflight_err)
             return 1
-    state.recover_processing(db)
     if args.retry_flagged is not None:
         n = state.retry_flagged(db, args.retry_flagged or None)
         print(f"Vráceno do fronty (flagged → pending): {n}")
@@ -1622,6 +1757,11 @@ smyčka není obalená jako revizní, takže by state.queue_for_run tiše
 zkoušel stejnou systémovou chybu znovu při každém příštím run (stejné
 riziko jako kolo-2's StylistError fix, jiná příčina - plan-consensus
 kolo 6 IMPORTANT).
+
+state.recover_processing(db) zůstává úplně první krok _cmd_run, PŘED
+eager preflight kontrolou - jinak by --translator codex s nesplněnou
+podmínkou nechalo kapitoly uvízlé v processing navěky neviditelné pro
+queue_for_run (plan-consensus kolo 8 IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```

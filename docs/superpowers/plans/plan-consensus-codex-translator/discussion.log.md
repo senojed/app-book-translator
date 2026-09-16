@@ -99,3 +99,17 @@ klíčový test opraven - používal stejnou hodnotu pro model i codex_model,
 nezachytil by regresi při záměně. Task 6's manuální ověření zpřesněno -
 explicitní pending-kapitola instrukce + llm_calls SQL kontrola
 provider='codex'/cost_usd=0.0.
+
+## Round 8
+
+- Codex: [round-8-codex.md](round-8-codex.md) — CHANGES_NEEDED
+- Claude: [round-8-claude.md](round-8-claude.md) — CHANGES_NEEDED
+
+Opraveno: 3x IMPORTANT. Kolo-3's eager preflight omylem předběhl
+recover_processing - --translator codex s nesplněnou podmínkou by
+nechalo processing-kapitoly uvízlé navěky (queue_for_run je nevidí);
+prohozeno pořadí, recovery zůstává úplně první krok. CodexLLMClient's
+FatalRunError zprávy teď jdou přes stylist._redact_detail() (docstring
+výslovně jmenuje "str(e) neočekávané výjimky"). Přidán chybějící test
+ověřující, že i _guard() (cost-limit, ne jen audit log) použije
+effective_model.
