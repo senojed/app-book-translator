@@ -61,7 +61,12 @@ FS-risk varování jako `polish`).
   nápisu v knize) jako "poškozený výstup". `_parse()` normalizuje
   CRLF/CR na LF JAKO PRVNÍ krok, PŘED validací (kolo 11 IMPORTANT,
   plan-consensus - viz Task 2) - `^marker$` by na CRLF řádku bez
-  normalizace neprošlo (Windows-primární projekt).
+  normalizace neprošlo (Windows-primární projekt). `_parse()` validuje i
+  TVAR metadata JSON (`meta` je `dict`, pole jsou seznamy objektů), ne
+  jen syntaxi (kolo 12 IMPORTANT, plan-consensus - viz Task 2) -
+  syntakticky validní, ale špatně tvarované JSON (`[]`, `{"new_terms":
+  "x"}`) by jinak spadlo na neklasifikovanou `AttributeError`, ne
+  `InvalidTranslationOutput`.
 - `pipeline.process_chapter`'s revizní smyčka NEZAHODÍ hotový scénový
   překlad, když `revise_chapter()` selže (kolo 3 IMPORTANT, plan-
   consensus - viz Task 2) - `FatalRunError` propaguje (run se zastaví),
@@ -204,8 +209,11 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   nejsou PŘESNĚ jednou, ve správném pořadí, a `===KONEC===` opravdu
   POSLEDNÍ neprázdný obsah (kolo 4 BLOCKING - viz níž, `MARK_END in raw`
   samo nestačí), nebo pokud je překlad prázdný, nebo pokud metadata JSON
-  je rozbité (`extract_json()`'s `ValueError` se přebalí) - PŘED čímkoliv
-  jiným, žádný tichý fallback na částečný text. ZNÁMÝ, VĚDOMĚ přijatý
+  je rozbité (`extract_json()`'s `ValueError` se přebalí), nebo pokud má
+  syntakticky VALIDNÍ JSON ŠPATNÝ TVAR - `meta` není `dict`, nebo
+  `new_terms`/`rendered_terms`/`questions` nejsou seznamy objektů (kolo
+  12 IMPORTANT - viz níž) - PŘED čímkoliv jiným, žádný tichý fallback na
+  částečný text. ZNÁMÝ, VĚDOMĚ přijatý
   toleranční limit (kolo 11 NIT, plan-consensus) - text PŘED prvním
   `===PREKLAD===` (model chatter typu "Tady je překlad:") se tiše
   ZAHODÍ, ne odmítne jako poškozený výstup - záměrně mírnější než po
@@ -484,6 +492,38 @@ def test_crlf_line_endings_do_not_confuse_parser():
     r = translator.translate_scene("x", "g", "gl",
                                    FakeLLMClient([Completion(raw, False, 5, 5)]))
     assert r.translation == "Text s CRLF."
+
+
+def test_metadata_not_a_dict_raises():
+    """Kolo 12 IMPORTANT (plan-consensus) - `extract_json()` validuje
+    jen syntaxi JSON - `[]` je validní JSON, ale `meta.get(...)` na
+    seznamu spadne na `AttributeError`, ne `InvalidTranslationOutput`."""
+    raw = "===PREKLAD===\nText.\n===METADATA===\n[]\n===KONEC==="
+    with pytest.raises(translator.InvalidTranslationOutput):
+        translator.translate_scene("x", "g", "gl",
+                                   FakeLLMClient([Completion(raw, False, 5, 5)]))
+
+
+def test_metadata_field_wrong_type_raises():
+    """Kolo 12 IMPORTANT (plan-consensus) - `{"new_terms": "x"}` je
+    validní JSON, ale `list("x")` by tiše rozsekal řetězec na znaky
+    (`['x']`), ne vyhodilo chybu."""
+    raw = ('===PREKLAD===\nText.\n===METADATA===\n'
+           '{"new_terms": "x"}\n===KONEC===')
+    with pytest.raises(translator.InvalidTranslationOutput):
+        translator.translate_scene("x", "g", "gl",
+                                   FakeLLMClient([Completion(raw, False, 5, 5)]))
+
+
+def test_metadata_field_items_not_dicts_raises():
+    """Kolo 12 IMPORTANT (plan-consensus) - seznam JE seznam, ale
+    položky NEJSOU objekty - downstream kód (`nt.get("term_en")`) by
+    spadl na `AttributeError` na řetězcové položce."""
+    raw = ('===PREKLAD===\nText.\n===METADATA===\n'
+           '{"new_terms": ["not-a-dict"]}\n===KONEC===')
+    with pytest.raises(translator.InvalidTranslationOutput):
+        translator.translate_scene("x", "g", "gl",
+                                   FakeLLMClient([Completion(raw, False, 5, 5)]))
 ```
 
 Přidej do `tests/test_pipeline.py` (vzor existujícího
@@ -530,7 +570,7 @@ def test_revision_fatal_error_propagates_not_flagged(tmp_path, monkeypatch):
 
 - [ ] **Step 2: Ověř selhání**
 
-Run: `pytest tests/test_translator.py tests/test_pipeline.py -k "end_marker or duplicate_end or content_after_end or missing_metadata_marker or duplicate_translation_marker or duplicate_metadata_marker or markers_out_of_order or invalid_translation_output_type or system_prompts_instruct or marker_like_text or crlf_line_endings or revision_recoverable or revision_fatal" -v`
+Run: `pytest tests/test_translator.py tests/test_pipeline.py -k "end_marker or duplicate_end or content_after_end or missing_metadata_marker or duplicate_translation_marker or duplicate_metadata_marker or markers_out_of_order or invalid_translation_output_type or system_prompts_instruct or marker_like_text or crlf_line_endings or metadata_not_a_dict or metadata_field or revision_recoverable or revision_fatal" -v`
 Expected: FAIL - `translator.MARK_END` neexistuje (`AttributeError`),
 `_parse()` ještě netestuje konec/strukturu, revizní smyčka v
 `pipeline.py` ještě neobaluje `revise_chapter()` voláním (výjimka
@@ -675,6 +715,24 @@ def _parse(raw: str) -> TranslationResult:
         meta = extract_json(metadata_text)
     except ValueError as e:
         raise InvalidTranslationOutput(str(e)) from e
+    # Kolo 12 IMPORTANT (plan-consensus) - `extract_json()` validuje jen
+    # SYNTAXI JSON, ne jeho TVAR - `[]`/`null`/`{"new_terms": "x"}` je
+    # validní JSON, ale `meta.get(...)` na ne-dict spadne na
+    # `AttributeError`, a `list("x")` (string místo seznamu) by tiše
+    # rozsekal řetězec na znaky. Obojí je STEJNÁ třída "formát driftl"
+    # jako rozbité JSON výš - musí projít přes `InvalidTranslationOutput`,
+    # ne uniknout jako obyčejná `AttributeError` (necháno neklasifikované
+    # by to Codex cestu nechalo auto-retryovat jako běžnou kapitolu).
+    if not isinstance(meta, dict):
+        raise InvalidTranslationOutput(
+            f"Metadata JSON musí být objekt, ne {type(meta).__name__}.")
+    for key in ("new_terms", "rendered_terms", "questions"):
+        value = meta.get(key)
+        if value is not None and (not isinstance(value, list)
+                                  or not all(isinstance(item, dict) for item in value)):
+            raise InvalidTranslationOutput(
+                f"Metadata pole '{key}' musí být seznam objektů, "
+                f"ne {type(value).__name__}.")
     return TranslationResult(
         translation=translation,
         new_terms=list(meta.get("new_terms") or []),
@@ -794,6 +852,11 @@ _parse() normalizuje CRLF/CR na LF jako první krok - ^marker$ regex by
 na CRLF řádku (Windows-primární projekt) bez normalizace neprošlo, i
 validní odpověď by se odmítla jako poškozená (plan-consensus kolo 11
 IMPORTANT).
+
+_parse() validuje i TVAR metadata JSON (dict + seznamy objektů), ne jen
+syntaxi - extract_json() ověří jen že je to validní JSON, ale [] nebo
+{"new_terms": "x"} by spadlo na neklasifikovanou AttributeError misto
+InvalidTranslationOutput (plan-consensus kolo 12 IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
@@ -1620,10 +1683,17 @@ def test_client_factory_default_backend_claude_translator_unaffected(monkeypatch
 
 
 def test_client_factory_translator_backend_codex_preflight_failure_raises_fatal(monkeypatch):
+    """Kolo 12 IMPORTANT (plan-consensus) - `CodexTranslatorFatalError`
+    (ne holý `FatalRunError`) - tahle LÍNÁ preflight kontrola (uvnitř
+    `factory()`) běží PO `state.begin_chapter()` (kapitola už
+    `processing`) - bez správného typu by `_cmd_run` (Task 5) tenhle
+    pád neoznačil `flagged`, kapitola by zůstala uvízlá stejně jako
+    před kolem 10/11."""
+    from src.llm.client import CodexTranslatorFatalError
     monkeypatch.setattr("main._polish_preflight",
                         lambda: (None, None, "Codex CLI není použitelné"))
     factory = main._client_factory(1, interactive=False, translator_backend="codex")
-    with pytest.raises(FatalRunError, match="Codex CLI není použitelné"):
+    with pytest.raises(CodexTranslatorFatalError, match="Codex CLI není použitelné"):
         factory("translator")
 ```
 
@@ -1657,7 +1727,16 @@ def _client_factory(run_id: int, *, interactive: bool, require_lock=None,
         if agent == "translator" and translator_backend == "codex":
             model, codex_cmd, preflight_err = _polish_preflight()
             if preflight_err:
-                raise FatalRunError(preflight_err)
+                # Kolo 12 IMPORTANT (plan-consensus) - `CodexTranslatorFatalError`,
+                # NE holý `FatalRunError` - tahle LÍNÁ kontrola běží AŽ
+                # při prvním `factory("translator")` volání, PO `state.
+                # begin_chapter()` (kapitola už `processing`). I když
+                # eager preflight (main.py `_cmd_run`, kolo 8) tohle
+                # obvykle odchytí dřív, je to SAMOSTATNÉ volání - typ
+                # musí být stejný jako `CodexLLMClient.complete()`'s
+                # (Task 3), ať `_cmd_run` (Task 5) tenhle pád taky
+                # označí `flagged`, ne nechá kapitolu uvízlou.
+                raise CodexTranslatorFatalError(preflight_err)
             inner = CodexLLMClient(codex_cmd, model)
         else:
             inner = AnthropicClient()
@@ -1667,11 +1746,12 @@ def _client_factory(run_id: int, *, interactive: bool, require_lock=None,
     return factory
 ```
 
-Rozšiř import na main.py:35-36 o `CodexLLMClient`:
+Rozšiř import na main.py:35-36 o `CodexLLMClient`/`CodexTranslatorFatalError`
+(`factory()` výš `CodexTranslatorFatalError` přímo používá):
 
 ```python
-from src.llm.client import (AnthropicClient, CodexLLMClient, FatalRunError,
-                           LockLostError, OutputTruncated, PipelineLLMClient)
+from src.llm.client import (AnthropicClient, CodexLLMClient, CodexTranslatorFatalError,
+                           FatalRunError, LockLostError, OutputTruncated, PipelineLLMClient)
 ```
 
 - [ ] **Step 4: Ověř úspěch**
@@ -1685,6 +1765,12 @@ zachovává dnešní chování)
 ```bash
 git add main.py tests/test_cli.py
 git commit -m "feat: _client_factory translator_backend param - Codex jen pro translatora
+
+factory()'s líná preflight kontrola vyhazuje CodexTranslatorFatalError,
+ne holý FatalRunError - běží AŽ po state.begin_chapter() (kapitola už
+processing), takže _cmd_run (Task 5) potřebuje stejný typ jako
+CodexLLMClient.complete(), aby i tenhle pád označil flagged, ne nechal
+kapitolu uvíznout (plan-consensus kolo 12 IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
@@ -1712,15 +1798,19 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   "codex"` (kolo 3 IMPORTANT, plan-consensus).
 - Produces: `_cmd_run` má NOVOU `except translator.InvalidTranslationOutput`
   větev (PŘED generickou `except Exception`) - pro `args.translator ==
-  "codex"` ji přebalí na `FatalRunError` (celý běh se zastaví); pro
-  `claude` (default) beze změny spadne do generické větve jako dřív
-  (kolo 6 IMPORTANT, plan-consensus).
-- Produces: `_cmd_run`'s `except FatalRunError` (i ta z přebalené
-  `InvalidTranslationOutput` výš) označí AKTUÁLNÍ kapitolu `flagged`
-  (redigovaná diagnostika) PŘED re-raise, když `args.translator ==
-  "codex"` - jinak by zůstala `processing`→`pending` a DALŠÍ `run` by
-  ji tiše znovu zařadil bez explicitního `--retry-flagged` (kolo 10
-  IMPORTANT, plan-consensus).
+  "codex"` ji přebalí na `CodexTranslatorFatalError` (celý běh se
+  zastaví); pro `claude` (default) beze změny spadne do generické větve
+  jako dřív (kolo 6 IMPORTANT, plan-consensus; typ upřesněn kolo 11
+  IMPORTANT).
+- Produces: `_cmd_run` má NOVOU `except CodexTranslatorFatalError`
+  větev PŘED obecnou `except FatalRunError` - označí AKTUÁLNÍ kapitolu
+  `flagged` (redigovaná diagnostika) PŘED re-raise, BEZ PODMÍNKY na
+  `args.translator` (typ sám garantuje původ - kritikova Claude-side
+  `FatalRunError`, cost guard/`LockLostError`, spadne do NEZMĚNĚNÉ
+  obecné `except FatalRunError: raise` větve níž) - jinak by kapitola
+  zůstala `processing`→`pending` a DALŠÍ `run` by ji tiše znovu zařadil
+  bez explicitního `--retry-flagged` (kolo 10 IMPORTANT, mechanismus
+  přepracován na typovou podtřídu kolo 11 IMPORTANT, plan-consensus).
 
 **Kolo 3 IMPORTANT (plan-consensus) - proč eager preflight:**
 `_client_factory` (Task 4) je LÍNÁ - `_polish_preflight()` se volá AŽ
@@ -2019,6 +2109,30 @@ def test_run_translator_codex_generic_fatal_run_error_from_critic_not_flagged(
     assert state.get_chapter("data/state.sqlite3", 1)["status"] in ("pending", "processing")
 
 
+def test_run_translator_codex_lazy_preflight_failure_flags_chapter(tmp_path, monkeypatch):
+    """Kolo 12 IMPORTANT (plan-consensus) - eager preflight (main.
+    _cmd_run, kolo 8) může uspět, ale LÍNÁ kontrola uvnitř `_client_
+    factory`'s `factory()` (Task 4) - volaná AŽ při prvním `factory
+    ("translator")`, PO `state.begin_chapter()` (kapitola už `processing`) -
+    může selhat SAMOSTATNĚ (jiné volání, jiný okamžik). I tenhle pád
+    musí kapitolu označit `flagged`, ne ji nechat uvíznout - `factory()`
+    teď vyhazuje `CodexTranslatorFatalError` (Task 4's kolo-12 fix),
+    stejný typ jako `CodexLLMClient.complete()`, takže `_cmd_run`'s
+    typová větev (kolo 11) ho zachytí stejně."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    calls = {"n": 0}
+    def preflight():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ("m", ["codex"], None)   # eager (main._cmd_run) uspěje
+        return (None, None, "Codex CLI mezitím přestalo fungovat")   # línÁ (factory) selže
+    monkeypatch.setattr("main._polish_preflight", preflight)
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
+    assert state.get_chapter("data/state.sqlite3", 1)["status"] == "flagged"
+
+
 def test_run_translator_claude_invalid_translation_output_stays_per_chapter_error(
         tmp_path, monkeypatch):
     """Beze změny chování pro default `claude` backend - formát-drift
@@ -2058,12 +2172,8 @@ přidej:
                             "codex vyžaduje STYLIST_ACCEPT_FS_RISK=True)")
 ```
 
-Rozšiř import na main.py (z Tasku 4) o `CodexTranslatorFatalError`:
-
-```python
-from src.llm.client import (AnthropicClient, CodexLLMClient, CodexTranslatorFatalError,
-                           FatalRunError, LockLostError, OutputTruncated, PipelineLLMClient)
-```
+(`CodexTranslatorFatalError` je do importu na main.py přidaná už Taskem
+4 - žádná další úprava importu tady potřeba.)
 
 V `_cmd_run` (main.py:990-1000), najdi:
 

@@ -155,3 +155,16 @@ rozliseni podle TYPU. ^marker$ regex neprijme CRLF radky (Windows-
 primarni projekt); opraveno explicitni normalizaci. Existujici timeout
 test v test_stylist.py overoval jen rodicovsky typ; zprisneno na
 StylistTimeoutError. NIT o zdokumentovani preambule-tolerance.
+
+## Round 12
+
+- Codex: [round-12-codex.md](round-12-codex.md) — CHANGES_NEEDED
+- Claude: [round-12-claude.md](round-12-claude.md) — CHANGES_NEEDED
+
+Opraveno: 3x IMPORTANT. _client_factory's vlastni lina preflight
+kontrola vyhazovala holy FatalRunError, ne CodexTranslatorFatalError -
+stejna mezera jako kolo 11 resilo jinde. Task 5's Interfaces dokumentace
+nebyla po kole 11 plne prepsana, stale popisovala stary
+args.translator-gated mechanismus. _parse() validovala jen JSON syntaxi,
+ne tvar - []/{"new_terms":"x"} by unikaly klasifikaci jako format-drift.
+Vsechny opraveny, plan je vnitrne konzistentni.
