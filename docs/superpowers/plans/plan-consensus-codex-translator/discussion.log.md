@@ -168,3 +168,16 @@ nebyla po kole 11 plne prepsana, stale popisovala stary
 args.translator-gated mechanismus. _parse() validovala jen JSON syntaxi,
 ne tvar - []/{"new_terms":"x"} by unikaly klasifikaci jako format-drift.
 Vsechny opraveny, plan je vnitrne konzistentni.
+
+## Round 13
+
+- Codex: [round-13-codex.md](round-13-codex.md) — CHANGES_NEEDED
+- Claude: [round-13-claude.md](round-13-claude.md) — CHANGES_NEEDED
+
+Opraveno: IMPORTANT - kolo 10/11's flagged status oprava byla jen
+kosmeticka pro revizni-fazi fatalni chybu - pipeline.py's except
+FatalRunError: raise nikdy nic necommitoval, translated_text zustaval
+ztraceny. Existujici test dokonce assertoval opak zamysleneho chovani
+(status != flagged) - dukaz, ze bug byl od kola 10 nezpozorovany.
+Opraveno: revizni smycka ulozi posledni platny cz PRED re-raise
+fatalni chyby, minimalni transakce B. Existujici test prepsan.

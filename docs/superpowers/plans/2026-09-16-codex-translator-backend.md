@@ -69,9 +69,12 @@ FS-risk varování jako `polish`).
   `InvalidTranslationOutput`.
 - `pipeline.process_chapter`'s revizní smyčka NEZAHODÍ hotový scénový
   překlad, když `revise_chapter()` selže (kolo 3 IMPORTANT, plan-
-  consensus - viz Task 2) - `FatalRunError` propaguje (run se zastaví),
-  jakákoli jiná výjimka smyčku přeruší a kapitola jde do `flagged` s
-  POSLEDNÍM platným překladem, ne do `error` se ztraceným textem.
+  consensus - viz Task 2) - `FatalRunError` PŘED propagací ULOŽÍ
+  poslední platný `cz` jako `flagged` (kolo 13 IMPORTANT, plan-consensus -
+  jinak by `_cmd_run`'s `flagged` status, kolo 10/11, byl jen kosmetický,
+  `translated_text` by zůstal ztracený), jakákoli jiná výjimka smyčku
+  přeruší a kapitola jde do `flagged` s POSLEDNÍM platným překladem, ne
+  do `error` se ztraceným textem.
 - `--translator codex` se ověřuje (`STYLIST_ACCEPT_FS_RISK`/`CODEX_MODEL`/
   CLI) HNED na začátku `_cmd_run`, ne líně až při prvním volání (kolo 3
   IMPORTANT, plan-consensus - viz Task 5) - prázdná/vyfiltrovaná fronta
@@ -224,7 +227,10 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   `translator.revise_chapter()` na cokoli JINÉHO než `FatalRunError`,
   smyčka se přeruší, `cz` zůstane na POSLEDNÍ platné hodnotě, kapitola
   skončí `flagged` (ne `error`), nikdy neztratí už hotový text.
-  `FatalRunError` propaguje BEZE ZMĚNY (run se zastaví).
+  `FatalRunError` PŘED re-raise ULOŽÍ poslední platný `cz` jako
+  `flagged` (minimální transakce B, bez nových glosářových kandidátů/
+  mentions/otázek) - kolo 13 IMPORTANT, viz níž, PROČ - a pak propaguje
+  (run se zastaví).
 
 **Kolo 3 BLOCKING (plan-consensus) - proč `===KONEC===`:** `CodexLLMClient.
 complete()` (Task 3) vrací `truncated=False` VŽDY - Codex CLI nemá
@@ -319,6 +325,31 @@ stejný důvod jako Task 5's redakce níž), `cz`/`rendered`/`questions`/
 `new_terms` zůstanou na POSLEDNÍ platné hodnotě, přidá se `"action":
 "note"` pseudo-nález a `status` výpočet dostane `revision_failed` do
 stejné větve jako `critic_failed` → `flagged`.
+
+**Kolo 13 IMPORTANT (plan-consensus) - proč `except FatalRunError`
+MUSÍ taky uložit `cz`, ne jen propagovat:** Výš uvedená oprava řeší jen
+NEfatální selhání revize (`except Exception`). `except FatalRunError:
+raise` samo o sobě STÁLE propaguje výjimku BEZ commitu - `cz` (scénový
+překlad, případně i částečně revidovaný z předchozích úspěšných kol)
+zůstává NEULOŽENÝ, protože `state.commit_chapter_result()` běží AŽ NA
+KONCI funkce, kam se z `except FatalRunError: raise` nikdy nedostane.
+`_cmd_run`'s `flagged` status (kolo 10/11 - main.py, Task 5) je pak jen
+KOSMETICKÝ - kapitola SICE nese `flagged` značku, ale `translated_text`
+sloupec zůstává PRÁZDNÝ/starý, skutečně odvedená (a zaplacená!) práce
+je ztracená stejně, jako kdyby žádná ochrana neexistovala.
+
+**Oprava:** `except FatalRunError as e:` (místo pouhého `except
+FatalRunError:`) PŘED re-raise uloží `cz` jako `flagged` - MINIMÁLNÍ
+"transakce B" (`new_candidates=[]`, `mentions=[]`, `questions=[]` -
+nové glosářové kandidáty/mentions/otázky se DAJÍ dohnat později,
+ztráta CELÉHO přeloženého textu ne), s pseudo-nálezem vysvětlujícím
+přerušení (`type(e).__name__`, BEZ `str(e)` - stejný důvod jako
+nefatální větev výš). `_cmd_run`'s vlastní `except CodexTranslatorFatalError`
+(Task 5) pak PŘEPÍŠE `notes` (ale NE `translated_text` - `state.
+update_chapter()` mění jen explicitně předané sloupce) vlastní,
+run-úrovňovou diagnostikou - ZNÁMÝ, přijatý kompromis (najdi/nahraď
+detailní revizní nález za obecnější "fatální chyba běhu" zprávu), NE
+ztráta translated_text, co je tady to hlavní.
 
 - [ ] **Step 1: Napiš testy**
 
@@ -550,11 +581,18 @@ def test_revision_recoverable_failure_flags_chapter_preserves_translation(
     assert "revize selhala" in state.get_chapter(db, 1)["notes"]
 
 
-def test_revision_fatal_error_propagates_not_flagged(tmp_path, monkeypatch):
+def test_revision_fatal_error_preserves_translation_before_reraising(
+        tmp_path, monkeypatch):
+    """Kolo 13 IMPORTANT (plan-consensus) - FatalRunError BĚHEM revize
+    (rozbitý CLI/auth) MUSÍ uložit poslední platný překlad JAKO
+    `flagged` PŘED re-raise - jinak `_cmd_run`'s `flagged` status
+    (kolo 10/11) je jen kosmetický, skutečný PŘEKLAD zůstává ztracený
+    (commit v `pipeline.py` běží normálně až na konci funkce, výjimka
+    ho nikdy nedosáhne)."""
     db = _db(tmp_path)
     from src.llm.client import FatalRunError
     monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
-        "překlad", [], [], []))
+        "prvotní scénový překlad", [], [], []))
     always_bad = [{"source": "critic", "type": "fidelity", "severity": "critical",
                    "action": "revise", "term_id": None, "expected": None,
                    "actual": None, "cz_excerpt": "x", "issue": "chyba", "suggestion": "y"}]
@@ -565,7 +603,9 @@ def test_revision_fatal_error_propagates_not_flagged(tmp_path, monkeypatch):
     with __import__("pytest").raises(FatalRunError):
         pipeline.process_chapter(db, ch, client_factory=_factory, guide={
             "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
-    assert state.get_chapter(db, 1)["status"] != "flagged"
+    row = state.get_chapter(db, 1)
+    assert row["status"] == "flagged"
+    assert row["translated_text"] == "prvotní scénový překlad"
 ```
 
 - [ ] **Step 2: Ověř selhání**
@@ -763,7 +803,28 @@ nahraď:
         try:
             res = translator.revise_chapter(en, cz, to_fix, guide_block, glossary_block,
                                             client_factory("translator"))
-        except FatalRunError:
+        except FatalRunError as e:
+            # Kolo 13 IMPORTANT (plan-consensus) - BEZ týhle opravy `cz`
+            # (scénový překlad, případně částečně revidovaný) propadne
+            # s výjimkou, NIKDY se neuloží - `_cmd_run`'s `flagged`
+            # status (kolo 10/11) je pak jen KOSMETICKÝ, skutečný
+            # PŘEKLAD zůstává ztracený (commit běží až na konci funkce,
+            # `raise`/re-raise ho nikdy nedosáhne). Uložíme HO PŘED
+            # re-raise - minimální "transakce B" (bez nových
+            # glosářových kandidátů/mentions/otázek - ty se dají dohnat
+            # později, ztráta CELÉHO překladu ne).
+            from src import findings as findings_mod
+            pseudo = {"source": "pipeline", "type": "fluency", "severity": "critical",
+                     "action": "note", "term_id": None, "expected": None,
+                     "actual": None, "cz_excerpt": None,
+                     "issue": f"revize přerušena fatální chybou ({type(e).__name__}) - "
+                              "poslední platný překlad zachován",
+                     "suggestion": None}
+            saved_findings = findings_mod.assign_ids(findings + [pseudo])
+            state.commit_chapter_result(
+                db_path, idx, translated_text=cz, revision_rounds=rounds,
+                notes_json=json.dumps(saved_findings, ensure_ascii=False),
+                status="flagged", new_candidates=[], mentions=[], questions=[])
             raise
         except Exception as e:
             # Kolo 3 IMPORTANT (plan-consensus) - `revise_chapter()`
@@ -857,6 +918,11 @@ _parse() validuje i TVAR metadata JSON (dict + seznamy objektů), ne jen
 syntaxi - extract_json() ověří jen že je to validní JSON, ale [] nebo
 {"new_terms": "x"} by spadlo na neklasifikovanou AttributeError misto
 InvalidTranslationOutput (plan-consensus kolo 12 IMPORTANT).
+
+pipeline.process_chapter's revizni smycka teď uloží posledni platny cz
+jako flagged PŘED re-raise fatalni chyby behem revize, ne jen po
+propagaci - bez tohohle byl _cmd_run's flagged status kosmeticky,
+translated_text zustaval ztraceny (plan-consensus kolo 13 IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
@@ -2262,6 +2328,14 @@ nahraď:
                 # jednou takhle spadla. `flagged` vyžaduje explicitní
                 # `--retry-flagged` - nedbalé "spusť run znova" ji tiše
                 # nezkusí znovu bez vědomého rozhodnutí.
+                #
+                # Kolo 13 - `state.update_chapter()` mění JEN explicitně
+                # předané sloupce (`status`/`notes`), NE `translated_text` -
+                # pokud tahle chyba přišla BĚHEM revize, `pipeline.py`
+                # (Task 2, kolo 13 fix) už `translated_text` uložil PŘED
+                # re-raise, tenhle zápis ho nepřepíše, jen NAHRADÍ `notes`
+                # obecnější run-úrovňovou diagnostikou (přijatý kompromis -
+                # detailní revizní nález se ztratí, `translated_text` ne).
                 detail = stylist._redact_detail(str(e))
                 state.update_chapter(db, ch["idx"], status="flagged",
                                      notes=json.dumps(
