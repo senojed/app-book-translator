@@ -141,3 +141,17 @@ nepouziva). IMPORTANT (FatalRunError nechavalo kapitolu v processing
 limbu, dalsi run by ji tise zaradil znovu bez explicitniho
 --retry-flagged - prijato s vyhradou o nizsi zavaznosti nez kolo 2/6,
 oprava je porad realne zlepseni).
+
+## Round 11
+
+- Codex: [round-11-codex.md](round-11-codex.md) — CHANGES_NEEDED
+- Claude: [round-11-claude.md](round-11-claude.md) — CHANGES_NEEDED
+
+Opraveno: 3x IMPORTANT + 1 NIT. args.translator=="codex" gate v
+_cmd_run reagovalo na nastaveni backendu, ne puvod chyby - kritikova
+Claude-side FatalRunError (cost guard) by dostala Codex-specificke
+flagged zachazeni; opraveno novou CodexTranslatorFatalError podtridou,
+rozliseni podle TYPU. ^marker$ regex neprijme CRLF radky (Windows-
+primarni projekt); opraveno explicitni normalizaci. Existujici timeout
+test v test_stylist.py overoval jen rodicovsky typ; zprisneno na
+StylistTimeoutError. NIT o zdokumentovani preambule-tolerance.

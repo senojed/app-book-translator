@@ -58,7 +58,10 @@ FS-risk varování jako `polish`).
   `re.MULTILINE`), NE substring `in`/`count`/`index` (kolo 9 IMPORTANT,
   plan-consensus - viz Task 2) - substring by odmítl legitimní překlad/
   JSON hodnotu s markerem-podobným textem UPROSTŘED (citace, popis
-  nápisu v knize) jako "poškozený výstup".
+  nápisu v knize) jako "poškozený výstup". `_parse()` normalizuje
+  CRLF/CR na LF JAKO PRVNÍ krok, PŘED validací (kolo 11 IMPORTANT,
+  plan-consensus - viz Task 2) - `^marker$` by na CRLF řádku bez
+  normalizace neprošlo (Windows-primární projekt).
 - `pipeline.process_chapter`'s revizní smyčka NEZAHODÍ hotový scénový
   překlad, když `revise_chapter()` selže (kolo 3 IMPORTANT, plan-
   consensus - viz Task 2) - `FatalRunError` propaguje (run se zastaví),
@@ -91,15 +94,19 @@ FS-risk varování jako `polish`).
   by timeout BĚHEM revize zahodil hotový scénový překlad a zastavil
   celý run, v přímém rozporu s Task 2's kolo-3 fixem (revizní smyčka
   má kapitolu jen `flagged`, ne ztracenou).
-- Kapitola, na které vyletí `FatalRunError` (pro `--translator codex`),
-  dostane `flagged` status (redigovaná diagnostika) PŘED re-raise, ne
-  zůstane `processing` (kolo 10 IMPORTANT, plan-consensus - viz Task 5) -
-  `state.recover_processing()` by ji jinak DALŠÍ `run` vrátila na
-  `pending` a `queue_for_run()` by ji tiše znovu zařadila, bez
-  persistentního záznamu, že už jednou takhle spadla; `flagged` vyžaduje
-  explicitní `--retry-flagged`. Gated JEN na `codex` - Claude-cesta
-  `FatalRunError` (cost guard, `LockLostError`) je před-existující
-  chování, mimo rozsah týhle plánu.
+- Kapitola, na které vyletí `CodexTranslatorFatalError` (nová podtřída
+  `FatalRunError` - Task 3), dostane `flagged` status (redigovaná
+  diagnostika) PŘED re-raise, ne zůstane `processing` (kolo 10
+  IMPORTANT, plan-consensus - viz Task 5) - `state.recover_processing()`
+  by ji jinak DALŠÍ `run` vrátila na `pending` a `queue_for_run()` by ji
+  tiše znovu zařadila, bez persistentního záznamu, že už jednou takhle
+  spadla; `flagged` vyžaduje explicitní `--retry-flagged`. Rozlišeno
+  PODLE TYPU, ne podle `args.translator == "codex"` (kolo 11 IMPORTANT,
+  plan-consensus) - obecný `FatalRunError` (kritikův cost guard,
+  `LockLostError` - kritik je VŽDY Claude, i při `--translator codex`)
+  je před-existující chování, mimo rozsah týhle plánu, a NESMÍ dostat
+  stejné zacházení jen proto, že translator backend je nastavený na
+  `codex`.
 
 ---
 
@@ -198,7 +205,13 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   POSLEDNÍ neprázdný obsah (kolo 4 BLOCKING - viz níž, `MARK_END in raw`
   samo nestačí), nebo pokud je překlad prázdný, nebo pokud metadata JSON
   je rozbité (`extract_json()`'s `ValueError` se přebalí) - PŘED čímkoliv
-  jiným, žádný tichý fallback na částečný text.
+  jiným, žádný tichý fallback na částečný text. ZNÁMÝ, VĚDOMĚ přijatý
+  toleranční limit (kolo 11 NIT, plan-consensus) - text PŘED prvním
+  `===PREKLAD===` (model chatter typu "Tady je překlad:") se tiše
+  ZAHODÍ, ne odmítne jako poškozený výstup - záměrně mírnější než po
+  markeru (přísná kontrola tam by zbytečně křehčila parser proti
+  neškodné preambuli, na rozdíl od PO markeru, kde cokoli navíc
+  signalizuje SKUTEČNÝ problém).
 - Produces: `pipeline.process_chapter`'s revizní smyčka - selže-li
   `translator.revise_chapter()` na cokoli JINÉHO než `FatalRunError`,
   smyčka se přeruší, `cz` zůstane na POSLEDNÍ platné hodnotě, kapitola
@@ -460,6 +473,17 @@ def test_marker_like_text_inside_metadata_json_does_not_confuse_parser():
     r = translator.translate_scene("x", "g", "gl",
                                    FakeLLMClient([Completion(raw, False, 5, 5)]))
     assert r.new_terms[0]["note"] == "puvodni text mel ===KONEC=== jako oddelovac"
+
+
+def test_crlf_line_endings_do_not_confuse_parser():
+    """Kolo 11 IMPORTANT (plan-consensus) - `^marker$` (re.MULTILINE) by
+    na CRLF řádku ("marker\\r\\n") neprošlo bez normalizace - `\\r`
+    zůstane mezi markerem a `$` pozicí. Windows-primární projekt."""
+    raw = ("===PREKLAD===\r\nText s CRLF.\r\n"
+           "===METADATA===\r\n{}\r\n===KONEC===\r\n")
+    r = translator.translate_scene("x", "g", "gl",
+                                   FakeLLMClient([Completion(raw, False, 5, 5)]))
+    assert r.translation == "Text s CRLF."
 ```
 
 Přidej do `tests/test_pipeline.py` (vzor existujícího
@@ -506,7 +530,7 @@ def test_revision_fatal_error_propagates_not_flagged(tmp_path, monkeypatch):
 
 - [ ] **Step 2: Ověř selhání**
 
-Run: `pytest tests/test_translator.py tests/test_pipeline.py -k "end_marker or duplicate_end or content_after_end or missing_metadata_marker or duplicate_translation_marker or duplicate_metadata_marker or markers_out_of_order or invalid_translation_output_type or system_prompts_instruct or marker_like_text or revision_recoverable or revision_fatal" -v`
+Run: `pytest tests/test_translator.py tests/test_pipeline.py -k "end_marker or duplicate_end or content_after_end or missing_metadata_marker or duplicate_translation_marker or duplicate_metadata_marker or markers_out_of_order or invalid_translation_output_type or system_prompts_instruct or marker_like_text or crlf_line_endings or revision_recoverable or revision_fatal" -v`
 Expected: FAIL - `translator.MARK_END` neexistuje (`AttributeError`),
 `_parse()` ještě netestuje konec/strukturu, revizní smyčka v
 `pipeline.py` ještě neobaluje `revise_chapter()` voláním (výjimka
@@ -589,6 +613,15 @@ def _marker_line_positions(raw: str, marker: str) -> list:
 
 
 def _parse(raw: str) -> TranslationResult:
+    # Kolo 11 IMPORTANT (plan-consensus) - normalizace CRLF/CR na LF
+    # JAKO PRVNÍ krok, PŘED řádkovou validací - `^marker$` (re.MULTILINE)
+    # by na řádku končícím "\r\n" NEPROŠLO (`\r` zůstane MEZI markerem a
+    # `$` pozicí, `$` v Pythonu matchuje těsně PŘED `\n`, ne za `\r\n`
+    # dohromady). Windows-primární projekt - `subprocess`/`open()`'s
+    # textový mód univerzální newlines obvykle řeší samy, ale tenhle
+    # parser je backend-agnostický (obrana do hloubky i pro Claude
+    # cestu, viz kolo 3), takže se na to nespoléhá.
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
     # Kolo 4 BLOCKING (plan-consensus) - pouhé "marker je NĚKDE v textu"
     # (kolo 3's `MARK_END in raw`) nestačí: marker uprostřed/duplicitní,
     # text po markeru, nebo (nejhorší) chybějící ===METADATA=== se
@@ -757,6 +790,11 @@ JSON hodnoty našla jako první výskyt a sekci předčasně uřízla; sekce se
 teď řežou přímo slicingem podle ověřených pozic (plan-consensus kolo 10
 BLOCKING).
 
+_parse() normalizuje CRLF/CR na LF jako první krok - ^marker$ regex by
+na CRLF řádku (Windows-primární projekt) bez normalizace neprošlo, i
+validní odpověď by se odmítla jako poškozená (plan-consensus kolo 11
+IMPORTANT).
+
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
 
@@ -771,7 +809,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   `StylistError`, jen jeden `raise` typ přepnutý na timeout raise-site;
   ŽÁDNÁ změna subprocess mechaniky - viz kolo 9 IMPORTANT níž, PROČ tahle
   jinak mimo-rozsah úprava je nutná)
-- Test: `tests/test_pipeline_client.py`
+- Test: `tests/test_pipeline_client.py`, `tests/test_stylist.py`
 
 **Interfaces:**
 - Consumes: `stylist._exec_codex`, `stylist.StylistError` (lokální
@@ -780,22 +818,27 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 - Produces: `stylist.StylistTimeoutError(StylistError)` - nová podtřída,
   existující `except StylistError` volající kód (`_polish_one_chapter`
   atd.) funguje beze změny (kolo 9 IMPORTANT - viz níž, PROČ).
+- Produces: `CodexTranslatorFatalError(FatalRunError)` (v `src/llm/
+  client.py`, HNED ZA `LockLostError` - stejný vzor, stejný soubor) -
+  nová podtřída, existující `except FatalRunError` volající kód (main.py
+  `_cmd_polish`/`_cmd_run`'s outer handler) funguje beze změny (kolo 11
+  IMPORTANT - viz níž, PROČ nutná).
 - Produces: `CodexLLMClient(codex_cmd: list[str], codex_model: str,
   timeout: int | None = None)` - `complete()`/`count_tokens()` stejný
   `LLMClient` protokol jako `AnthropicClient`, `.provider == "codex"`,
   `.billed_model == codex_model` (kolo 1 BLOCKING - viz níž, PROČ).
   `complete()` přebaluje `stylist.StylistError`/`OSError`/`UnicodeError`
-  na `FatalRunError` (kolo 2 BLOCKING + kolo 7 IMPORTANT - viz níž,
-  PROČ), zprávu redaguje přes `stylist._redact_detail()` (kolo 8
-  IMPORTANT) - ALE `stylist.StylistTimeoutError` (podtřída) NEpřebaluje,
-  necháváme propadnout jako obyčejnou výjimku (kolo 9 IMPORTANT - viz
-  níž, PROČ). `complete()`'s `Completion.input_tokens`/`output_tokens`
-  NENULOVÝ konzervativní odhad, ne natvrdo `0` (kolo 5 IMPORTANT - viz
-  níž, PROČ). `PipelineLLMClient._guard()` (cost-limit kontrola PŘED
-  voláním) používá `effective_model` STEJNĚ jako `_price()`/audit (už
-  součást kolo-1 opravy níž) - ověřeno samostatným testem (kolo 8
-  IMPORTANT - existující test kryl jen výsledný audit řádek, ne
-  `_guard()` samotný).
+  na `CodexTranslatorFatalError` (kolo 2 BLOCKING + kolo 7 IMPORTANT +
+  kolo 11 IMPORTANT - viz níž, PROČ), zprávu redaguje přes `stylist.
+  _redact_detail()` (kolo 8 IMPORTANT) - ALE `stylist.StylistTimeoutError`
+  (podtřída) NEpřebaluje, necháváme propadnout jako obyčejnou výjimku
+  (kolo 9 IMPORTANT - viz níž, PROČ). `complete()`'s `Completion.
+  input_tokens`/`output_tokens` NENULOVÝ konzervativní odhad, ne natvrdo
+  `0` (kolo 5 IMPORTANT - viz níž, PROČ). `PipelineLLMClient._guard()`
+  (cost-limit kontrola PŘED voláním) používá `effective_model` STEJNĚ
+  jako `_price()`/audit (už součást kolo-1 opravy níž) - ověřeno
+  samostatným testem (kolo 8 IMPORTANT - existující test kryl jen
+  výsledný audit řádek, ne `_guard()` samotný).
 
 **Kolo 5 IMPORTANT (plan-consensus) - proč `input_tokens`/`output_tokens`
 nesmí být natvrdo `0`:** `PipelineLLMClient.complete()` (`src/llm/
@@ -981,14 +1024,19 @@ def test_codex_llm_client_wraps_stylist_error_as_fatal_run_error(monkeypatch):
     _redact_detail()`, takže defaultně (`STYLIST_REPORT_REJECTED_TEXT`
     `False`, test fixture default) NEOBSAHUJE raw text - ověřuje
     REDIGOVANOU podobu, ne `match="auth expired"` (to ověřuje samostatný
-    test níž s explicitním opt-inem)."""
-    from src.llm.client import CodexLLMClient
+    test níž s explicitním opt-inem).
+
+    Kolo 11 IMPORTANT (plan-consensus) - ověřuje PŘESNÝ typ
+    `CodexTranslatorFatalError`, ne jen `FatalRunError` - `_cmd_run`
+    (Task 5) na TOMHLE typu rozlišuje flagged/redakci od obecného
+    `FatalRunError` (kritikův cost guard atd.)."""
+    from src.llm.client import CodexLLMClient, CodexTranslatorFatalError
     from src.agents.stylist import StylistError
     def boom(*a, **k):
         raise StylistError("codex exec skončil s kódem 1: auth expired")
     monkeypatch.setattr("src.agents.stylist._exec_codex", boom)
     c = CodexLLMClient(["codex"], "m")
-    with pytest.raises(FatalRunError) as exc_info:
+    with pytest.raises(CodexTranslatorFatalError) as exc_info:
         c.complete(system="s", user="u", max_tokens=10, model="m")
     assert "auth expired" not in str(exc_info.value)
     assert "potlačeny" in str(exc_info.value)
@@ -1170,6 +1218,21 @@ stejně na `ImportError` (`CodexLLMClient` ještě neexistuje).
 
 - [ ] **Step 3: Implementuj**
 
+V `src/llm/client.py`, HNED ZA `class LockLostError(FatalRunError): ...`
+(dnes řádek 17-23), přidej:
+
+```python
+class CodexTranslatorFatalError(FatalRunError):
+    """Fatální chyba VZNIKLÁ PŘÍMO v Codex-translator volání
+    (`CodexLLMClient.complete()`) - podtřída `FatalRunError`, ať VŠECHNO,
+    co dnes odchytává `except FatalRunError`, funguje beze změny. `main.
+    _cmd_run` (Task 5) ji rozlišuje SAMOSTATNĚ od obecného `FatalRunError`
+    (kritikův cost guard, `LockLostError`, atd. - ty jsou VŽDY Claude-side,
+    i při `--translator codex`, protože kritik zůstává vždy `AnthropicClient`) -
+    jen TAHLE konkrétní podtřída dostane flagged status před re-raise
+    (kolo 11 IMPORTANT, plan-consensus)."""
+```
+
 V `src/llm/client.py`, HNED ZA `class AnthropicClient` (před
 `class FakeLLMClient`), přidej:
 
@@ -1281,7 +1344,18 @@ class CodexLLMClient:
             # chyby) - jednotná redakce na výstupu z `CodexLLMClient` je
             # bezpečnější než spoléhat na to, že KAŽDÁ cesta uvnitř
             # `_exec_codex` redakci nezapomene.
-            raise FatalRunError(stylist._redact_detail(str(e))) from e
+            #
+            # Kolo 11 IMPORTANT (plan-consensus) - `CodexTranslatorFatalError`
+            # (podtřída `FatalRunError`), NE holý `FatalRunError` - `_cmd_run`
+            # (Task 5) potřebuje ROZLIŠIT "tahle fatální chyba vznikla
+            # PŘÍMO v Codex-translator volání" od "kritik (VŽDY Claude,
+            # i při `--translator codex`) narazil na cost guard/lock
+            # ztrátu" - obojí je dnes STEJNÝ `FatalRunError` typ, takže
+            # podmínka `if args.translator == "codex":` v `_cmd_run`
+            # (kolo 10 fix) by omylem flagovala/redigovala i Claude-side
+            # kritikovu chybu jen proto, že translator backend je nastavený
+            # na `codex` - v přímém rozporu s "Claude cesta beze změny".
+            raise CodexTranslatorFatalError(stylist._redact_detail(str(e))) from e
         # `truncated` VŽDY False (zdokumentovaný limit, viz spec "Známé
         # limity") - Codex nedává spolehlivý signál o useknutí na limitu
         # jako Claude `stop_reason`. Skutečné useknutí spadne na
@@ -1332,6 +1406,38 @@ nemění):
 
 ```python
             raise StylistTimeoutError(f"codex exec překročil timeout {timeout}s. [{label}]")
+```
+
+**Kolo 11 IMPORTANT (plan-consensus) - proč zpřísnit existující test:**
+`tests/test_stylist.py::test_polish_raises_on_timeout` (existující,
+PŘED tímhle plánem) dnes ověřuje `pytest.raises(stylist.StylistError,
+match="timeout")` - `StylistTimeoutError` JE `StylistError` (podtřída),
+takže tenhle test projde STEJNĚ, ať se raise-site typ opraví, nebo
+NEOPRAVÍ (regrese - někdo omylem vrátí `raise StylistError(...)` - by
+tenhle test nezachytil). Testy v `tests/test_pipeline_client.py`
+(Step 1 výš) navíc mockují `_exec_codex` PŘÍMO na `StylistTimeoutError`,
+takže NEOVĚŘUJÍ, že SKUTEČNÁ `subprocess.TimeoutExpired` větev uvnitř
+`_exec_codex()` tenhle typ opravdu vytváří.
+
+V `tests/test_stylist.py`, najdi:
+
+```python
+def test_polish_raises_on_timeout(tmp_path):
+    fake = tmp_path / "slow.py"
+    fake.write_text("import time; time.sleep(5)")
+    with pytest.raises(stylist.StylistError, match="timeout"):
+        stylist.polish("EN", "CZ", codex_cmd=[sys.executable, str(fake)], timeout=1)
+```
+
+nahraď (zpřísní typ na `StylistTimeoutError` - reálný subprocess
+timeout, ne mock, ověřuje SKUTEČNOU `_exec_codex()`'s raise-site):
+
+```python
+def test_polish_raises_on_timeout(tmp_path):
+    fake = tmp_path / "slow.py"
+    fake.write_text("import time; time.sleep(5)")
+    with pytest.raises(stylist.StylistTimeoutError, match="timeout"):
+        stylist.polish("EN", "CZ", codex_cmd=[sys.executable, str(fake)], timeout=1)
 ```
 
 **Kolo 1 BLOCKING oprava - `PipelineLLMClient.complete()`** (`src/llm/
@@ -1388,7 +1494,7 @@ vědět, KTERÝ Claude model volat); `CodexLLMClient.complete()` svůj
 
 - [ ] **Step 4: Ověř úspěch**
 
-Run: `pytest tests/test_pipeline_client.py tests/test_pipeline.py -v`
+Run: `pytest tests/test_pipeline_client.py tests/test_pipeline.py tests/test_stylist.py -v`
 Expected: PASS (všechny, včetně existujících - `effective_model` fallback
 na `model` pro klienty bez `billed_model` znamená NULOVOU změnu chování
 pro `AnthropicClient`/`FakeLLMClient` cestu)
@@ -1396,7 +1502,7 @@ pro `AnthropicClient`/`FakeLLMClient` cestu)
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/llm/client.py src/agents/stylist.py tests/test_pipeline_client.py tests/test_pipeline.py
+git add src/llm/client.py src/agents/stylist.py tests/test_pipeline_client.py tests/test_pipeline.py tests/test_stylist.py
 git commit -m "feat: CodexLLMClient + oprava PipelineLLMClient cena/audit pro Codex
 
 PipelineLLMClient.complete() teď používá inner klienta 'billed_model'
@@ -1438,6 +1544,16 @@ FatalRunError (na rozdíl od ostatních StylistError příčin) - bez týhle
 opravy by timeout BĚHEM revize zahodil hotový scénový překlad a zastavil
 celý run, přímo v rozporu s Tasku 2's kolo-3 fixem (plan-consensus
 kolo 9 IMPORTANT).
+
+Nová CodexTranslatorFatalError (podtřída FatalRunError) - main.py's
+_cmd_run (Task 5) ji rozlišuje SAMOSTATNĚ od obecného FatalRunError
+(kritikův cost guard - kritik je vždy Claude, i při --translator codex),
+ať flagged/redakce dostane jen chyba, co skutečně vznikla v Codex-
+translator volání (plan-consensus kolo 11 IMPORTANT).
+
+Zpřísněn tests/test_stylist.py::test_polish_raises_on_timeout na
+StylistTimeoutError - reálná subprocess.TimeoutExpired větev, ne mock,
+ověřuje SKUTEČNOU raise-site opravu (plan-consensus kolo 11 IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
@@ -1855,9 +1971,15 @@ def test_run_translator_codex_invalid_translation_output_is_fatal(tmp_path, monk
 def test_run_translator_codex_fatal_error_flags_chapter_not_silently_retried(
         tmp_path, monkeypatch):
     """Kolo 10 IMPORTANT (plan-consensus) - kapitola, na které vyletí
-    FatalRunError (rozbitý CLI/auth), musí dostat persistentní `flagged`
-    status, NE zůstat `processing`→`pending` limbo, co by DALŠÍ `run`
-    (bez explicitního `--retry-flagged`) tiše znovu zkusil."""
+    CodexTranslatorFatalError (rozbitý CLI/auth), musí dostat
+    persistentní `flagged` status, NE zůstat `processing`→`pending`
+    limbo, co by DALŠÍ `run` (bez explicitního `--retry-flagged`) tiše
+    znovu zkusil.
+
+    Kolo 11 IMPORTANT (plan-consensus) - mock používá SPECIFICKY
+    `CodexTranslatorFatalError` (ne holý `FatalRunError`) - `_cmd_run`
+    teď rozlišuje podle TYPU, ne podle `args.translator`."""
+    from src.llm.client import CodexTranslatorFatalError
     book = tmp_path / "k.txt"
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
@@ -1866,7 +1988,7 @@ def test_run_translator_codex_fatal_error_flags_chapter_not_silently_retried(
     calls = {"n": 0}
     def boom(db_path, chapter, *, client_factory, guide):
         calls["n"] += 1
-        raise FatalRunError("codex auth expired")
+        raise CodexTranslatorFatalError("codex auth expired")
     monkeypatch.setattr(P, "process_chapter", boom)
     assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
     assert state.get_chapter("data/state.sqlite3", 1)["status"] == "flagged"
@@ -1876,6 +1998,25 @@ def test_run_translator_codex_fatal_error_flags_chapter_not_silently_retried(
     assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 0
     assert calls["n"] == 1
     assert state.get_chapter("data/state.sqlite3", 1)["status"] == "flagged"
+
+
+def test_run_translator_codex_generic_fatal_run_error_from_critic_not_flagged(
+        tmp_path, monkeypatch):
+    """Kolo 11 IMPORTANT (plan-consensus) - obecný FatalRunError (např.
+    kritikův cost guard - kritik zůstává VŽDY Claude, i při --translator
+    codex) NESMÍ dostat flagged/redakci určenou pro Codex-translator
+    selhání - beze změny oproti chování PŘED tímhle plánem (kapitola
+    zůstane processing, žádná falešná diagnostika o "chybě od Codexu")."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    import src.pipeline as P
+    def boom(db_path, chapter, *, client_factory, guide):
+        raise FatalRunError("Cost guard: strop $5.00 překročen")
+    monkeypatch.setattr(P, "process_chapter", boom)
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
+    assert state.get_chapter("data/state.sqlite3", 1)["status"] in ("pending", "processing")
 
 
 def test_run_translator_claude_invalid_translation_output_stays_per_chapter_error(
@@ -1915,6 +2056,13 @@ přidej:
                        default="claude",
                        help="překladatelský backend (default claude; "
                             "codex vyžaduje STYLIST_ACCEPT_FS_RISK=True)")
+```
+
+Rozšiř import na main.py (z Tasku 4) o `CodexTranslatorFatalError`:
+
+```python
+from src.llm.client import (AnthropicClient, CodexLLMClient, CodexTranslatorFatalError,
+                           FatalRunError, LockLostError, OutputTruncated, PipelineLLMClient)
 ```
 
 V `_cmd_run` (main.py:990-1000), najdi:
@@ -1985,7 +2133,17 @@ V `_cmd_run`'s hlavní zpracovací smyčce (main.py:1010-1021), najdi:
 nahraď:
 
 ```python
-            except FatalRunError as e:
+            except CodexTranslatorFatalError as e:
+                # Kolo 11 IMPORTANT (plan-consensus) - SAMOSTATNÁ větev
+                # PŘED obecným `except FatalRunError` níž - TYP sám
+                # garantuje, že chyba vznikla PŘÍMO v Codex-translator
+                # volání (CodexLLMClient), NE v kritikovi (VŽDY Claude,
+                # i při `--translator codex`, viz Global Constraints) -
+                # žádná `if args.translator == "codex":` běhová podmínka
+                # potřeba, typ to už zaručuje (na rozdíl od kola 10's
+                # původní verze, co gatovala podle `args.translator`
+                # a omylem flagovala i Claude-side kritikovy chyby).
+                #
                 # Kolo 10 IMPORTANT (plan-consensus) - BEZ týhle opravy
                 # zůstane kapitola v `processing` - příští `run` (main.py,
                 # kolo 8 fix) ji přes `state.recover_processing()` vrátí
@@ -1993,18 +2151,18 @@ nahraď:
                 # persistentního záznamu, že tahle KONKRÉTNÍ kapitola už
                 # jednou takhle spadla. `flagged` vyžaduje explicitní
                 # `--retry-flagged` - nedbalé "spusť run znova" ji tiše
-                # nezkusí znovu bez vědomého rozhodnutí. Gated JEN na
-                # `codex` - Claude-cesta `FatalRunError` (cost guard,
-                # `LockLostError`) je PŘED-EXISTUJÍCÍ chování, mimo
-                # rozsah týhle plánu (nemění se).
-                if args.translator == "codex":
-                    detail = stylist._redact_detail(str(e))
-                    state.update_chapter(db, ch["idx"], status="flagged",
-                                         notes=json.dumps(
-                                             {"error": f"fatální chyba běhu: "
-                                                      f"{type(e).__name__}: {detail}"},
-                                             ensure_ascii=False))
+                # nezkusí znovu bez vědomého rozhodnutí.
+                detail = stylist._redact_detail(str(e))
+                state.update_chapter(db, ch["idx"], status="flagged",
+                                     notes=json.dumps(
+                                         {"error": f"fatální chyba běhu: "
+                                                  f"{type(e).__name__}: {detail}"},
+                                         ensure_ascii=False))
                 raise                      # celý běh KONČÍ i tak
+            except FatalRunError:
+                raise                      # BEZE ZMĚNY - kritikova chyba
+                                           # (cost guard, LockLostError),
+                                           # Claude-side, mimo rozsah plánu
             except translator.InvalidTranslationOutput as e:
                 # Kolo 6 IMPORTANT (plan-consensus) - `translate_scene()`'s
                 # scénová smyčka (pipeline.py) NENÍ obalená (na rozdíl od
@@ -2017,19 +2175,17 @@ nahraď:
                 # of scope (spike ho nepozoroval), Claude cesta spadne do
                 # existující generické větve níž, beze změny.
                 if args.translator == "codex":
-                    # Kolo 10 IMPORTANT (plan-consensus) - STEJNÁ flagged
-                    # oprava jako `except FatalRunError` výš (tenhle
-                    # `raise FatalRunError(...) from e` běží UVNITŘ
-                    # týhle except větve, takže sesterská `except
-                    # FatalRunError` ho NEZACHYTÍ - bez duplikace by
-                    # tahle cesta zůstala v "processing" limbu, i když
-                    # ta výš už opravená je).
+                    # `CodexTranslatorFatalError` (kolo 11), NE holý
+                    # `FatalRunError` - `raise` UVNITŘ týhle except větve
+                    # neprojde přes sesterskou `except CodexTranslatorFatalError`
+                    # výš (raise uvnitř except propadá z CELÉHO try/except),
+                    # takže flagged logiku duplikujeme (stejná jako výš).
                     detail = stylist._redact_detail(str(e))
                     state.update_chapter(db, ch["idx"], status="flagged",
                                          notes=json.dumps(
                                              {"error": f"neplatný formát překladu: {detail}"},
                                              ensure_ascii=False))
-                    raise FatalRunError(
+                    raise CodexTranslatorFatalError(
                         f"Neplatný formát překladu od Codexu: {detail}") from e
                 state.update_chapter(db, ch["idx"], status="error",
                                      notes=json.dumps(
@@ -2101,10 +2257,16 @@ eager preflight kontrolou - jinak by --translator codex s nesplněnou
 podmínkou nechalo kapitoly uvízlé v processing navěky neviditelné pro
 queue_for_run (plan-consensus kolo 8 IMPORTANT).
 
-Kapitola, na které vyletí FatalRunError (--translator codex), dostane
-flagged status s redigovanou diagnostikou PŘED re-raise - jinak by
-zůstala processing->pending limbo a další run by ji tiše znovu zařadil
-bez explicitního --retry-flagged (plan-consensus kolo 10 IMPORTANT).
+Kapitola, na které vyletí CodexTranslatorFatalError, dostane flagged
+status s redigovanou diagnostikou PŘED re-raise - jinak by zůstala
+processing->pending limbo a další run by ji tiše znovu zařadil bez
+explicitního --retry-flagged (plan-consensus kolo 10 IMPORTANT).
+
+Rozlišení podle TYPU (CodexTranslatorFatalError), ne podle
+args.translator - obecný FatalRunError (kritikův cost guard, kritik je
+VŽDY Claude i při --translator codex) by jinak dostal stejné
+flagged/redakci určené pro Codex-translator selhání, i když s Codexem
+nemá nic společného (plan-consensus kolo 11 IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
