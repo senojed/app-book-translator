@@ -72,3 +72,17 @@ output_tokens=0 natvrdo - main._print_usage() by po zpracování celé
 knihy ukázalo "0 tokenů" i přes reálnou práci; opraveno konzervativním
 odhadem, stejný vzorec jako count_tokens()). NIT (přidán regresní test,
 že oba systémové prompty obsahují ===KONEC=== instrukci).
+
+## Round 6
+
+- Codex: [round-6-codex.md](round-6-codex.md) — CHANGES_NEEDED
+- Claude: [round-6-claude.md](round-6-claude.md) — CHANGES_NEEDED
+
+Opraveno: BLOCKING (kolo 5's token-odhad test měl špatný vzorec vs.
+implementace - opraven test, implementace byla správně). IMPORTANT
+(translator._parse()'s ValueError ze SCÉNOVÉ smyčky, na rozdíl od
+revizní, propadal jako obyčejný per-kapitolový error - state.
+queue_for_run by ho tiše retryoval navěky při formát-driftu Codexu;
+nová InvalidTranslationOutput podtřída ValueError, --translator codex
+ji dělá fatální stejně jako kolo-2's StylistError fix). Přidány
+negativní testy pro duplicitní PREKLAD/METADATA marker a špatné pořadí.
