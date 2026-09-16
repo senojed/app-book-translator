@@ -30,17 +30,6 @@ FS-risk varování jako `polish`).
   `PipelineLLMClient._price()` vyhodí `FatalRunError` ("nemá sazby").
 - `CodexLLMClient.complete()`'s `truncated` je VŽDY `False` - zdokumentovaný
   limit (viz spec "Známé limity"), ne bug.
-- `pipeline.process_chapter` volá `translator.translate_scene`/`revise_
-  chapter` BEZ `model=` argumentu → `config.MODEL_TRANSLATOR` ("claude-
-  sonnet-5") defaultně. `PipelineLLMClient` proto MUSÍ pro cenu/audit
-  použít `CodexLLMClient.billed_model`, NE tenhle caller-supplied `model`
-  (kolo 1 BLOCKING, plan-consensus) - jinak Task 1's `$0.0` ceny se
-  nikdy nepoužijí a audit log lže o tom, jaký model běžel.
-- `StylistError` ze `_exec_codex` zůstává per-kapitolová chyba
-  (`_cmd_run`'s `except Exception: status="error"`), NENÍ `FatalRunError`
-  - stejný precedent jako `_polish_one_chapter`'s zpracování stejné
-  třídy chyby z `stylist.polish()`. Vědomé rozhodnutí (kolo 1 IMPORTANT,
-  plan-consensus - zdůvodnění v Tasku 2), ne mezera.
 
 ---
 
@@ -51,7 +40,6 @@ FS-risk varování jako `polish`).
 
 **Interfaces:**
 - Produces: `config.CODEX_TRANSLATE_TIMEOUT_SECONDS` (int),
-  `config.CODEX_TRANSLATE_MAX_CHARS` (int),
   `config.PRICE_IN_PER_MTOK[config.CODEX_MODEL] == 0.0`,
   `config.PRICE_OUT_PER_MTOK[config.CODEX_MODEL] == 0.0`.
 
@@ -66,11 +54,6 @@ def test_codex_model_has_zero_price_entries():
 def test_codex_translate_timeout_seconds_is_positive_int():
     assert isinstance(config_module.CODEX_TRANSLATE_TIMEOUT_SECONDS, int)
     assert config_module.CODEX_TRANSLATE_TIMEOUT_SECONDS > 0
-
-
-def test_codex_translate_max_chars_is_positive_int():
-    assert isinstance(config_module.CODEX_TRANSLATE_MAX_CHARS, int)
-    assert config_module.CODEX_TRANSLATE_MAX_CHARS > 0
 ```
 
 Přidej do `tests/test_config.py` (existující soubor z Tasku 1 dřívějšího
@@ -80,10 +63,9 @@ tyhle dva testy ho nepotřebují, čtou jen statickou hodnotu).
 
 - [ ] **Step 2: Ověř selhání**
 
-Run: `pytest tests/test_config.py -k "codex_model_has_zero_price or codex_translate_timeout or codex_translate_max_chars" -v`
+Run: `pytest tests/test_config.py -k "codex_model_has_zero_price or codex_translate_timeout" -v`
 Expected: FAIL - `AttributeError`/`KeyError` (config.py ještě nemá ani
-`CODEX_TRANSLATE_TIMEOUT_SECONDS`/`CODEX_TRANSLATE_MAX_CHARS`, ani ceny
-pro `CODEX_MODEL`)
+`CODEX_TRANSLATE_TIMEOUT_SECONDS`, ani ceny pro `CODEX_MODEL`)
 
 - [ ] **Step 3: Implementuj**
 
@@ -108,15 +90,6 @@ Najdi `STYLIST_TIMEOUT_SECONDS = 180` a přidej vedle:
 # (kapitoly nad CHAPTER_SPLIT_WORD_THRESHOLD se dělí na víc scén, každá
 # JEDNO volání zvlášť).
 CODEX_TRANSLATE_TIMEOUT_SECONDS = 300
-
-# Kolo 1 IMPORTANT (plan-consensus) - `stylist.polish()` má VLASTNÍ
-# `STYLIST_MAX_CHARS` guard (stylist.py:514), ale ten běží AŽ UVNITŘ
-# `polish()`, PŘED voláním `_exec_codex()` - `CodexLLMClient.complete()`
-# (Task 2) volá `_exec_codex()` PŘÍMO, takže tenhle guard nedědí.
-# Samostatná konstanta (NE reuse `STYLIST_MAX_CHARS`) - jiná kompozice
-# promptu (systém+návod+glosář+scéna, nebo EN+předchozí CZ+nálezy u
-# revize), ne jen EN+CZ jako u polish.
-CODEX_TRANSLATE_MAX_CHARS = 60_000
 ```
 
 - [ ] **Step 4: Ověř úspěch**
@@ -135,11 +108,10 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 2: `CodexLLMClient` v `src/llm/client.py` + oprava `PipelineLLMClient` cena/audit
+### Task 2: `CodexLLMClient` v `src/llm/client.py`
 
 **Files:**
-- Modify: `src/llm/client.py` (`CodexLLMClient` - nová; `PipelineLLMClient.
-  complete()` - oprava, viz kolo 1 BLOCKING níž)
+- Modify: `src/llm/client.py`
 - Test: `tests/test_pipeline_client.py`
 
 **Interfaces:**
@@ -147,35 +119,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   ne na úrovni modulu - viz Global Constraints v designu, vrstvení).
 - Produces: `CodexLLMClient(codex_cmd: list[str], codex_model: str,
   timeout: int | None = None)` - `complete()`/`count_tokens()` stejný
-  `LLMClient` protokol jako `AnthropicClient`, `.provider == "codex"`,
-  `.billed_model == codex_model` (kolo 1 BLOCKING - viz níž, PROČ).
-
-**Kolo 1 BLOCKING (plan-consensus) - proč `billed_model`:** `pipeline.
-process_chapter` volá `translator.translate_scene(scene, guide_block,
-glossary_block, client_factory("translator"))` BEZ `model=` argumentu →
-`translate_scene`'s `model=None` default → `translator._complete()`'s
-`model=model or config.MODEL_TRANSLATOR` → VŽDY `"claude-sonnet-5"`
-(`config.py:55`), bez ohledu na to, jestli translator je `AnthropicClient`
-nebo `CodexLLMClient`. Tahle hodnota jde do `PipelineLLMClient.complete
-(model="claude-sonnet-5")`, co ji použije PŘÍMO pro `self._price(model)`
-(cenová tabulka `PRICE_*_PER_MTOK["claude-sonnet-5"]` = $2/$10, NE Task
-1's `$0.0` pro `CODEX_MODEL`) i pro `record_llm_call(model=model, ...)`
-(audit řádek by tvrdil, že proběhlo Claude volání, i když ve skutečnosti
-běžel Codex subprocess). Beze zásahu by Task 1's nulové ceny NIKDY
-nepřišly ke slovu a cost guard by u KAŽDÉHO Codex-translator volání
-počítal s cenou Claude modelu za něco, co ve skutečnosti nic nestojí -
-zbytečné/matoucí zásahy cost guardu, plus nepravdivý audit log.
-
-**Oprava:** `CodexLLMClient` má `billed_model` atribut. `PipelineLLMClient.
-complete()` spočítá `effective_model = getattr(self._inner, "billed_model",
-None) or model` a použije ho MÍSTO `model` pro `_guard()`/`_price()`/
-`record_llm_call(model=...)`. Skutečné volání `self._inner.complete(model=
-model, ...)` dostává PŮVODNÍ `model` beze změny (jediná správná hodnota
-pro `AnthropicClient`; `CodexLLMClient` ho stejně ignoruje - viz jeho
-`complete()` níž). `AnthropicClient`/`FakeLLMClient` nemají `billed_model`
-atribut - `getattr(..., None)` tam spadne na `model` param, NULOVÁ změna
-chování pro existující Claude cestu (proto testy níž ověřují OBOJÍ -
-Codex cestu i že Claude cesta zůstala nedotčená).
+  `LLMClient` protokol jako `AnthropicClient`, `.provider == "codex"`.
 
 - [ ] **Step 1: Napiš test**
 
@@ -219,70 +163,12 @@ def test_codex_llm_client_count_tokens_is_conservative_estimate():
     from src.llm.client import CodexLLMClient
     c = CodexLLMClient(["codex"], "m")
     assert c.count_tokens(system="abcd", user="efgh", model="m") == 4   # (4+4)//2
-
-
-def test_codex_llm_client_billed_model_is_codex_model_not_caller_model():
-    from src.llm.client import CodexLLMClient
-    c = CodexLLMClient(["codex"], "gpt-5.6-terra")
-    assert c.billed_model == "gpt-5.6-terra"
-
-
-def test_codex_llm_client_rejects_prompt_over_max_chars(monkeypatch):
-    from src.llm.client import CodexLLMClient
-    import config
-    monkeypatch.setattr(config, "CODEX_TRANSLATE_MAX_CHARS", 10)
-    def boom(*a, **k):
-        raise AssertionError("_exec_codex se nemá volat na moc velký prompt")
-    monkeypatch.setattr("src.agents.stylist._exec_codex", boom)
-    c = CodexLLMClient(["codex"], "m")
-    from src.agents.stylist import StylistError
-    with pytest.raises(StylistError, match="CODEX_TRANSLATE_MAX_CHARS"):
-        c.complete(system="123456", user="7890AB", max_tokens=10, model="m")   # 12 > 10
-
-
-def test_pipeline_client_uses_billed_model_for_price_not_caller_model(monkeypatch, tmp_path):
-    """Kolo 1 BLOCKING (plan-consensus) - jádro opravy. `PipelineLLMClient`
-    dostane `model="claude-sonnet-5"` (přesně to, co `translator.py`
-    reálně posílá), ale `self._inner` (Codex) má `billed_model="codex-x"`
-    s NULOVOU cenou - cena/audit MUSÍ použít `billed_model`, ne
-    `"claude-sonnet-5"` (co by mělo nenulovou cenu a spadlo by na
-    přísahu FatalRunError "nemá sazby", protože `"claude-sonnet-5"`
-    sazby MÁ, ale skutečně běžel Codex, ne Claude)."""
-    db = _db(tmp_path)
-    rid = state.create_run(db, "run")
-    monkeypatch.setattr(config, "PRICE_IN_PER_MTOK",
-                        {**config.PRICE_IN_PER_MTOK, "codex-x": 0.0})
-    monkeypatch.setattr(config, "PRICE_OUT_PER_MTOK",
-                        {**config.PRICE_OUT_PER_MTOK, "codex-x": 0.0})
-
-    class FakeCodexInner:
-        provider = "codex"
-        billed_model = "codex-x"
-        def complete(self, *, system, user, max_tokens, model):
-            return Completion(text="ok", truncated=False, input_tokens=100, output_tokens=50)
-        def count_tokens(self, *, system, user, model):
-            return 10
-
-    c = PipelineLLMClient(FakeCodexInner(), run_id=rid, agent="translator",
-                          db_path=db, config_mod=config)
-    # `model="claude-sonnet-5"` - PŘESNĚ to, co `translator.py` reálně
-    # posílá (žádný explicitní `model=` argument z `pipeline.py`).
-    c.complete(system="s", user="u", max_tokens=10, model="claude-sonnet-5")
-    with state.connect(db) as conn:
-        row = conn.execute("SELECT * FROM llm_calls").fetchone()
-    assert row["model"] == "codex-x"        # NE "claude-sonnet-5"
-    assert row["cost_usd"] == 0.0            # nulová cena z `billed_model`
 ```
 
 - [ ] **Step 2: Ověř selhání**
 
-Run: `pytest tests/test_pipeline_client.py -k "codex_llm_client or pipeline_client_uses_billed_model" -v`
+Run: `pytest tests/test_pipeline_client.py -k codex_llm_client -v`
 Expected: FAIL - `ImportError: cannot import name 'CodexLLMClient'`
-(a `test_pipeline_client_uses_billed_model_for_price_not_caller_model`
-padne jinak - `AttributeError: 'FakeCodexInner' object has no attribute`
-NEBO projde náhodou, pokud `PipelineLLMClient` ještě `billed_model`
-nezná a prostě použije `model` beze změny → `row["model"] ==
-"claude-sonnet-5"`, ne `"codex-x"` → assert selže. Obojí je platné FAIL.)
 
 - [ ] **Step 3: Implementuj**
 
@@ -294,11 +180,11 @@ class CodexLLMClient:
     """`LLMClient` obal nad `codex exec` subprocess voláním (`stylist.
     _exec_codex`) - stejný protokol jako `AnthropicClient`, takže
     `PipelineLLMClient` ho obalí beze změny (stejný audit/cost-guard
-    kód, jen s cenou $0/token - viz `billed_model`/`config.PRICE_IN_
-    PER_MTOK[CODEX_MODEL]`). Používá se pro `agent="translator"` při
-    `--translator codex` (main.py `_client_factory`) - kritik zůstává
-    VŽDY na `AnthropicClient` (spike 2026-09-16 ukázal nespolehlivost
-    Codex jako kritika, viz spec)."""
+    kód, jen s cenou $0/token - viz `config.PRICE_IN_PER_MTOK[CODEX_
+    MODEL]`). Používá se pro `agent="translator"` při `--translator
+    codex` (main.py `_client_factory`) - kritik zůstává VŽDY na
+    `AnthropicClient` (spike 2026-09-16 ukázal nespolehlivost Codex
+    jako kritika, viz spec)."""
     provider = "codex"
 
     def __init__(self, codex_cmd: list[str], codex_model: str,
@@ -306,16 +192,6 @@ class CodexLLMClient:
         self._codex_cmd = codex_cmd
         self._codex_model = codex_model
         self._timeout = timeout
-        # Kolo 1 BLOCKING (plan-consensus) - `pipeline.process_chapter`
-        # volá `translator.translate_scene`/`revise_chapter` BEZ
-        # `model=` argumentu, takže `translator.py` VŽDY defaultuje na
-        # `config.MODEL_TRANSLATOR` ("claude-sonnet-5"), bez ohledu na
-        # to, jaký klient je skutečně pod kapotou. `PipelineLLMClient`
-        # (viz jeho oprava níž) čte TENHLE atribut MÍSTO toho
-        # caller-supplied `model` pro cenu/audit - jinak by Codex
-        # volání dostala cenu Claude modelu a audit log by lhal o tom,
-        # co skutečně běželo.
-        self.billed_model = codex_model
 
     def complete(self, *, system: str, user: str, max_tokens: int, model: str) -> Completion:
         # Lokální import (ne na úrovni modulu) - `client.py` je
@@ -326,22 +202,6 @@ class CodexLLMClient:
         # complete()`'s `from src import state`).
         import config
         from src.agents import stylist
-        # Kolo 1 IMPORTANT (plan-consensus) - `stylist.polish()` má
-        # VLASTNÍ `STYLIST_MAX_CHARS` guard, ale ten běží AŽ UVNITŘ
-        # `polish()`, PŘED `_exec_codex()` voláním - tady voláme
-        # `_exec_codex()` PŘÍMO, takže ho nedědíme. Bez týhle kontroly
-        # by extrémně dlouhý prompt (dlouhá scéna + velký glosář, nebo
-        # celá kapitola EN+CZ+nálezy u revize) stejně pravděpodobně
-        # vyčerpal `timeout` a dal jen obecnou `StylistError` o
-        # timeoutu, ne jasnou zprávu proč (stejné zdůvodnění jako
-        # `stylist.polish()`'s vlastní guard, `stylist.py:494-499`).
-        combined_len = len(system) + len(user)
-        if combined_len > config.CODEX_TRANSLATE_MAX_CHARS:
-            raise stylist.StylistError(
-                f"prompt pro Codex translator je moc velký ({combined_len} "
-                f"znaků, limit config.CODEX_TRANSLATE_MAX_CHARS="
-                f"{config.CODEX_TRANSLATE_MAX_CHARS}) - přeskakuji, aby "
-                "se nečekalo na jistý timeout.")
         prompt = f"{system}\n\n{user}"
         timeout = self._timeout or config.CODEX_TRANSLATE_TIMEOUT_SECONDS
         text = stylist._exec_codex(prompt, codex_cmd=self._codex_cmd,
@@ -361,76 +221,17 @@ class CodexLLMClient:
         return (len(system) + len(user)) // 2
 ```
 
-**Kolo 1 BLOCKING oprava - `PipelineLLMClient.complete()`** (`src/llm/
-client.py`, dnešní řádky ~195-245, viz "Kolo 1 BLOCKING" vysvětlení
-výš). Najdi:
-
-```python
-    def complete(self, *, system: str, user: str, max_tokens: int, model: str) -> Completion:
-        from src import state
-```
-
-a HNED ZA `from src import state` přidej:
-
-```python
-        # Kolo 1 BLOCKING (plan-consensus 2026-09-16) - `self._inner`
-        # může ignorovat `model` param úplně (`CodexLLMClient` vždy
-        # execuje SVŮJ fixní `billed_model`, bez ohledu na to, co
-        # `translator.py` defaultně pošle - `config.MODEL_TRANSLATOR`).
-        # Cost guard i audit musí odrážet, co SE SKUTEČNĚ spustilo (a
-        # za co se SKUTEČNĚ platí), ne co volající předpokládal.
-        # `AnthropicClient`/`FakeLLMClient` nemají `billed_model` -
-        # `getattr(...) is None` spadne zpátky na `model` param beze
-        # změny chování pro existující Claude cestu.
-        effective_model = getattr(self._inner, "billed_model", None) or model
-```
-
-Pak nahraď VŠECHNY tři existující výskyty holého `model` (ne `max_tokens`
-ani `self._inner.complete(model=model, ...)` - TAM zůstává PŮVODNÍ
-`model`, viz níž proč) uvnitř týhle metody `effective_model`:
-
-```python
-        self._guard(system, user, max_tokens, effective_model)
-        ...
-        in_rate, out_rate = self._price(effective_model)
-```
-
-a v `finally` bloku `record_llm_call`'s `model=model` na `model=
-effective_model`:
-
-```python
-                state.record_llm_call(
-                    self._db, run_id=self._run_id, agent=self._agent,
-                    provider=getattr(self._inner, "provider", "unknown"),
-                    model=effective_model, input_tokens=it, output_tokens=ot,
-                    cost_usd=cost, truncated=bool(comp.truncated) if comp else False,
-                    status=status, error_class=err)
-```
-
-`self._inner.complete(system=system, user=user, max_tokens=max_tokens,
-model=model)` (skutečné volání o pár řádků výš) NECHÁVÁ PŮVODNÍ `model`
-BEZE ZMĚNY - pro `AnthropicClient` je to jediná správná hodnota (musí
-vědět, KTERÝ Claude model volat); `CodexLLMClient.complete()` svůj
-`model` parametr stejně ignoruje (viz kód výš, používá `self._codex_model`).
-
 - [ ] **Step 4: Ověř úspěch**
 
 Run: `pytest tests/test_pipeline_client.py -v`
-Expected: PASS (všechny, včetně existujících - `effective_model` fallback
-na `model` pro klienty bez `billed_model` znamená NULOVOU změnu chování
-pro `AnthropicClient`/`FakeLLMClient` cestu)
+Expected: PASS (všechny, včetně existujících - `CodexLLMClient` nic
+nemění na `AnthropicClient`/`PipelineLLMClient`)
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/llm/client.py tests/test_pipeline_client.py
-git commit -m "feat: CodexLLMClient + oprava PipelineLLMClient cena/audit pro Codex
-
-PipelineLLMClient.complete() teď používá inner klienta 'billed_model'
-(pokud existuje) místo caller-supplied 'model' pro cost guard i audit -
-translator.py vždy defaultuje na config.MODEL_TRANSLATOR bez ohledu na
-skutečně použitý backend, takže bez týhle opravy by Codex volání
-dostala cenu/audit záznam Claude modelu (plan-consensus kolo 1 BLOCKING).
+git commit -m "feat: CodexLLMClient - LLMClient obal nad codex exec subprocess
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
@@ -469,7 +270,6 @@ def test_client_factory_translator_backend_codex_uses_codex_client(monkeypatch):
     assert isinstance(client._inner, CodexLLMClient)
     assert client._inner._codex_model == "m"
     assert client._inner._codex_cmd == ["codex", "resolved"]
-    assert client._inner.billed_model == "m"
 
 
 def test_client_factory_translator_backend_codex_critic_stays_claude(monkeypatch):
@@ -711,32 +511,18 @@ Expected: PASS, 0 chyb.
 
 - [ ] **Step 2: Manuální ověření na reálné kapitole**
 
-**NE rovnou nad `data/state.sqlite3` u prvního ostrého spuštění** -
-`run` nemá `--db` parametr, vždy čte `config.DB_PATH` (`config.py:39-42`,
-odvozené z `config.PROJECT_DIR`). Použij existující mechanismus na
-izolovaný projektový adresář (`BOOK_TRANSLATOR_PROJECT_DIR` env var,
-z dřívějšího Tasku "parametrizuj kořenovou složku projektu") - NE
-prostý `cp` databáze (kolo 1 IMPORTANT, plan-consensus - `run`/`state.
-connect` by furt mířily na `data/state.sqlite3` v aktuálním adresáři,
-kopie by se nikdy nepoužila):
+**NE rovnou nad `data/state.sqlite3` u prvního ostrého spuštění** - použij
+kopii DB (stejný vzor jako spike testy, `data/spikes/`) NEBO jednu
+konkrétní `pending` kapitolu, kterou je bezpečné přepsat:
 
 ```bash
-mkdir -p /tmp/codex-translator-smoke/data
-cp data/state.sqlite3 /tmp/codex-translator-smoke/data/state.sqlite3
-cp data/guide.json /tmp/codex-translator-smoke/data/guide.json
-BOOK_TRANSLATOR_PROJECT_DIR=/tmp/codex-translator-smoke \
-  python main.py run --translator codex --only <idx>
-BOOK_TRANSLATOR_PROJECT_DIR=/tmp/codex-translator-smoke \
-  python main.py status
+python main.py run --translator codex --only <idx>
+python main.py status
 ```
 
 Zkontroluj: kapitola má rozumný český text, `new_terms`/`questions` (pokud
-kapitola nějaké má) vypadají smysluplně,
-`BOOK_TRANSLATOR_PROJECT_DIR=/tmp/codex-translator-smoke python main.py
-polish --only <idx>` (Codex, beze změny) na výsledku projde stejně jako
-dřív. Teprve PO tomhle ověření zkus `--translator codex` i nad reálnou
-`data/state.sqlite3` (bez `BOOK_TRANSLATOR_PROJECT_DIR`), na jedné
-konkrétní `pending` kapitole.
+kapitola nějaké má) vypadají smysluplně, `python main.py polish --only
+<idx>` (Codex, beze změny) na výsledku projde stejně jako dřív.
 
 - [ ] **Step 3: Invoke `superpowers:finishing-a-development-branch`**
 
