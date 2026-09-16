@@ -46,3 +46,18 @@ obešla). IMPORTANT (chybové hlášky z --translator codex jdou přes
 stylist._redact_detail() jako u _cmd_polish - extract_json()'s ValueError
 nese až 2000 raw znaků do chapters.notes bez redakce). Plán přeuspořádán:
 nová Task 2, staré Task 2-5 posunuté na Task 3-6.
+
+## Round 4
+
+- Codex: [round-4-codex.md](round-4-codex.md) — CHANGES_NEEDED
+- Claude: [round-4-claude.md](round-4-claude.md) — CHANGES_NEEDED
+
+Opraveno: 2× BLOCKING, oba v Claudově vlastním kolo-3 kódu. (1)
+`MARK_END not in raw` kontrolovalo jen přítomnost markeru, ne pozici/
+počet - chybějící METADATA marker by nechal ===KONEC=== zapečený jako
+součást přeloženého textu; opraveno přesnou strukturální kontrolou
+(počet==1 každého markeru, pořadí, raw.rstrip().endswith). (2) Task 5's
+test_run_translator_flag_passed_to_client_factory nemockoval eager
+preflight z kola 3 - v CI bez codex binárky by spadl dřív, než se spy
+factory zavolá; opraveno přidáním mocku. Přidány negativní testy pro
+duplicitní/špatně umístěný marker a text po markeru.

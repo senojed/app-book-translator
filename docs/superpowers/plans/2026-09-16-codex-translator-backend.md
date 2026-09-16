@@ -161,7 +161,9 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Produces: `translator.MARK_END == "===KONEC==="`. `translator._parse()`
-  vyhodí `ValueError`, pokud `MARK_END not in raw` - PŘED čímkoliv
+  vyhodí `ValueError`, pokud markery nejsou PŘESNĚ jednou, ve správném
+  pořadí, a `===KONEC===` opravdu POSLEDNÍ neprázdný obsah (kolo 4
+  BLOCKING - viz níž, `MARK_END in raw` samo nestačí) - PŘED čímkoliv
   jiným, žádný tichý fallback na částečný text.
 - Produces: `pipeline.process_chapter`'s revizní smyčka - selže-li
   `translator.revise_chapter()` na cokoli JINÉHO než `FatalRunError`,
@@ -184,10 +186,30 @@ section_tolerated` - existující test DOKUMENTUJE přesně tohle chování
 jako "tolerated".)
 
 **Oprava:** Povinný koncový marker `===KONEC===` v `_FORMAT_RULES`
-(obě systémové promty, fresh i revize). `_parse()` zkontroluje `MARK_END
-in raw` JAKO PRVNÍ krok - chybí-li, `ValueError` ("useknutý nebo jinak
+(obě systémové promty, fresh i revize). `_parse()` zkontroluje PŘESNOU
+strukturu JAKO PRVNÍ krok - chybí-li, `ValueError` ("useknutý nebo jinak
 neúplný výstup"). Backend-agnostické - platí i pro Claude cestu jako
 obrana do hloubky (kdyby `stop_reason` detekce měla vlastní mezeru).
+
+**Kolo 4 BLOCKING (plan-consensus) - proč pouhé `MARK_END in raw`
+nestačí:** Kontroluje jen PŘÍTOMNOST markeru kdekoli v textu, ne jeho
+POZICI ani POČET. Tři díry: (1) marker duplicitní nebo vložený
+UPROSTŘED (např. halucinovaný uvnitř JSON stringu) projde; (2) text PO
+markeru (garbage, další pokus modelu) projde ze stejného důvodu;
+(3) nejzávažnější - chybí-li `===METADATA===` ÚPLNĚ, ale `===KONEC===`
+přítomný je (model zapomene metadata sekci, ale marker si pamatuje z
+instrukcí), `split_sections(raw, [MARK_TRANSLATION, MARK_METADATA,
+MARK_END])` pro `MARK_TRANSLATION` hledá `nxt=MARK_METADATA` v `after` -
+není tam - takže `value = after` BEZE ZKRÁCENÍ, a `===KONEC===` string
+skončí JAKO SOUČÁST přeloženého textu, zapečený v próze.
+
+**Oprava:** `_parse()` vyžaduje PŘESNOU strukturu: (a) každý marker
+přesně JEDNOU (`raw.count(...) == 1`), (b) ve SPRÁVNÉM pořadí
+(`raw.index(MARK_TRANSLATION) < raw.index(MARK_METADATA) <
+raw.index(MARK_END)`), (c) `raw.rstrip().endswith(MARK_END)` - marker
+je opravdu POSLEDNÍ neprázdný obsah. Vedlejší efekt: METADATA
+přítomnost je teď zaručená kontrolou (a), takže `extract_json()` volání
+se zjednoduší na bezpodmínečné (žádné `if MARK_METADATA in raw:`).
 
 **Kolo 3 IMPORTANT (plan-consensus) - proč revizní smyčka nesmí zahodit
 hotový překlad:** Oprava výš dělá tohle riziko PRAVDĚPODOBNĚJŠÍM, ne
@@ -263,6 +285,39 @@ def test_missing_end_marker_raises_as_possibly_truncated():
     with pytest.raises(ValueError, match="KONEC"):
         translator.translate_scene("x", "g", "gl",
                                    FakeLLMClient([Completion(raw, False, 5, 5)]))
+
+
+def test_duplicate_end_marker_raises():
+    """Kolo 4 BLOCKING (plan-consensus) - pouhé `MARK_END in raw` by
+    tohle propustilo (marker JE přítomný), ale duplicita signalizuje
+    poškozený/opakovaný výstup, ne validní strukturu."""
+    raw = ("===PREKLAD===\nText.\n===METADATA===\n{}\n===KONEC===\n"
+           "===KONEC===")
+    with pytest.raises(ValueError):
+        translator.translate_scene("x", "g", "gl",
+                                   FakeLLMClient([Completion(raw, False, 5, 5)]))
+
+
+def test_content_after_end_marker_raises():
+    """Kolo 4 BLOCKING (plan-consensus) - text PO markeru (druhý pokus
+    modelu, garbage) by pouhé `in` kontrole prošel - marker musí být
+    opravdu POSLEDNÍ obsah."""
+    raw = "===PREKLAD===\nText.\n===METADATA===\n{}\n===KONEC===\nnavíc ještě tohle"
+    with pytest.raises(ValueError):
+        translator.translate_scene("x", "g", "gl",
+                                   FakeLLMClient([Completion(raw, False, 5, 5)]))
+
+
+def test_missing_metadata_marker_does_not_leak_end_marker_into_translation():
+    """Kolo 4 BLOCKING (plan-consensus) - nejzávažnější díra kola 3:
+    chybí-li ===METADATA=== úplně, ale ===KONEC=== přítomný je,
+    split_sections by bez týhle opravy vzalo `===KONEC===` jako
+    SOUČÁST přeloženého textu (zapečený marker v próze), místo aby
+    to zahodilo jako poškozený výstup."""
+    raw = "===PREKLAD===\nText bez metadat.\n===KONEC==="
+    with pytest.raises(ValueError):
+        translator.translate_scene("x", "g", "gl",
+                                   FakeLLMClient([Completion(raw, False, 5, 5)]))
 ```
 
 Přidej do `tests/test_pipeline.py` (vzor existujícího
@@ -309,12 +364,12 @@ def test_revision_fatal_error_propagates_not_flagged(tmp_path, monkeypatch):
 
 - [ ] **Step 2: Ověř selhání**
 
-Run: `pytest tests/test_translator.py tests/test_pipeline.py -k "end_marker or revision_recoverable or revision_fatal" -v`
+Run: `pytest tests/test_translator.py tests/test_pipeline.py -k "end_marker or duplicate_end or content_after_end or missing_metadata_marker or revision_recoverable or revision_fatal" -v`
 Expected: FAIL - `translator.MARK_END` neexistuje (`AttributeError`),
-`_parse()` ještě netestuje konec, revizní smyčka v `pipeline.py` ještě
-neobaluje `revise_chapter()` voláním (výjimka propadne celou funkcí,
-`state.get_chapter(db, 1)["translated_text"]` bude prázdné/None, ne
-`"prvotní scénový překlad"`).
+`_parse()` ještě netestuje konec/strukturu, revizní smyčka v
+`pipeline.py` ještě neobaluje `revise_chapter()` voláním (výjimka
+propadne celou funkcí, `state.get_chapter(db, 1)["translated_text"]`
+bude prázdné/None, ne `"prvotní scénový překlad"`).
 
 - [ ] **Step 3: Implementuj**
 
@@ -362,25 +417,36 @@ V `_parse()`, JAKO PRVNÍ řádek funkce (před `sections = split_sections
 
 ```python
 def _parse(raw: str) -> TranslationResult:
-    if MARK_END not in raw:
-        # Kolo 3 BLOCKING (plan-consensus) - jediná pojistka proti
-        # tichému přijetí useknutého výstupu jako hotového překladu.
-        # `CodexLLMClient.complete()`'s `truncated` je VŽDY False (Codex
-        # nemá spolehlivý stop_reason signál jako Claude) - bez tohohle
-        # markeru by `split_sections` vzalo useknutý text (chybějící
-        # `===METADATA===`) jako kompletní, NEPRÁZDNÝ překlad. Backend-
-        # agnostické - platí i pro Claude cestu (obrana do hloubky).
+    # Kolo 4 BLOCKING (plan-consensus) - pouhé "marker je NĚKDE v textu"
+    # (kolo 3's `MARK_END in raw`) nestačí: marker uprostřed/duplicitní,
+    # text po markeru, nebo (nejhorší) chybějící ===METADATA=== se
+    # zachovaným ===KONEC=== by nechalo marker zapečený JAKO SOUČÁST
+    # přeloženého textu (split_sections by "PREKLAD" sekci nezkrátilo,
+    # protože by nenašlo svůj `nxt` marker). Vyžaduje se PŘESNÁ
+    # struktura: každý marker právě jednou, ve správném pořadí, a
+    # `===KONEC===` je opravdu POSLEDNÍ neprázdný obsah.
+    if (raw.count(MARK_TRANSLATION) != 1 or raw.count(MARK_METADATA) != 1
+            or raw.count(MARK_END) != 1):
         raise ValueError(
-            f"Výstup neobsahuje koncový marker {MARK_END} - useknutý "
-            "nebo jinak neúplný výstup, odmítám ho tiše přijmout jako hotový.")
+            "Výstup nemá přesně jeden výskyt každého markeru "
+            f"({MARK_TRANSLATION}/{MARK_METADATA}/{MARK_END}) - "
+            "useknutý nebo jinak poškozený výstup.")
+    if not (raw.index(MARK_TRANSLATION) < raw.index(MARK_METADATA)
+            < raw.index(MARK_END)):
+        raise ValueError("Markery nejsou ve správném pořadí "
+                         f"({MARK_TRANSLATION} → {MARK_METADATA} → {MARK_END}).")
+    if not raw.rstrip().endswith(MARK_END):
+        raise ValueError(
+            f"Výstup nekončí markerem {MARK_END} - useknutý nebo jinak "
+            "neúplný výstup, odmítám ho tiše přijmout jako hotový.")
     sections = split_sections(raw, [MARK_TRANSLATION, MARK_METADATA, MARK_END])
     translation = (sections.get("PREKLAD") or "").strip()
     if not translation:
         raise ValueError("Translator nevrátil žádný text mezi markery "
                          f"{MARK_TRANSLATION} / {MARK_METADATA}.")
-    meta: dict = {}
-    if MARK_METADATA in raw:
-        meta = extract_json(sections.get("METADATA") or "")
+    # METADATA přítomnost je zaručená kontrolou výš (přesně jeden výskyt
+    # každého markeru) - žádné podmíněné volání potřeba.
+    meta = extract_json(sections.get("METADATA") or "")
     return TranslationResult(
         translation=translation,
         new_terms=list(meta.get("new_terms") or []),
@@ -466,10 +532,13 @@ markerem prochází stejně jako dřív)
 git add src/agents/translator.py src/pipeline.py tests/test_translator.py tests/test_pipeline.py
 git commit -m "fix: koncový marker proti tichému přijetí useknutého překladu
 
-translator._parse() teď vyžaduje povinný ===KONEC=== marker PŘED
-přijetím výstupu jako kompletního - CodexLLMClient (Task 3) hlásí
-truncated=False vždy, takže useknutý výstup by split_sections jinak
-tiše vzalo za hotový překlad (plan-consensus kolo 3 BLOCKING).
+translator._parse() teď vyžaduje povinný ===KONEC=== marker (přesně
+jednou, ve správném pořadí, jako poslední obsah) PŘED přijetím výstupu
+jako kompletního - CodexLLMClient (Task 3) hlásí truncated=False vždy,
+takže useknutý výstup by split_sections jinak tiše vzalo za hotový
+překlad (plan-consensus kolo 3 BLOCKING, zpřesněno kolo 4 BLOCKING -
+pouhé 'marker je přítomný' nestačilo, chybějící METADATA marker by
+nechalo ===KONEC=== zapečený jako součást přeloženého textu).
 
 pipeline.process_chapter's revizní smyčka teď zachová poslední platný
 překlad, když revise_chapter() selže (kapitola jde do flagged, ne
@@ -1025,6 +1094,12 @@ def test_run_translator_flag_passed_to_client_factory(tmp_path, monkeypatch):
     book = tmp_path / "k.txt"
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
+    # Kolo 4 BLOCKING (plan-consensus) - kolo 3 přidalo eager preflight
+    # na začátek _cmd_run (main._polish_preflight()); bez mocku by test
+    # narazil na SKUTEČNOU STYLIST_ACCEPT_FS_RISK/CODEX_MODEL/CLI
+    # kontrolu (reálný filesystem/PATH lookup) a v CI bez codex binárky
+    # by spadl na "== 0" dřív, než se spy factory vůbec zavolá.
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
     import src.pipeline as P
     seen = {}
     def fake_process(db_path, chapter, *, client_factory, guide):
