@@ -61,3 +61,14 @@ test_run_translator_flag_passed_to_client_factory nemockoval eager
 preflight z kola 3 - v CI bez codex binárky by spadl dřív, než se spy
 factory zavolá; opraveno přidáním mocku. Přidány negativní testy pro
 duplicitní/špatně umístěný marker a text po markeru.
+
+## Round 5
+
+- Codex: [round-5-codex.md](round-5-codex.md) — CHANGES_NEEDED
+- Claude: [round-5-claude.md](round-5-claude.md) — CHANGES_NEEDED
+
+Opraveno: IMPORTANT (CodexLLMClient.complete() vracelo input_tokens=0,
+output_tokens=0 natvrdo - main._print_usage() by po zpracování celé
+knihy ukázalo "0 tokenů" i přes reálnou práci; opraveno konzervativním
+odhadem, stejný vzorec jako count_tokens()). NIT (přidán regresní test,
+že oba systémové prompty obsahují ===KONEC=== instrukci).

@@ -318,6 +318,16 @@ def test_missing_metadata_marker_does_not_leak_end_marker_into_translation():
     with pytest.raises(ValueError):
         translator.translate_scene("x", "g", "gl",
                                    FakeLLMClient([Completion(raw, False, 5, 5)]))
+
+
+def test_system_prompts_instruct_end_marker():
+    """Kolo 5 NIT (plan-consensus) - parser-testy samy nezachytí
+    regresi, kdy `_parse()` kontrolu na `MARK_END` ponechá, ale
+    instrukce modelu (co marker vlastně vyžádá) se omylem z promptu
+    vytratí - model by pak marker nikdy nevrátil a VŠECHNY odpovědi
+    by selhávaly."""
+    assert translator.MARK_END in translator.SYSTEM_PROMPT_FRESH
+    assert translator.MARK_END in translator.SYSTEM_PROMPT_REVISE
 ```
 
 Přidej do `tests/test_pipeline.py` (vzor existujícího
@@ -364,7 +374,7 @@ def test_revision_fatal_error_propagates_not_flagged(tmp_path, monkeypatch):
 
 - [ ] **Step 2: Ověř selhání**
 
-Run: `pytest tests/test_translator.py tests/test_pipeline.py -k "end_marker or duplicate_end or content_after_end or missing_metadata_marker or revision_recoverable or revision_fatal" -v`
+Run: `pytest tests/test_translator.py tests/test_pipeline.py -k "end_marker or duplicate_end or content_after_end or missing_metadata_marker or system_prompts_instruct or revision_recoverable or revision_fatal" -v`
 Expected: FAIL - `translator.MARK_END` neexistuje (`AttributeError`),
 `_parse()` ještě netestuje konec/strukturu, revizní smyčka v
 `pipeline.py` ještě neobaluje `revise_chapter()` voláním (výjimka
@@ -567,7 +577,24 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   `LLMClient` protokol jako `AnthropicClient`, `.provider == "codex"`,
   `.billed_model == codex_model` (kolo 1 BLOCKING - viz níž, PROČ).
   `complete()` přebaluje `stylist.StylistError` na `FatalRunError`
-  (kolo 2 BLOCKING - viz níž, PROČ).
+  (kolo 2 BLOCKING - viz níž, PROČ). `complete()`'s `Completion.
+  input_tokens`/`output_tokens` NENULOVÝ konzervativní odhad, ne natvrdo
+  `0` (kolo 5 IMPORTANT - viz níž, PROČ).
+
+**Kolo 5 IMPORTANT (plan-consensus) - proč `input_tokens`/`output_tokens`
+nesmí být natvrdo `0`:** `PipelineLLMClient.complete()` (`src/llm/
+client.py:229-230`) čte `comp.input_tokens`/`comp.output_tokens` PŘÍMO z
+vráceného `Completion` a zapíše je do `record_llm_call(...)` - `main.
+_print_usage()` (main.py:77-81) je pak SČÍTÁ napříč celým `run`em pro
+souhrnný report. Natvrdo `0` by po zpracování CELÉ knihy Codexem
+ukázalo "0 tokenů" - cena $0 je SPRÁVNĚ (billed_model má nulovou
+sazbu), ale objem zpracovaného textu by byl neviditelný, i když
+`CodexLLMClient` má vlastní konzervativní odhad k dispozici (`count_
+tokens()` už `(len(system)+len(user))//2` počítá).
+
+**Oprava:** `complete()` vrátí `input_tokens=(len(system)+len(user))//2`
+(stejný vzorec jako `count_tokens()`) a `output_tokens=len(text)//2`
+(stejná konzervativní aproximace na výstupu).
 
 **Kolo 1 BLOCKING (plan-consensus) - proč `billed_model`:** `pipeline.
 process_chapter` volá `translator.translate_scene(scene, guide_block,
@@ -635,6 +662,12 @@ def test_codex_llm_client_calls_exec_codex_and_wraps_result(monkeypatch):
     comp = c.complete(system="SYS", user="USR", max_tokens=1000, model="gpt-5.6-terra")
     assert comp.text == "===PREKLAD===\ntext\n===METADATA===\n{}"
     assert comp.truncated is False
+    # Kolo 5 IMPORTANT (plan-consensus) - NENULOVÝ odhad (konzervativní,
+    # stejný vzor jako count_tokens()), ne natvrdo 0 - jinak _print_usage()
+    # ukáže "0 tokenů" i po zpracování celé knihy, přestože cena je
+    # správně $0 (billed_model price entry, ne nulový objem).
+    assert comp.input_tokens == len("SYS\n\nUSR") // 2
+    assert comp.output_tokens == len("===PREKLAD===\ntext\n===METADATA===\n{}") // 2
     assert seen["prompt"] == "SYS\n\nUSR"
     assert seen["codex_cmd"] == ["codex"]
     assert seen["codex_model"] == "gpt-5.6-terra"
@@ -804,7 +837,16 @@ class CodexLLMClient:
         # jako Claude `stop_reason`. Skutečné useknutí spadne na
         # chybějící `===KONEC===` marker uvnitř `translator._parse()`
         # (ValueError, Task 2, kolo 3 BLOCKING), ne na tenhle příznak.
-        return Completion(text=text, truncated=False, input_tokens=0, output_tokens=0)
+        # Kolo 5 IMPORTANT (plan-consensus) - NENULOVÝ konzervativní
+        # odhad (stejný vzorec jako count_tokens() níž), ne natvrdo 0 -
+        # PipelineLLMClient.complete() tyhle hodnoty zapíše do audit
+        # logu beze změny, main._print_usage() je sčítá napříč celým
+        # během. Natvrdo 0 by po zpracování celé knihy ukázalo "0
+        # tokenů" - cena $0 je správně (billed_model), ale objem
+        # zpracovaného textu by byl neviditelný.
+        return Completion(text=text, truncated=False,
+                          input_tokens=(len(system) + len(user)) // 2,
+                          output_tokens=len(text) // 2)
 
     def count_tokens(self, *, system: str, user: str, model: str) -> int:
         # Stejná konzervativní aproximace jako `PipelineLLMClient._guard()`'s
@@ -889,6 +931,11 @@ FatalRunError - state.queue_for_run() automaticky retryuje 'error'
 kapitoly při každém příštím run, takže rozbitá Codex cesta (CLI/auth)
 by jinak potichu selhávala napříč libovolně mnoha budoucími běhy
 (plan-consensus kolo 2 BLOCKING).
+
+CodexLLMClient.complete() vrací nenulový konzervativní odhad
+input_tokens/output_tokens (ne natvrdo 0) - main._print_usage() by
+jinak po zpracování celé knihy ukázalo "0 tokenů", i když cena $0 je
+správně (plan-consensus kolo 5 IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
