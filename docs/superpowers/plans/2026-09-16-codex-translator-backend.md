@@ -91,6 +91,15 @@ FS-risk varování jako `polish`).
   by timeout BĚHEM revize zahodil hotový scénový překlad a zastavil
   celý run, v přímém rozporu s Task 2's kolo-3 fixem (revizní smyčka
   má kapitolu jen `flagged`, ne ztracenou).
+- Kapitola, na které vyletí `FatalRunError` (pro `--translator codex`),
+  dostane `flagged` status (redigovaná diagnostika) PŘED re-raise, ne
+  zůstane `processing` (kolo 10 IMPORTANT, plan-consensus - viz Task 5) -
+  `state.recover_processing()` by ji jinak DALŠÍ `run` vrátila na
+  `pending` a `queue_for_run()` by ji tiše znovu zařadila, bez
+  persistentního záznamu, že už jednou takhle spadla; `flagged` vyžaduje
+  explicitní `--retry-flagged`. Gated JEN na `codex` - Claude-cesta
+  `FatalRunError` (cost guard, `LockLostError`) je před-existující
+  chování, mimo rozsah týhle plánu.
 
 ---
 
@@ -246,12 +255,27 @@ podřetězce.
 
 **Oprava:** Markery se hledají regulárním výrazem kotveným na CELÝ
 ŘÁDEK (`^{marker}$` s `re.MULTILINE` - marker musí být JEDINÝ obsah
-řádku, nic před ani po), ne substring kdekoli v textu. `split_sections()`
-(`src/llm/parsing.py`) zůstává BEZE ZMĚNY (obecná substring utilita) -
-řádkové kotvení běží JAKO VALIDACE PŘED jejím voláním, takže v době, kdy
-`split_sections()` běží, je už zaručené, že KAŽDÝ marker je přesně na
-jednom řádku a nikde jinde - její naivní substring split je pak
-bezpečný.
+řádku, nic před ani po), ne substring kdekoli v textu.
+
+**Kolo 10 BLOCKING (plan-consensus) - proč `split_sections()` NESTAČÍ
+ani po řádkovém kotvení:** Řádková validace výš ověří, že KAŽDÝ marker
+je přesně na jednom řádku - ALE `split_sections()` (`src/llm/
+parsing.py`) na to nebere ohled, dělá si VLASTNÍ nezávislé substring
+hledání (`text.split(marker, 1)[1]`/`if nxt and nxt in after`). Marker-
+podobný text UPROSTŘED METADATA JSON hodnoty (např. `"note": "...
+===KONEC=== ..."`, NENÍ na vlastním řádku, takže validaci výš neprojde
+jako skutečný marker) by `split_sections()` PŘESTO našla jako PRVNÍ
+substring výskyt `MARK_END` a metadata sekci tam předčasně uřízla -
+rozbité JSON, `test_marker_like_text_inside_metadata_json_does_not_
+confuse_parser` (viz test Step 1) by na tomhle spadl.
+
+**Oprava:** `_parse()` `split_sections()` VŮBEC nevolá - sekce řeže
+PŘÍMO slicingem podle OVĚŘENÝCH pozic z `_marker_line_positions()`
+(`raw[trans_pos[0]+len(MARK_TRANSLATION):meta_pos[0]]` atd.). `split_
+sections()` samotná zůstává v `src/llm/parsing.py` nedotčená (obecná,
+otestovaná utilita - `tests/test_llm_parsing.py`), jen `translator.py`
+ji už nepoužívá (import `split_sections` z `src.llm.parsing` se
+odstraní, `extract_json` zůstává).
 
 **Kolo 3 IMPORTANT (plan-consensus) - proč revizní smyčka nesmí zahodit
 hotový překlad:** Oprava výš dělá tohle riziko PRAVDĚPODOBNĚJŠÍM, ne
@@ -544,8 +568,12 @@ Bez něj je výstup považovaný za useknutý/neúplný a celý zahozený, i
 kdyby zbytek vypadal kompletně."""
 ```
 
-V `_parse()`, JAKO PRVNÍ řádek funkce (před `sections = split_sections
-(...)`), přidej kontrolu a rozšiř seznam markerů:
+Nahraď import `split_sections` (`from src.llm.parsing import extract_json,
+split_sections`) za `from src.llm.parsing import extract_json` (`_parse()`
+už `split_sections()` nevolá, viz kolo 10 BLOCKING výš).
+
+Přepiš celou `_parse()` (a přidej `_marker_line_positions()` pomocnou
+funkci před ni):
 
 ```python
 def _marker_line_positions(raw: str, marker: str) -> list:
@@ -593,22 +621,25 @@ def _parse(raw: str) -> TranslationResult:
         raise InvalidTranslationOutput(
             f"Výstup nekončí markerem {MARK_END} - useknutý nebo jinak "
             "neúplný výstup, odmítám ho tiše přijmout jako hotový.")
-    # `split_sections()` (src/llm/parsing.py) zůstává BEZE ZMĚNY (obecná
-    # substring utilita) - kontroly výš zaručují, že KAŽDÝ marker je
-    # přesně na jednom řádku a nikde jinde, takže její naivní substring
-    # split je teď bezpečný.
-    sections = split_sections(raw, [MARK_TRANSLATION, MARK_METADATA, MARK_END])
-    translation = (sections.get("PREKLAD") or "").strip()
+    # Kolo 10 BLOCKING (plan-consensus) - `split_sections()` (src/llm/
+    # parsing.py) NEPOUŽÍVÁME - i po kontrolách výš by její VLASTNÍ
+    # substring `.split(marker, 1)` hledání znovu narazilo na STEJNÝ
+    # problém: marker-podobný text UPROSTŘED METADATA JSON hodnoty (ne
+    # na vlastním řádku, takže validaci výš neprojde jako SKUTEČNÝ
+    # marker) by `split_sections()` přesto našla jako PRVNÍ výskyt
+    # podřetězce a sekci tam předčasně uřízla - `_marker_line_positions()`
+    # výš zná PŘESNÉ, OVĚŘENÉ offsety, takže sekce řežeme PŘÍMO slicingem
+    # podle nich, ne přes samostatné substring hledání.
+    translation = raw[trans_pos[0] + len(MARK_TRANSLATION):meta_pos[0]].strip()
     if not translation:
         raise InvalidTranslationOutput(
             "Translator nevrátil žádný text mezi markery "
             f"{MARK_TRANSLATION} / {MARK_METADATA}.")
-    # METADATA přítomnost je zaručená kontrolou výš (přesně jeden výskyt
-    # každého markeru) - žádné podmíněné volání potřeba. `extract_json()`'s
-    # ValueError se přebalí na InvalidTranslationOutput taky - rozbité
-    # JSON je STEJNÁ třída "formát driftl", ne jiná.
+    metadata_text = raw[meta_pos[0] + len(MARK_METADATA):end_pos[0]].strip()
+    # `extract_json()`'s `ValueError` se přebalí na `InvalidTranslationOutput`
+    # taky - rozbité JSON je STEJNÁ třída "formát driftl", ne jiná.
     try:
-        meta = extract_json(sections.get("METADATA") or "")
+        meta = extract_json(metadata_text)
     except ValueError as e:
         raise InvalidTranslationOutput(str(e)) from e
     return TranslationResult(
@@ -719,6 +750,12 @@ Markery se hledají řádkově kotveným regexem (^marker$, MULTILINE), ne
 substring in/count/index - substring by odmítl legitimní překlad/JSON
 hodnotu s markerem-podobným textem uprostřed jako poškozený výstup
 (plan-consensus kolo 9 IMPORTANT).
+
+_parse() split_sections() vůbec nevolá - i po řádkovém kotvení výš by
+její VLASTNÍ substring hledání marker-podobný text uprostřed METADATA
+JSON hodnoty našla jako první výskyt a sekci předčasně uřízla; sekce se
+teď řežou přímo slicingem podle ověřených pozic (plan-consensus kolo 10
+BLOCKING).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
@@ -1562,6 +1599,12 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   "codex"` ji přebalí na `FatalRunError` (celý běh se zastaví); pro
   `claude` (default) beze změny spadne do generické větve jako dřív
   (kolo 6 IMPORTANT, plan-consensus).
+- Produces: `_cmd_run`'s `except FatalRunError` (i ta z přebalené
+  `InvalidTranslationOutput` výš) označí AKTUÁLNÍ kapitolu `flagged`
+  (redigovaná diagnostika) PŘED re-raise, když `args.translator ==
+  "codex"` - jinak by zůstala `processing`→`pending` a DALŠÍ `run` by
+  ji tiše znovu zařadil bez explicitního `--retry-flagged` (kolo 10
+  IMPORTANT, plan-consensus).
 
 **Kolo 3 IMPORTANT (plan-consensus) - proč eager preflight:**
 `_client_factory` (Task 4) je LÍNÁ - `_polish_preflight()` se volá AŽ
@@ -1791,7 +1834,11 @@ def test_run_translator_codex_invalid_translation_output_is_fatal(tmp_path, monk
     jako per-kapitolový error - state.queue_for_run by ji jinak tiše
     zkoušel znovu při KAŽDÉM příštím run, na VŠECH takhle postižených
     kapitolách (stejné riziko jako kolo 2's StylistError fix, jiná
-    příčina)."""
+    příčina).
+
+    Kolo 10 IMPORTANT (plan-consensus) - status je teď `flagged`, ne
+    `pending`/`processing` - persistentní záznam, že tahle KONKRÉTNÍ
+    kapitola spadla, vyžaduje explicitní `--retry-flagged`."""
     book = tmp_path / "k.txt"
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
@@ -1802,7 +1849,33 @@ def test_run_translator_codex_invalid_translation_output_is_fatal(tmp_path, monk
         raise InvalidTranslationOutput("chybí ===KONEC===")
     monkeypatch.setattr(P, "process_chapter", boom)
     assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
-    assert state.get_chapter("data/state.sqlite3", 1)["status"] in ("pending", "processing")
+    assert state.get_chapter("data/state.sqlite3", 1)["status"] == "flagged"
+
+
+def test_run_translator_codex_fatal_error_flags_chapter_not_silently_retried(
+        tmp_path, monkeypatch):
+    """Kolo 10 IMPORTANT (plan-consensus) - kapitola, na které vyletí
+    FatalRunError (rozbitý CLI/auth), musí dostat persistentní `flagged`
+    status, NE zůstat `processing`→`pending` limbo, co by DALŠÍ `run`
+    (bez explicitního `--retry-flagged`) tiše znovu zkusil."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    import src.pipeline as P
+    calls = {"n": 0}
+    def boom(db_path, chapter, *, client_factory, guide):
+        calls["n"] += 1
+        raise FatalRunError("codex auth expired")
+    monkeypatch.setattr(P, "process_chapter", boom)
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
+    assert state.get_chapter("data/state.sqlite3", 1)["status"] == "flagged"
+    assert calls["n"] == 1
+    # Druhý run BEZ --retry-flagged - queue_for_run vrací jen pending/
+    # error, flagged kapitola se NEZAŘADÍ, process_chapter se nezavolá znovu.
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 0
+    assert calls["n"] == 1
+    assert state.get_chapter("data/state.sqlite3", 1)["status"] == "flagged"
 
 
 def test_run_translator_claude_invalid_translation_output_stays_per_chapter_error(
@@ -1898,6 +1971,8 @@ def _cmd_run(args) -> int:
 V `_cmd_run`'s hlavní zpracovací smyčce (main.py:1010-1021), najdi:
 
 ```python
+            except FatalRunError:
+                raise                      # celý běh končí, kapitola zůstane rozpracovaná
             except Exception as e:         # OutputTruncated i ValueError sem patří
                 state.update_chapter(db, ch["idx"], status="error",
                                      notes=json.dumps(
@@ -1910,6 +1985,26 @@ V `_cmd_run`'s hlavní zpracovací smyčce (main.py:1010-1021), najdi:
 nahraď:
 
 ```python
+            except FatalRunError as e:
+                # Kolo 10 IMPORTANT (plan-consensus) - BEZ týhle opravy
+                # zůstane kapitola v `processing` - příští `run` (main.py,
+                # kolo 8 fix) ji přes `state.recover_processing()` vrátí
+                # na `pending`, `queue_for_run()` ji ZNOVU zařadí, BEZ
+                # persistentního záznamu, že tahle KONKRÉTNÍ kapitola už
+                # jednou takhle spadla. `flagged` vyžaduje explicitní
+                # `--retry-flagged` - nedbalé "spusť run znova" ji tiše
+                # nezkusí znovu bez vědomého rozhodnutí. Gated JEN na
+                # `codex` - Claude-cesta `FatalRunError` (cost guard,
+                # `LockLostError`) je PŘED-EXISTUJÍCÍ chování, mimo
+                # rozsah týhle plánu (nemění se).
+                if args.translator == "codex":
+                    detail = stylist._redact_detail(str(e))
+                    state.update_chapter(db, ch["idx"], status="flagged",
+                                         notes=json.dumps(
+                                             {"error": f"fatální chyba běhu: "
+                                                      f"{type(e).__name__}: {detail}"},
+                                             ensure_ascii=False))
+                raise                      # celý běh KONČÍ i tak
             except translator.InvalidTranslationOutput as e:
                 # Kolo 6 IMPORTANT (plan-consensus) - `translate_scene()`'s
                 # scénová smyčka (pipeline.py) NENÍ obalená (na rozdíl od
@@ -1922,9 +2017,20 @@ nahraď:
                 # of scope (spike ho nepozoroval), Claude cesta spadne do
                 # existující generické větve níž, beze změny.
                 if args.translator == "codex":
+                    # Kolo 10 IMPORTANT (plan-consensus) - STEJNÁ flagged
+                    # oprava jako `except FatalRunError` výš (tenhle
+                    # `raise FatalRunError(...) from e` běží UVNITŘ
+                    # týhle except větve, takže sesterská `except
+                    # FatalRunError` ho NEZACHYTÍ - bez duplikace by
+                    # tahle cesta zůstala v "processing" limbu, i když
+                    # ta výš už opravená je).
+                    detail = stylist._redact_detail(str(e))
+                    state.update_chapter(db, ch["idx"], status="flagged",
+                                         notes=json.dumps(
+                                             {"error": f"neplatný formát překladu: {detail}"},
+                                             ensure_ascii=False))
                     raise FatalRunError(
-                        f"Neplatný formát překladu od Codexu: "
-                        f"{stylist._redact_detail(str(e))}") from e
+                        f"Neplatný formát překladu od Codexu: {detail}") from e
                 state.update_chapter(db, ch["idx"], status="error",
                                      notes=json.dumps(
                                          {"error": f"{type(e).__name__}: {e}"},
@@ -1994,6 +2100,11 @@ state.recover_processing(db) zůstává úplně první krok _cmd_run, PŘED
 eager preflight kontrolou - jinak by --translator codex s nesplněnou
 podmínkou nechalo kapitoly uvízlé v processing navěky neviditelné pro
 queue_for_run (plan-consensus kolo 8 IMPORTANT).
+
+Kapitola, na které vyletí FatalRunError (--translator codex), dostane
+flagged status s redigovanou diagnostikou PŘED re-raise - jinak by
+zůstala processing->pending limbo a další run by ji tiše znovu zařadil
+bez explicitního --retry-flagged (plan-consensus kolo 10 IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```

@@ -127,3 +127,17 @@ StylistTimeoutError podtřídou (minimální zásah do stylist.py). Marker
 parsing (count/index) hledal substring kdekoli v textu, ne řádek -
 legitimní obsah s marker-podobným textem uprostřed by se chybně
 odmítl; opraveno řádkově kotveným regexem.
+
+## Round 10
+
+- Codex: [round-10-codex.md](round-10-codex.md) — CHANGES_NEEDED
+- Claude: [round-10-claude.md](round-10-claude.md) — CHANGES_NEEDED
+
+Opraveno: BLOCKING (kolo-9's radkove kotvena validace byla spravna, ale
+split_sections() delala vlastni nezavisle substring hledani, porad
+zranitelne na marker-podobny text uprostred JSON hodnoty - opraveno
+primym slicingem podle overenych pozic, split_sections() se uz
+nepouziva). IMPORTANT (FatalRunError nechavalo kapitolu v processing
+limbu, dalsi run by ji tise zaradil znovu bez explicitniho
+--retry-flagged - prijato s vyhradou o nizsi zavaznosti nez kolo 2/6,
+oprava je porad realne zlepseni).
