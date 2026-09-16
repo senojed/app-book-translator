@@ -28,3 +28,21 @@ teď přebaluje StylistError na FatalRunError, celý běh se zastaví).
 CODEX_TRANSLATE_MAX_CHARS guard z kola 1 ZRUŠEN (mohl by zahodit hotovou
 scénovou práci při selhání revizní fáze - pipeline.process_chapter nemá
 checkpoint před revizí). Task 5 Step 2 doplněn o PowerShell variantu.
+
+## Round 3
+
+- Codex: [round-3-codex.md](round-3-codex.md) — CHANGES_NEEDED
+- Claude: [round-3-claude.md](round-3-claude.md) — CHANGES_NEEDED
+
+Opraveno: BLOCKING (translator._parse() tiše přijalo useknutý Codex výstup
+jako hotový překlad, protože CodexLLMClient.truncated je vždy False a
+chybějící ===METADATA=== marker split_sections nezachytí - nová Task 2,
+povinný ===KONEC=== marker, backend-agnostické). IMPORTANT (revizní smyčka
+v pipeline.py teď zachová poslední platný překlad při chybě revize -
+mirror _run_critic()'s vzoru, součást Task 2 - fix výš zvýšil
+pravděpodobnost týhle cesty). IMPORTANT (--translator codex preflight
+se ověřuje eager PŘED frontou, ne líně - prázdná fronta by ho jinak
+obešla). IMPORTANT (chybové hlášky z --translator codex jdou přes
+stylist._redact_detail() jako u _cmd_polish - extract_json()'s ValueError
+nese až 2000 raw znaků do chapters.notes bez redakce). Plán přeuspořádán:
+nová Task 2, staré Task 2-5 posunuté na Task 3-6.
