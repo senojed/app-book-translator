@@ -54,7 +54,11 @@ FS-risk varování jako `polish`).
   je VŽDY `False`, takže bez vlastního markeru by useknutý Codex výstup
   (chybějící `===METADATA===`) `split_sections` tiše vzal jako hotový
   překlad. Backend-agnostické, platí i pro Claude cestu (obrana do
-  hloubky).
+  hloubky). Markery se hledají ŘÁDKOVĚ KOTVENÝM regexem (`^marker$`,
+  `re.MULTILINE`), NE substring `in`/`count`/`index` (kolo 9 IMPORTANT,
+  plan-consensus - viz Task 2) - substring by odmítl legitimní překlad/
+  JSON hodnotu s markerem-podobným textem UPROSTŘED (citace, popis
+  nápisu v knize) jako "poškozený výstup".
 - `pipeline.process_chapter`'s revizní smyčka NEZAHODÍ hotový scénový
   překlad, když `revise_chapter()` selže (kolo 3 IMPORTANT, plan-
   consensus - viz Task 2) - `FatalRunError` propaguje (run se zastaví),
@@ -80,6 +84,13 @@ FS-risk varování jako `polish`).
   `CodexLLMClient`'s `StylistError`→`FatalRunError` wrapping tohle
   nezachytí, protože `_parse()` běží AŽ PO úspěšném CLI volání, mimo
   `CodexLLMClient.complete()`.
+- `stylist.StylistTimeoutError` (podtřída `StylistError`, nová - Task 3)
+  se NEpřebaluje na `FatalRunError` (kolo 9 IMPORTANT, plan-consensus) -
+  timeout jednoho volání je PER-CALL/transientní, ne systémové selhání
+  jako auth/launch/exit-kód (ty ZŮSTÁVAJÍ fatální) - bez týhle výjimky
+  by timeout BĚHEM revize zahodil hotový scénový překlad a zastavil
+  celý run, v přímém rozporu s Task 2's kolo-3 fixem (revizní smyčka
+  má kapitolu jen `flagged`, ne ztracenou).
 
 ---
 
@@ -218,12 +229,29 @@ není tam - takže `value = after` BEZE ZKRÁCENÍ, a `===KONEC===` string
 skončí JAKO SOUČÁST přeloženého textu, zapečený v próze.
 
 **Oprava:** `_parse()` vyžaduje PŘESNOU strukturu: (a) každý marker
-přesně JEDNOU (`raw.count(...) == 1`), (b) ve SPRÁVNÉM pořadí
-(`raw.index(MARK_TRANSLATION) < raw.index(MARK_METADATA) <
-raw.index(MARK_END)`), (c) `raw.rstrip().endswith(MARK_END)` - marker
-je opravdu POSLEDNÍ neprázdný obsah. Vedlejší efekt: METADATA
-přítomnost je teď zaručená kontrolou (a), takže `extract_json()` volání
-se zjednoduší na bezpodmínečné (žádné `if MARK_METADATA in raw:`).
+přesně JEDNOU, (b) ve SPRÁVNÉM pořadí, (c) `===KONEC===` je opravdu
+POSLEDNÍ neprázdný obsah. Vedlejší efekt: METADATA přítomnost je teď
+zaručená kontrolou (a), takže `extract_json()` volání se zjednoduší na
+bezpodmínečné (žádné `if MARK_METADATA in raw:`).
+
+**Kolo 9 IMPORTANT (plan-consensus) - proč markery MUSÍ být ŘÁDKOVĚ
+kotvené, ne substring:** Naivní `raw.count(MARK_X)`/`raw.index(MARK_X)`
+(substring kdekoli v textu) by legitimní přeložený text nebo JSON
+hodnotu s markerem-podobným řetězcem UPROSTŘED (citace formátování
+zdrojového textu, popis nápisu v knize, `note` pole citující originál)
+odmítly jako "poškozený výstup", i když jsou 100% validní - `_FORMAT_
+RULES` už teď vyžaduje marker na VLASTNÍM řádku, takže kontrola tohle
+může (a MĚLA by) vynutit, ne jen kontrolovat přítomnost/pozici
+podřetězce.
+
+**Oprava:** Markery se hledají regulárním výrazem kotveným na CELÝ
+ŘÁDEK (`^{marker}$` s `re.MULTILINE` - marker musí být JEDINÝ obsah
+řádku, nic před ani po), ne substring kdekoli v textu. `split_sections()`
+(`src/llm/parsing.py`) zůstává BEZE ZMĚNY (obecná substring utilita) -
+řádkové kotvení běží JAKO VALIDACE PŘED jejím voláním, takže v době, kdy
+`split_sections()` běží, je už zaručené, že KAŽDÝ marker je přesně na
+jednom řádku a nikde jinde - její naivní substring split je pak
+bezpečný.
 
 **Kolo 3 IMPORTANT (plan-consensus) - proč revizní smyčka nesmí zahodit
 hotový překlad:** Oprava výš dělá tohle riziko PRAVDĚPODOBNĚJŠÍM, ne
@@ -382,6 +410,32 @@ def test_system_prompts_instruct_end_marker():
     by selhávaly."""
     assert translator.MARK_END in translator.SYSTEM_PROMPT_FRESH
     assert translator.MARK_END in translator.SYSTEM_PROMPT_REVISE
+
+
+def test_marker_like_text_inside_translation_does_not_confuse_parser():
+    """Kolo 9 IMPORTANT (plan-consensus) - `===KONEC===` (nebo jiný
+    marker) může být SOUČÁSTÍ legitimního přeloženého textu (citace,
+    popis nápisu v knize) - pokud NENÍ na vlastním řádku, nesmí se
+    počítat jako SKUTEČNÝ marker. Substring kontrola (`in`/`count`) by
+    tohle chybně odmítla jako "poškozený výstup"."""
+    raw = ('===PREKLAD===\nNa obálce stálo podivné heslo: "===KONEC==="'
+           ' a nikdo nevěděl proč.\n'
+           '===METADATA===\n{}\n===KONEC===')
+    r = translator.translate_scene("x", "g", "gl",
+                                   FakeLLMClient([Completion(raw, False, 5, 5)]))
+    assert 'heslo: "===KONEC==="' in r.translation
+
+
+def test_marker_like_text_inside_metadata_json_does_not_confuse_parser():
+    """Kolo 9 IMPORTANT (plan-consensus) - stejné riziko uvnitř JSON
+    hodnoty (např. `note` pole citující zdrojový text)."""
+    raw = ('===PREKLAD===\nText.\n'
+           '===METADATA===\n{"new_terms": [{"term_en": "X", "cz": "Y", '
+           '"note": "puvodni text mel ===KONEC=== jako oddelovac", '
+           '"type": "term"}]}\n===KONEC===')
+    r = translator.translate_scene("x", "g", "gl",
+                                   FakeLLMClient([Completion(raw, False, 5, 5)]))
+    assert r.new_terms[0]["note"] == "puvodni text mel ===KONEC=== jako oddelovac"
 ```
 
 Přidej do `tests/test_pipeline.py` (vzor existujícího
@@ -428,7 +482,7 @@ def test_revision_fatal_error_propagates_not_flagged(tmp_path, monkeypatch):
 
 - [ ] **Step 2: Ověř selhání**
 
-Run: `pytest tests/test_translator.py tests/test_pipeline.py -k "end_marker or duplicate_end or content_after_end or missing_metadata_marker or duplicate_translation_marker or duplicate_metadata_marker or markers_out_of_order or invalid_translation_output_type or system_prompts_instruct or revision_recoverable or revision_fatal" -v`
+Run: `pytest tests/test_translator.py tests/test_pipeline.py -k "end_marker or duplicate_end or content_after_end or missing_metadata_marker or duplicate_translation_marker or duplicate_metadata_marker or markers_out_of_order or invalid_translation_output_type or system_prompts_instruct or marker_like_text or revision_recoverable or revision_fatal" -v`
 Expected: FAIL - `translator.MARK_END` neexistuje (`AttributeError`),
 `_parse()` ještě netestuje konec/strukturu, revizní smyčka v
 `pipeline.py` ještě neobaluje `revise_chapter()` voláním (výjimka
@@ -437,7 +491,8 @@ bude prázdné/None, ne `"prvotní scénový překlad"`).
 
 - [ ] **Step 3: Implementuj**
 
-V `src/agents/translator.py`, za `MARK_METADATA = "===METADATA==="`
+V `src/agents/translator.py`, přidej `import re` k existujícím importům
+(`from dataclasses import ...` výš) a za `MARK_METADATA = "===METADATA==="`
 přidej:
 
 ```python
@@ -493,6 +548,18 @@ V `_parse()`, JAKO PRVNÍ řádek funkce (před `sections = split_sections
 (...)`), přidej kontrolu a rozšiř seznam markerů:
 
 ```python
+def _marker_line_positions(raw: str, marker: str) -> list:
+    """Pozice (offsety) řádků, co PŘESNĚ odpovídají markeru (celý
+    řádek, nic jiného) - substring `in`/`count`/`index` by chytlo
+    marker i UPROSTŘED přeloženého textu nebo JSON hodnoty (citace
+    formátování zdrojového textu, popis nápisu v knize - kolo 9
+    IMPORTANT, plan-consensus). `_FORMAT_RULES` už vyžaduje marker na
+    VLASTNÍM řádku - tahle kontrola to VYNUTÍ, místo aby jen hledala
+    podřetězec kdekoli."""
+    pattern = re.compile(rf"^{re.escape(marker)}$", re.MULTILINE)
+    return [m.start() for m in pattern.finditer(raw)]
+
+
 def _parse(raw: str) -> TranslationResult:
     # Kolo 4 BLOCKING (plan-consensus) - pouhé "marker je NĚKDE v textu"
     # (kolo 3's `MARK_END in raw`) nestačí: marker uprostřed/duplicitní,
@@ -500,8 +567,9 @@ def _parse(raw: str) -> TranslationResult:
     # zachovaným ===KONEC=== by nechalo marker zapečený JAKO SOUČÁST
     # přeloženého textu (split_sections by "PREKLAD" sekci nezkrátilo,
     # protože by nenašlo svůj `nxt` marker). Vyžaduje se PŘESNÁ
-    # struktura: každý marker právě jednou, ve správném pořadí, a
-    # `===KONEC===` je opravdu POSLEDNÍ neprázdný obsah.
+    # struktura: každý marker právě jednou (na VLASTNÍM řádku, kolo 9
+    # IMPORTANT - viz `_marker_line_positions` výš), ve správném pořadí,
+    # a `===KONEC===` je opravdu POSLEDNÍ neprázdný obsah.
     # Kolo 6 IMPORTANT (plan-consensus) - `InvalidTranslationOutput`
     # (podtřída ValueError), ne holý `ValueError` - `--translator codex`
     # (main.py `_cmd_run`, Task 5) ji rozlišuje zvlášť a dělá z ní
@@ -509,14 +577,15 @@ def _parse(raw: str) -> TranslationResult:
     # `StylistError`→`FatalRunError` (`state.queue_for_run`'s automatický
     # retry `error` kapitol), jen pro selhání PARSOVÁNÍ (formát driftl),
     # ne selhání CLI exekuce.
-    if (raw.count(MARK_TRANSLATION) != 1 or raw.count(MARK_METADATA) != 1
-            or raw.count(MARK_END) != 1):
+    trans_pos = _marker_line_positions(raw, MARK_TRANSLATION)
+    meta_pos = _marker_line_positions(raw, MARK_METADATA)
+    end_pos = _marker_line_positions(raw, MARK_END)
+    if len(trans_pos) != 1 or len(meta_pos) != 1 or len(end_pos) != 1:
         raise InvalidTranslationOutput(
-            "Výstup nemá přesně jeden výskyt každého markeru "
+            "Výstup nemá přesně jeden ŘÁDEK s každým markerem "
             f"({MARK_TRANSLATION}/{MARK_METADATA}/{MARK_END}) - "
             "useknutý nebo jinak poškozený výstup.")
-    if not (raw.index(MARK_TRANSLATION) < raw.index(MARK_METADATA)
-            < raw.index(MARK_END)):
+    if not (trans_pos[0] < meta_pos[0] < end_pos[0]):
         raise InvalidTranslationOutput(
             "Markery nejsou ve správném pořadí "
             f"({MARK_TRANSLATION} → {MARK_METADATA} → {MARK_END}).")
@@ -524,6 +593,10 @@ def _parse(raw: str) -> TranslationResult:
         raise InvalidTranslationOutput(
             f"Výstup nekončí markerem {MARK_END} - useknutý nebo jinak "
             "neúplný výstup, odmítám ho tiše přijmout jako hotový.")
+    # `split_sections()` (src/llm/parsing.py) zůstává BEZE ZMĚNY (obecná
+    # substring utilita) - kontroly výš zaručují, že KAŽDÝ marker je
+    # přesně na jednom řádku a nikde jinde, takže její naivní substring
+    # split je teď bezpečný.
     sections = split_sections(raw, [MARK_TRANSLATION, MARK_METADATA, MARK_END])
     translation = (sections.get("PREKLAD") or "").strip()
     if not translation:
@@ -642,6 +715,11 @@ ValueError) místo holého ValueError - main.py's _cmd_run (Task 5) ji
 pro --translator codex dělá fatální, stejná třída rizika jako kolo-2's
 StylistError fix (plan-consensus kolo 6 IMPORTANT).
 
+Markery se hledají řádkově kotveným regexem (^marker$, MULTILINE), ne
+substring in/count/index - substring by odmítl legitimní překlad/JSON
+hodnotu s markerem-podobným textem uprostřed jako poškozený výstup
+(plan-consensus kolo 9 IMPORTANT).
+
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
 
@@ -652,12 +730,19 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 **Files:**
 - Modify: `src/llm/client.py` (`CodexLLMClient` - nová; `PipelineLLMClient.
   complete()` - oprava, viz kolo 1 BLOCKING níž)
+- Modify: `src/agents/stylist.py` (`StylistTimeoutError` - NOVÁ podtřída
+  `StylistError`, jen jeden `raise` typ přepnutý na timeout raise-site;
+  ŽÁDNÁ změna subprocess mechaniky - viz kolo 9 IMPORTANT níž, PROČ tahle
+  jinak mimo-rozsah úprava je nutná)
 - Test: `tests/test_pipeline_client.py`
 
 **Interfaces:**
 - Consumes: `stylist._exec_codex`, `stylist.StylistError` (lokální
   import uvnitř `complete()`, ne na úrovni modulu - viz Global
   Constraints v designu, vrstvení).
+- Produces: `stylist.StylistTimeoutError(StylistError)` - nová podtřída,
+  existující `except StylistError` volající kód (`_polish_one_chapter`
+  atd.) funguje beze změny (kolo 9 IMPORTANT - viz níž, PROČ).
 - Produces: `CodexLLMClient(codex_cmd: list[str], codex_model: str,
   timeout: int | None = None)` - `complete()`/`count_tokens()` stejný
   `LLMClient` protokol jako `AnthropicClient`, `.provider == "codex"`,
@@ -665,7 +750,9 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   `complete()` přebaluje `stylist.StylistError`/`OSError`/`UnicodeError`
   na `FatalRunError` (kolo 2 BLOCKING + kolo 7 IMPORTANT - viz níž,
   PROČ), zprávu redaguje přes `stylist._redact_detail()` (kolo 8
-  IMPORTANT). `complete()`'s `Completion.input_tokens`/`output_tokens`
+  IMPORTANT) - ALE `stylist.StylistTimeoutError` (podtřída) NEpřebaluje,
+  necháváme propadnout jako obyčejnou výjimku (kolo 9 IMPORTANT - viz
+  níž, PROČ). `complete()`'s `Completion.input_tokens`/`output_tokens`
   NENULOVÝ konzervativní odhad, ne natvrdo `0` (kolo 5 IMPORTANT - viz
   níž, PROČ). `PipelineLLMClient._guard()` (cost-limit kontrola PŘED
   voláním) používá `effective_model` STEJNĚ jako `_price()`/audit (už
@@ -748,6 +835,37 @@ povšimnutí a propadly by STEJNOU cestou jako `InvalidTranslationOutput`
 před kolem 6 opravou: obyčejná výjimka, `_cmd_run`'s generický `except
 Exception` → per-kapitolový `error` → `state.queue_for_run`'s
 automatický retry navěky.
+
+**Kolo 9 IMPORTANT (plan-consensus) - proč `StylistTimeoutError` NESMÍ
+být `FatalRunError`:** Ověřil jsem přesně tenhle scénář krok za krokem -
+`_exec_codex()`'s timeout (`subprocess.TimeoutExpired`) se dnes přebalí
+na OBYČEJNÝ `StylistError` (`src/agents/stylist.py:398`, žádné odlišení
+od auth/exit-kód selhání). Kolo 2's fix výš přebalí KAŽDÝ `StylistError`
+(včetně timeoutu) na `FatalRunError` - a Task 2's revizní smyčka
+(kolo 3 fix) má `except FatalRunError: raise`, takže timeout BĚHEM
+revize by propagoval CELOU `process_chapter()` funkcí, zahodil by JIŽ
+HOTOVÝ scénový překlad, a zastavil by CELÝ běh. To přímo POPÍRÁ vlastní
+komentář u Tasku 2's kolo-3 fixu ("bezpečné i pro delší kapitoly...
+revizní smyčka teď MÁ checkpoint... jen označí flagged, nezahodí ho") -
+ten slib platí jen pro `FatalRunError`-NEZPŮSOBENÉ výjimky, a timeout
+kolem 2's fixem OMYLEM spadl do "fatální" kategorie spolu s auth/launch
+selháními, se kterými nemá nic společného. Timeout JEDNOHO volání je
+PER-CALL/transientní (prompt byl tentokrát moc velký/pomalý), NE nutně
+systémové selhání CELÉHO Codex backendu jako rozbitý CLI/vypršelá
+autentizace (to zůstává fatální, viz kolo 2 výš) - navíc pro SCÉNOVOU
+smyčku (Task 5) by non-fatal timeout znamenal `error` status, co
+`state.queue_for_run` autoretryuje PŘÍŠTÍ `run` - SPRÁVNÉ chování pro
+dočasný problém (na rozdíl od auth-selhání, co by se opakovalo navěky).
+
+Řešení vyžaduje ODLIŠENÍ typu chyby uvnitř `stylist.py` (timeout vs.
+ostatní `StylistError` příčiny) - jinak by `CodexLLMClient.complete()`
+musela SNIFFOVAT text hlášky (křehké, přesně to, co jsem odmítl už v
+kole 1 jako řešení jiného problému). Nová `StylistTimeoutError` podtřída
+je MINIMÁLNÍ možný zásah do `stylist.py` (jedna nová třída, jeden
+existující `raise` na jednom řádku přepnutý na podtřídu) - NEDOTÝKÁ SE
+subprocess mechaniky (`Popen`/`communicate`/`_kill_process_tree`/timeout
+hodnota samotná), jen JEJÍ TYPOVÁNÍ. Existující `except StylistError`
+volající kód (`_polish_one_chapter` atd.) funguje beze změny (podtřída).
 
 - [ ] **Step 1: Napiš test**
 
@@ -873,6 +991,26 @@ def test_codex_llm_client_wraps_os_and_unicode_errors_as_fatal_run_error(monkeyp
             c.complete(system="s", user="u", max_tokens=10, model="m")
 
 
+def test_codex_llm_client_does_not_wrap_timeout_as_fatal_run_error(monkeypatch):
+    """Kolo 9 IMPORTANT (plan-consensus) - timeout jednoho volání je
+    PER-CALL/transientní, ne nutně systémové selhání celého Codex
+    backendu jako auth/launch/exit-kód výš - NESMÍ se stát FatalRunError
+    (to by zahodilo i hotový scénový překlad při selhání revize, viz
+    Task 2, a zbytečně zastavilo celý run kvůli jednomu pomalému
+    volání). Necháváme propadnout jako StylistTimeoutError beze změny -
+    scénová smyčka ji zpracuje jako per-kapitolový error (auto-retry
+    příští run je tady správně), revizní smyčka (Task 2) ji zachytí a
+    kapitolu označí flagged s posledním platným překladem."""
+    from src.llm.client import CodexLLMClient
+    from src.agents.stylist import StylistTimeoutError
+    def boom(*a, **k):
+        raise StylistTimeoutError("codex exec překročil timeout 300s. [translator]")
+    monkeypatch.setattr("src.agents.stylist._exec_codex", boom)
+    c = CodexLLMClient(["codex"], "m")
+    with pytest.raises(StylistTimeoutError):
+        c.complete(system="s", user="u", max_tokens=10, model="m")
+
+
 def test_pipeline_client_uses_billed_model_for_price_not_caller_model(monkeypatch, tmp_path):
     """Kolo 1 BLOCKING (plan-consensus) - jádro opravy. `PipelineLLMClient`
     dostane `model="claude-sonnet-5"` (přesně to, co `translator.py`
@@ -941,9 +1079,49 @@ def test_pipeline_client_guard_uses_billed_model_price_not_caller_model(
     c.complete(system="s", user="u", max_tokens=100000, model="claude-sonnet-5")
 ```
 
+Přidej i do `tests/test_pipeline.py` (existující soubor, upravený už Taskem 2 - `_db`/`_factory`/`state`/`pipeline`/`T`/`C` importy tam už jsou; tenhle test potřebuje `CodexLLMClient`/`StylistTimeoutError`, co PŘICHÁZEJÍ AŽ týmhle Taskem 3, proto je až tady, ne u Tasku 2):
+
+```python
+def test_revision_timeout_flags_chapter_preserves_translation_integration(
+        tmp_path, monkeypatch):
+    """Kolo 9 IMPORTANT (plan-consensus) - integrační test PŘES CELÝ
+    stack (CodexLLMClient → PipelineLLMClient → pipeline.py revizní
+    smyčka, Task 2), ne jen mockovaný ValueError jako Task 2's vlastní
+    test - timeout BĚHEM revize (StylistTimeoutError) nesmí zastavit
+    celý běh ani zahodit hotový scénový překlad."""
+    from src.llm.client import CodexLLMClient, PipelineLLMClient
+    from src.agents.stylist import StylistTimeoutError
+    db = _db(tmp_path)
+    rid = state.create_run(db, "run")
+    calls = {"n": 0}
+    def fake_exec(prompt, *, codex_cmd, codex_model, timeout, label):
+        calls["n"] += 1
+        if calls["n"] == 1:      # 1. volání = scénový překlad, uspěje
+            return ("===PREKLAD===\nprvotní scénový překlad\n"
+                    "===METADATA===\n{}\n===KONEC===")
+        raise StylistTimeoutError("codex exec překročil timeout 300s. [translator]")
+    monkeypatch.setattr("src.agents.stylist._exec_codex", fake_exec)
+    always_bad = [{"source": "critic", "type": "fidelity", "severity": "critical",
+                   "action": "revise", "term_id": None, "expected": None,
+                   "actual": None, "cz_excerpt": "x", "issue": "chyba", "suggestion": "y"}]
+    monkeypatch.setattr(C, "review", lambda *a, **k: always_bad)
+    def cf(agent):
+        inner = CodexLLMClient(["codex"], config.CODEX_MODEL) if agent == "translator" else None
+        return PipelineLLMClient(inner, run_id=rid, agent=agent,
+                                 db_path=db, config_mod=config)
+    ch = state.get_chapter(db, 1)
+    out = pipeline.process_chapter(db, ch, client_factory=cf, guide={
+        "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    assert out["status"] == "flagged"
+    assert state.get_chapter(db, 1)["translated_text"] == "prvotní scénový překlad"
+```
+
+(`config` modul potřeba doimportovat na začátek `tests/test_pipeline.py`,
+pokud tam ještě není na úrovni modulu - zkontroluj.)
+
 - [ ] **Step 2: Ověř selhání**
 
-Run: `pytest tests/test_pipeline_client.py -k "codex_llm_client or pipeline_client_uses_billed_model or guard_uses_billed_model or fatal_error_shows_detail" -v`
+Run: `pytest tests/test_pipeline_client.py -k "codex_llm_client or pipeline_client_uses_billed_model or guard_uses_billed_model or fatal_error_shows_detail" -v && pytest tests/test_pipeline.py -k revision_timeout_flags_chapter -v`
 Expected: FAIL - `ImportError: cannot import name 'CodexLLMClient'`
 (a `test_pipeline_client_uses_billed_model_for_price_not_caller_model`
 padne jinak - `AttributeError: 'FakeCodexInner' object has no attribute`
@@ -998,9 +1176,11 @@ class CodexLLMClient:
         prompt = f"{system}\n\n{user}"
         timeout = self._timeout or config.CODEX_TRANSLATE_TIMEOUT_SECONDS
         # Kolo 2 BLOCKING (plan-consensus) - `_exec_codex`'s `StylistError`
-        # (rozbitý CLI, vypršelá autentizace, špatný exit kód, timeout,
-        # prázdná/rozbitá odpověď) se přebaluje na `FatalRunError`, ne
-        # necháváme propadnout jako obyčejnou výjimku. `state.queue_for_
+        # (rozbitý CLI, vypršelá autentizace, špatný exit kód, prázdná/
+        # rozbitá odpověď - VŠECHNO KROMĚ timeoutu, ten je výjimka, viz
+        # `StylistTimeoutError` níž, kolo 9 IMPORTANT) se přebaluje na
+        # `FatalRunError`, ne necháváme propadnout jako obyčejnou
+        # výjimku. `state.queue_for_
         # run()` (main.py `_cmd_run`'s fronta) automaticky ZNOVU zkouší
         # `error` kapitoly PŘI KAŽDÉM příštím `run`u (na rozdíl od
         # `flagged`/`needs_human`, co čekají na člověka) - bez tyhle
@@ -1021,6 +1201,21 @@ class CodexLLMClient:
             text = stylist._exec_codex(prompt, codex_cmd=self._codex_cmd,
                                        codex_model=self._codex_model,
                                        timeout=timeout, label="translator")
+        except stylist.StylistTimeoutError:
+            # Kolo 9 IMPORTANT (plan-consensus) - timeout JEDNOHO volání
+            # je PER-CALL/transientní (tenhle prompt byl tentokrát moc
+            # velký/pomalý), NE nutně systémové selhání CELÉHO Codex
+            # backendu jako auth/launch/exit-kód níž - NEpřebaluje se na
+            # `FatalRunError` (to by zahodilo hotový scénový překlad při
+            # selhání revize, viz Task 2, a zbytečně zastavilo celý run
+            # kvůli jednomu pomalému volání). Necháváme propadnout beze
+            # změny - scénová smyčka ji zpracuje jako per-kapitolový
+            # `error` (auto-retry PŘÍŠTÍ `run` je tady správně, timeout
+            # může být jen dočasný), revizní smyčka (Task 2) ji zachytí
+            # a kapitolu označí `flagged` s posledním platným překladem.
+            # MUSÍ být PŘED `except stylist.StylistError` níž (podtřída -
+            # jinak by ji ten širší `except` pohltil první).
+            raise
         except (stylist.StylistError, OSError, UnicodeError) as e:
             # Kolo 7 IMPORTANT (plan-consensus) - `_exec_codex()`'s
             # výstupní soubor se čte (`open(out_path, encoding="utf-8")
@@ -1071,6 +1266,35 @@ class CodexLLMClient:
         # vlastní fallback (main.py existující kód, `(len(system)+len(user))
         # //2`) - Codex nemá API pro přesné počítání tokenů.
         return (len(system) + len(user)) // 2
+```
+
+**Kolo 9 IMPORTANT oprava - `stylist.StylistTimeoutError`** (`src/agents/
+stylist.py`). Za `class StylistError(Exception): ...` (dnes řádek 154-157)
+přidej:
+
+```python
+class StylistTimeoutError(StylistError):
+    """`_exec_codex()` timeout - podtřída `StylistError` (existující
+    `except StylistError` volající kód, např. `_polish_one_chapter`,
+    funguje beze změny). Odlišitelná od ostatních `StylistError` příčin
+    (auth/exit kód/prázdná odpověď) - timeout jednoho volání je PER-
+    CALL/transientní, ne nutně systémové selhání celého Codex backendu
+    (`CodexLLMClient.complete()`, plan-consensus kolo 9 IMPORTANT, ji
+    NEpřebaluje na `FatalRunError`, na rozdíl od ostatních `StylistError`
+    příčin)."""
+```
+
+Najdi (dnes řádek 398):
+
+```python
+            raise StylistError(f"codex exec překročil timeout {timeout}s. [{label}]")
+```
+
+nahraď (JEN tenhle jeden `raise` - žádná jiná subprocess mechanika se
+nemění):
+
+```python
+            raise StylistTimeoutError(f"codex exec překročil timeout {timeout}s. [{label}]")
 ```
 
 **Kolo 1 BLOCKING oprava - `PipelineLLMClient.complete()`** (`src/llm/
@@ -1127,7 +1351,7 @@ vědět, KTERÝ Claude model volat); `CodexLLMClient.complete()` svůj
 
 - [ ] **Step 4: Ověř úspěch**
 
-Run: `pytest tests/test_pipeline_client.py -v`
+Run: `pytest tests/test_pipeline_client.py tests/test_pipeline.py -v`
 Expected: PASS (všechny, včetně existujících - `effective_model` fallback
 na `model` pro klienty bez `billed_model` znamená NULOVOU změnu chování
 pro `AnthropicClient`/`FakeLLMClient` cestu)
@@ -1135,7 +1359,7 @@ pro `AnthropicClient`/`FakeLLMClient` cestu)
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/llm/client.py tests/test_pipeline_client.py
+git add src/llm/client.py src/agents/stylist.py tests/test_pipeline_client.py tests/test_pipeline.py
 git commit -m "feat: CodexLLMClient + oprava PipelineLLMClient cena/audit pro Codex
 
 PipelineLLMClient.complete() teď používá inner klienta 'billed_model'
@@ -1169,6 +1393,14 @@ Přidán test ověřující, že i PipelineLLMClient._guard() (cost-limit
 kontrola PŘED voláním, ne jen výsledný audit log) použije
 effective_model, ne caller-supplied model (plan-consensus kolo 8
 IMPORTANT).
+
+Nová stylist.StylistTimeoutError (podtřída StylistError) - timeout
+jednoho volání je per-call/transientní, ne systémové selhání jako
+auth/launch/exit-kód, takže CodexLLMClient ji NEpřebaluje na
+FatalRunError (na rozdíl od ostatních StylistError příčin) - bez týhle
+opravy by timeout BĚHEM revize zahodil hotový scénový překlad a zastavil
+celý run, přímo v rozporu s Tasku 2's kolo-3 fixem (plan-consensus
+kolo 9 IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```

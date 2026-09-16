@@ -113,3 +113,17 @@ FatalRunError zprávy teď jdou přes stylist._redact_detail() (docstring
 výslovně jmenuje "str(e) neočekávané výjimky"). Přidán chybějící test
 ověřující, že i _guard() (cost-limit, ne jen audit log) použije
 effective_model.
+
+## Round 9
+
+- Codex: [round-9-codex.md](round-9-codex.md) — CHANGES_NEEDED
+- Claude: [round-9-claude.md](round-9-claude.md) — CHANGES_NEEDED
+
+Opraveno: 2x IMPORTANT, oba odhalily mezery ve VLASTNÍCH dřívějších
+fixech. Kolo-2's StylistError->FatalRunError omylem zahrnul i timeout
+(per-call/transientní), ne jen systémová selhání - přímo popíralo
+kolo-3's slib "revize zachová hotový překlad"; opraveno novou
+StylistTimeoutError podtřídou (minimální zásah do stylist.py). Marker
+parsing (count/index) hledal substring kdekoli v textu, ne řádek -
+legitimní obsah s marker-podobným textem uprostřed by se chybně
+odmítl; opraveno řádkově kotveným regexem.
