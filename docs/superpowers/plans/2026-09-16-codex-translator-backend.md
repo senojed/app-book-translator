@@ -131,6 +131,13 @@ FS-risk varování jako `polish`).
   14 IMPORTANT, plan-consensus - viz Task 2) - `{"term_en": 1}` by
   jinak prošlo a spadlo na neklasifikovanou `AttributeError` v
   `pipeline.py`'s `.strip()` volání.
+- `PipelineLLMClient.complete()` přebalí `_guard()`'s "nemá sazby"
+  `FatalRunError` na `CodexTranslatorFatalError`, když `self._inner.
+  provider == "codex"` (kolo 15 IMPORTANT, plan-consensus - viz Task 3) -
+  obrana do hloubky (Task 1 garantuje sazby pro `CODEX_MODEL` VŽDY, ale
+  bez správného typu by JAKÁKOLI budoucí desynchronizace nechala
+  kapitolu uvíznout v `processing` stejně jako netypované cesty před
+  koly 10-13).
 
 ---
 
@@ -1026,7 +1033,11 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   (cost-limit kontrola PŘED voláním) používá `effective_model` STEJNĚ
   jako `_price()`/audit (už součást kolo-1 opravy níž) - ověřeno
   samostatným testem (kolo 8 IMPORTANT - existující test kryl jen
-  výsledný audit řádek, ne `_guard()` samotný).
+  výsledný audit řádek, ne `_guard()` samotný). `PipelineLLMClient.
+  complete()`'s `_guard()` volání přebalí `_guard()`'s "nemá sazby"
+  `FatalRunError` na `CodexTranslatorFatalError`, když `self._inner.
+  provider == "codex"` (kolo 15 IMPORTANT - viz níž, PROČ) - obrana do
+  hloubky, ne oprava aktivního bugu.
 
 **Kolo 5 IMPORTANT (plan-consensus) - proč `input_tokens`/`output_tokens`
 nesmí být natvrdo `0`:** `PipelineLLMClient.complete()` (`src/llm/
@@ -1383,6 +1394,31 @@ def test_pipeline_client_guard_uses_billed_model_price_not_caller_model(
     # max_tokens by vygeneroval nenulový odhad a FatalRunError by
     # vyletěl i s $0 utraceno.
     c.complete(system="s", user="u", max_tokens=100000, model="claude-sonnet-5")
+
+
+def test_pipeline_client_missing_price_for_codex_inner_raises_codex_translator_fatal(
+        monkeypatch, tmp_path):
+    """Kolo 15 IMPORTANT (plan-consensus) - `_guard()`'s "nemá sazby"
+    `FatalRunError` je obecný typ - pro Codex-backed inner klient
+    (`.provider == "codex"`) musí být `CodexTranslatorFatalError`, jinak
+    by `_cmd_run` (Task 5) tenhle pád nezachytil typovou větví a
+    kapitola by zůstala v `processing` limbu (stejná třída díry jako
+    kolo 12's `factory()` fix, jen jiné místo)."""
+    db = _db(tmp_path)
+    rid = state.create_run(db, "run")
+
+    class FakeCodexInner:
+        provider = "codex"
+        billed_model = "codex-missing-price"   # ŽÁDNÝ záznam v PRICE_*_PER_MTOK
+        def complete(self, *, system, user, max_tokens, model):
+            raise AssertionError("nemá se zavolat - guard selže dřív")
+        def count_tokens(self, *, system, user, model):
+            return 10
+
+    c = PipelineLLMClient(FakeCodexInner(), run_id=rid, agent="translator",
+                          db_path=db, config_mod=config, interactive=False)
+    with pytest.raises(CodexTranslatorFatalError):
+        c.complete(system="s", user="u", max_tokens=10, model="claude-sonnet-5")
 ```
 
 Přidej i do `tests/test_pipeline.py` (existující soubor, upravený už Taskem 2 - `_db`/`_factory`/`state`/`pipeline`/`T`/`C` importy tam už jsou; tenhle test potřebuje `CodexLLMClient`/`StylistTimeoutError`, co PŘICHÁZEJÍ AŽ týmhle Taskem 3, proto je až tady, ne u Tasku 2):
@@ -1427,7 +1463,7 @@ pokud tam ještě není na úrovni modulu - zkontroluj.)
 
 - [ ] **Step 2: Ověř selhání**
 
-Run: `pytest tests/test_pipeline_client.py -k "codex_llm_client or pipeline_client_uses_billed_model or guard_uses_billed_model or fatal_error_shows_detail" -v && pytest tests/test_pipeline.py -k revision_timeout_flags_chapter -v`
+Run: `pytest tests/test_pipeline_client.py -k "codex_llm_client or pipeline_client_uses_billed_model or guard_uses_billed_model or fatal_error_shows_detail or missing_price_for_codex" -v && pytest tests/test_pipeline.py -k revision_timeout_flags_chapter -v`
 Expected: FAIL - `ImportError: cannot import name 'CodexLLMClient'`
 (a `test_pipeline_client_uses_billed_model_for_price_not_caller_model`
 padne jinak - `AttributeError: 'FakeCodexInner' object has no attribute`
@@ -1702,11 +1738,42 @@ a HNED ZA `from src import state` přidej:
 
 Pak nahraď VŠECHNY tři existující výskyty holého `model` (ne `max_tokens`
 ani `self._inner.complete(model=model, ...)` - TAM zůstává PŮVODNÍ
-`model`, viz níž proč) uvnitř týhle metody `effective_model`:
+`model`, viz níž proč) uvnitř týhle metody `effective_model`. Najdi:
 
 ```python
-        self._guard(system, user, max_tokens, effective_model)
-        ...
+        self._guard(system, user, max_tokens, model)
+```
+
+nahraď (kolo 15 IMPORTANT - viz níž, PROČ `try/except` navíc):
+
+```python
+        try:
+            self._guard(system, user, max_tokens, effective_model)
+        except FatalRunError as e:
+            # Kolo 15 IMPORTANT (plan-consensus) - `_guard()`'s "nemá
+            # sazby" `FatalRunError` (přes `_price()`, `src/llm/client.py:
+            # 135-140`) je OBECNÝ typ. Pro Codex-backed `self._inner`
+            # (`.provider == "codex"`) ho přebalíme na
+            # `CodexTranslatorFatalError`, ať `_cmd_run` (Task 5) tenhle
+            # pád taky označí `flagged`, místo aby kapitola zůstala v
+            # `processing` limbu - stejná třída díry jako kolo 12's
+            # `factory()` fix, jen JINÉ místo (`PipelineLLMClient` samo,
+            # ne `_client_factory`). Za NORMÁLNÍCH okolností Task 1
+            # garantuje, že `CODEX_MODEL` má cenový záznam VŽDY (stejná
+            # source-of-truth proměnná na sousedním řádku v config.py),
+            # takže tenhle `except` je obrana do hloubky, ne oprava
+            # aktivního bugu - ALE bez správného typu by JAKÁKOLI
+            # budoucí desynchronizace (config edit, refaktor) nechala
+            # kapitolu uvíznout stejně jako ostatní netypované cesty
+            # před koly 10-13.
+            if getattr(self._inner, "provider", None) == "codex":
+                raise CodexTranslatorFatalError(str(e)) from e
+            raise
+```
+
+a `in_rate, out_rate = self._price(model)` na:
+
+```python
         in_rate, out_rate = self._price(effective_model)
 ```
 
@@ -1795,6 +1862,13 @@ CodexLLMClient.complete() ma vlastni STYLIST_ACCEPT_FS_RISK kontrolu,
 nezavislou na volajicim - stejny vzor jako stylist.polish(), obrana do
 hloubky proti primemu zkonstruovani/zavolani mimo _client_factory's
 gate (plan-consensus kolo 14 IMPORTANT).
+
+PipelineLLMClient.complete() preballi _guard()'s "nema sazby"
+FatalRunError na CodexTranslatorFatalError, kdyz self._inner.provider
+== "codex" - obrana do hloubky, jinak by jakakoli budouci
+desynchronizace cenove tabulky nechala kapitolu uviznout v processing
+stejne jako netypovane cesty pred koly 10-13 (plan-consensus kolo 15
+IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
@@ -2599,22 +2673,35 @@ ne omyl v Codex cestě. Zjisti si `pending` `<idx>` PŘED spuštěním -
 `python main.py status` (v izolované kopii, ne v `data/state.sqlite3` -
 viz níž) vypíše stav všech kapitol, vyber jednu s `[ ]`/pending značkou.
 
-**Kopie DB PŘES `.backup`, NE prostý `cp`/`Copy-Item`** (kolo 14
-IMPORTANT, plan-consensus) - `state.sqlite3` NENÍ quiescent, pokud
-souběžně běží (nebo nedávno běžel a má rozdělané zápisy) jiný proces -
-prostý souborový `cp` může zkopírovat DB uprostřed zápisu (nekonzistentní/
-useknutý snapshot). SQLite's `.backup` dot-command (přes `sqlite3` CLI,
-stejný nástroj, co plán stejně používá níž na `SELECT` dotaz) dělá
-konzistentní kopii i nad aktivní DB. `guide.json` (obyčejný JSON soubor,
-ne SQLite) zůstává prostý `cp`/`Copy-Item` - bez souběžných zapisovačů
-za normálního použití.
+**Kopie DB PŘES `sqlite3.Connection.backup()` (Python stdlib), NE
+prostý `cp`/`Copy-Item` ani `sqlite3` CLI** (kolo 14 IMPORTANT +
+kolo 15 IMPORTANT, plan-consensus) - `state.sqlite3` NENÍ quiescent,
+pokud souběžně běží (nebo nedávno běžel a má rozdělané zápisy) jiný
+proces - prostý souborový `cp` může zkopírovat DB uprostřed zápisu
+(nekonzistentní/useknutý snapshot). Kolo 14 navrhlo `sqlite3` CLI's
+`.backup` dot-command - OVĚŘENO (kolo 15 IMPORTANT) přímo v tomhle
+prostředí (`which sqlite3` → "command not found") - `sqlite3` CLI NENÍ
+dostupné a projekt ho nemá jako závislost, takže by tenhle krok podle
+plánu nešel provést. Python (`sqlite3` modul je STDLIB, vždy dostupný,
+projekt na Pythonu stejně běží) má STEJNOU `.backup()` metodu
+(`Connection.backup(target)`) - žádná externí závislost navíc. `guide.
+json` (obyčejný JSON soubor, ne SQLite) zůstává prostý `cp`/`Copy-Item` -
+bez souběžných zapisovačů za normálního použití.
 
 Bash (Git Bash/WSL - stejné nástroje, co používá tenhle plán i celá
 testovací sada):
 
 ```bash
 mkdir -p /tmp/codex-translator-smoke/data
-sqlite3 data/state.sqlite3 ".backup '/tmp/codex-translator-smoke/data/state.sqlite3'"
+export SMOKE_SRC_DB=data/state.sqlite3
+export SMOKE_DB=/tmp/codex-translator-smoke/data/state.sqlite3
+python -c "
+import os, sqlite3
+src = sqlite3.connect(os.environ['SMOKE_SRC_DB'])
+dst = sqlite3.connect(os.environ['SMOKE_DB'])
+src.backup(dst)
+dst.close(); src.close()
+"
 cp data/guide.json /tmp/codex-translator-smoke/data/guide.json
 BOOK_TRANSLATOR_PROJECT_DIR=/tmp/codex-translator-smoke \
   python main.py status   # najdi pending <idx>
@@ -2622,8 +2709,14 @@ BOOK_TRANSLATOR_PROJECT_DIR=/tmp/codex-translator-smoke \
   python main.py run --translator codex --only <idx>
 BOOK_TRANSLATOR_PROJECT_DIR=/tmp/codex-translator-smoke \
   python main.py status
-sqlite3 /tmp/codex-translator-smoke/data/state.sqlite3 \
-  "SELECT provider, model, cost_usd FROM llm_calls WHERE agent='translator' ORDER BY id DESC LIMIT 5;"
+python -c "
+import os, sqlite3
+conn = sqlite3.connect(os.environ['SMOKE_DB'])
+for row in conn.execute(
+        'SELECT provider, model, cost_usd FROM llm_calls WHERE agent=? ORDER BY id DESC LIMIT 5',
+        ('translator',)):
+    print(row)
+"
 ```
 
 PowerShell (kolo 2 IMPORTANT, plan-consensus - projekt běží primárně na
@@ -2632,13 +2725,28 @@ Windows/PowerShell, `mkdir -p`/inline `VAR=val` je bash-only syntax):
 ```powershell
 $smoke = "$env:TEMP\codex-translator-smoke"
 New-Item -ItemType Directory -Force "$smoke\data" | Out-Null
-sqlite3 data\state.sqlite3 ".backup '$smoke\data\state.sqlite3'"
+$env:SMOKE_SRC_DB = "data\state.sqlite3"
+$env:SMOKE_DB = "$smoke\data\state.sqlite3"
+python -c "
+import os, sqlite3
+src = sqlite3.connect(os.environ['SMOKE_SRC_DB'])
+dst = sqlite3.connect(os.environ['SMOKE_DB'])
+src.backup(dst)
+dst.close(); src.close()
+"
 Copy-Item data\guide.json "$smoke\data\guide.json"
 $env:BOOK_TRANSLATOR_PROJECT_DIR = $smoke
 python main.py status   # najdi pending <idx>
 python main.py run --translator codex --only <idx>
 python main.py status
-sqlite3 "$smoke\data\state.sqlite3" "SELECT provider, model, cost_usd FROM llm_calls WHERE agent='translator' ORDER BY id DESC LIMIT 5;"
+python -c "
+import os, sqlite3
+conn = sqlite3.connect(os.environ['SMOKE_DB'])
+for row in conn.execute(
+        'SELECT provider, model, cost_usd FROM llm_calls WHERE agent=? ORDER BY id DESC LIMIT 5',
+        ('translator',)):
+    print(row)
+"
 ```
 
 Zkontroluj: kapitola má rozumný český text, `new_terms`/`questions` (pokud

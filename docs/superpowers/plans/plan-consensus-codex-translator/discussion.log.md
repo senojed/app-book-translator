@@ -197,3 +197,18 @@ main.py a vyvraceno - _cmd_polish EXPLICITNE zahrnuje flagged/
 needs_human (zamerny, drivejsi design fix tohohle projektu). Prvni
 pripad v tomhle plan-consensus, kdy Codexovo tvrzeni bylo v rozporu se
 skutecnym kodem.
+
+## Round 15
+
+- Codex: [round-15-codex.md](round-15-codex.md) — CHANGES_NEEDED
+- Claude: [round-15-claude.md](round-15-claude.md) — CHANGES_NEEDED
+
+Opraveno: 2x IMPORTANT. Prvni bod - Codexova konkretni premisa
+("CODEX_MODEL se meni za behu") byla nespravna (config.py drzi cenu
+vzdy synchronizovanou), ale obecnejsi problem za ni byl platny -
+PipelineLLMClient._guard()'s FatalRunError bylo posledni netypovane
+misto z cele rodiny kolo-10-13 fixu; opraveno prebalenim na
+CodexTranslatorFatalError. Druhy bod OVEREN primo (sqlite3 CLI
+skutecne chybi v tomhle prostredi, `which sqlite3` -> command not
+found) - vlastni kolo-14 fix byl neproveditelna regrese; opraveno
+prechodem na Python stdlib sqlite3 modul.
