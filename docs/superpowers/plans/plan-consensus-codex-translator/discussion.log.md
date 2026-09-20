@@ -235,3 +235,17 @@ Opraveno: BLOCKING - kopirovaci artefakt v kolo-16's testu (prebytecne
 radky s nedefinovanou calls promennou, zkopirovane z predchoziho
 testu behem Edit vkladani). Opraveno odstranenim prebytecnych radku
 (pokryti "druhy run" uz existuje v sesterskem testu).
+
+## Round 18
+
+- Codex: [round-18-codex.md](round-18-codex.md) — CHANGES_NEEDED
+- Claude: [round-18-claude.md](round-18-claude.md) — CHANGES_NEEDED
+
+Opraveno: IMPORTANT - kolo-13's fatal-commit vetev poslala mentions=[],
+popsano jako "jen bez novych mentions", ale
+state.commit_chapter_result() dela bezpodminecny DELETE pred vlozenim -
+pro --retry-flagged kapitolu s existujicimi mentions z drivejsiho
+uspesneho commitu by [] tyhle mentions nenavratne smazal i pres
+zachovany translated_text. Opraveno deterministickym znovusestavenim
+mentions ze zachovaneho cz a existujiciho glosare (concordance.
+build_mentions, stejne volani jako normalni commit cesta).

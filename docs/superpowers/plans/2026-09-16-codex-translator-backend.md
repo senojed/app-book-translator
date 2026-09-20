@@ -76,9 +76,14 @@ FS-risk varování jako `polish`).
   consensus - viz Task 2) - `FatalRunError` PŘED propagací ULOŽÍ
   poslední platný `cz` jako `flagged` (kolo 13 IMPORTANT, plan-consensus -
   jinak by `_cmd_run`'s `flagged` status, kolo 10/11, byl jen kosmetický,
-  `translated_text` by zůstal ztracený), jakákoli jiná výjimka smyčku
-  přeruší a kapitola jde do `flagged` s POSLEDNÍM platným překladem, ne
-  do `error` se ztraceným textem.
+  `translated_text` by zůstal ztracený) - `mentions` se DETERMINISTICKY
+  znovu sestaví ze zachovaného `cz` a existujícího glosáře, NE `[]`
+  (kolo 18 IMPORTANT, plan-consensus - `state.commit_chapter_result()`
+  VŽDY smaže existující `term_mentions` před vložením, takže `[]` by
+  při `--retry-flagged` nenávratně smazal konkordanční metadata z
+  dřívějšího úspěšného commitu), jakákoli jiná výjimka smyčku přeruší a
+  kapitola jde do `flagged` s POSLEDNÍM platným překladem, ne do
+  `error` se ztraceným textem.
 - `--translator codex` se ověřuje (`STYLIST_ACCEPT_FS_RISK`/`CODEX_MODEL`/
   CLI) HNED na začátku `_cmd_run`, ne líně až při prvním volání (kolo 3
   IMPORTANT, plan-consensus - viz Task 5) - prázdná/vyfiltrovaná fronta
@@ -650,6 +655,34 @@ def test_revision_fatal_error_preserves_translation_before_reraising(
     row = state.get_chapter(db, 1)
     assert row["status"] == "flagged"
     assert row["translated_text"] == "prvotní scénový překlad"
+
+
+def test_revision_fatal_error_preserves_existing_term_mentions(tmp_path, monkeypatch):
+    """Kolo 18 IMPORTANT (plan-consensus) - `mentions=[]` (kolo-13
+    původní verze) NENÍ "jen bez nových mentions" - `state.commit_
+    chapter_result()` PŘED vložením VŽDY smaže VŠECHNY existující
+    `term_mentions` pro tuhle kapitolu, bez ohledu na co se posílá.
+    Pro `--retry-flagged` kapitolu s existujícím mention z dřívějšího
+    úspěšného commitu by prázdný seznam mentions ty existující
+    nenávratně smazal, i když `translated_text` zůstal zachovaný."""
+    db = _db(tmp_path)
+    from src.llm.client import FatalRunError
+    with state.connect(db) as conn:
+        conn.execute("UPDATE glossary SET canonical_en='Harry', cz='Harry', "
+                     "status='approved' WHERE term_id='t1'")
+    monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
+        "Harry je tady.", [], [], []))
+    always_bad = [{"source": "critic", "type": "fidelity", "severity": "critical",
+                   "action": "revise", "term_id": None, "expected": None,
+                   "actual": None, "cz_excerpt": "x", "issue": "chyba", "suggestion": "y"}]
+    monkeypatch.setattr(C, "review", lambda *a, **k: always_bad)
+    def boom(*a, **k): raise FatalRunError("codex auth expired")
+    monkeypatch.setattr(T, "revise_chapter", boom)
+    ch = state.get_chapter(db, 1)
+    with __import__("pytest").raises(FatalRunError):
+        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    assert 1 in state.chapters_mentioning_term(db, "t1")
 ```
 
 - [ ] **Step 2: Ověř selhání**
@@ -874,9 +907,28 @@ nahraď:
             # status (kolo 10/11) je pak jen KOSMETICKÝ, skutečný
             # PŘEKLAD zůstává ztracený (commit běží až na konci funkce,
             # `raise`/re-raise ho nikdy nedosáhne). Uložíme HO PŘED
-            # re-raise - minimální "transakce B" (bez nových
-            # glosářových kandidátů/mentions/otázek - ty se dají dohnat
-            # později, ztráta CELÉHO překladu ne).
+            # re-raise - minimální "transakce B" (bez nových glosářových
+            # kandidátů/otázek - ty se dají dohnat později, ztráta
+            # CELÉHO překladu ne).
+            #
+            # Kolo 18 IMPORTANT (plan-consensus) - `mentions=[]` (PŮVODNÍ
+            # kolo-13 verze) NENÍ "jen bez nových mentions" - `state.
+            # commit_chapter_result()` PŘED vložením VŽDY smaže VŠECHNY
+            # existující `term_mentions` řádky pro tuhle kapitolu
+            # (`DELETE FROM term_mentions WHERE chapter_idx=?`, `src/
+            # state.py:660`), bez ohledu na to, co se posílá. Pro
+            # kapitolu, co se PRVNÍKRÁT překládá, žádné existující
+            # mentions nejsou (žádná ztráta) - ALE pro `--retry-flagged`
+            # kapitolu, co UŽ MĚLA mentions z dřívějšího úspěšného
+            # commitu, by prázdný seznam ty existující nenávratně smazal
+            # (konkordanční metadata pro `run_drift_check` atd.), i když
+            # `translated_text` zůstal zachovaný. `mentions=[]` bylo
+            # nepřesné tvrzení, ne jen zjednodušení.
+            #
+            # Oprava: mentions se DETERMINISTICKY znovu sestaví ze
+            # zachovaného `cz` a existujícího glosáře (`glossary_rows`,
+            # bez nových kandidátů - ty jsme se rozhodli nedohánět) -
+            # STEJNÉ volání jako normální "transakce B" prep níž.
             from src import findings as findings_mod
             pseudo = {"source": "pipeline", "type": "fluency", "severity": "critical",
                      "action": "note", "term_id": None, "expected": None,
@@ -885,10 +937,15 @@ nahraď:
                               "poslední platný překlad zachován",
                      "suggestion": None}
             saved_findings = findings_mod.assign_ids(findings + [pseudo])
+            rebuilt_mentions = concordance.build_mentions(en, cz, glossary_rows, rendered)
+            rebuilt_mentions = [{"term_id": m.term_id, "cz_form": m.cz_form,
+                                 "scene_idx": m.scene_idx, "source": m.source}
+                                for m in rebuilt_mentions]
             state.commit_chapter_result(
                 db_path, idx, translated_text=cz, revision_rounds=rounds,
                 notes_json=json.dumps(saved_findings, ensure_ascii=False),
-                status="flagged", new_candidates=[], mentions=[], questions=[])
+                status="flagged", new_candidates=[], mentions=rebuilt_mentions,
+                questions=[])
             raise
         except Exception as e:
             # Kolo 3 IMPORTANT (plan-consensus) - `revise_chapter()`
@@ -993,6 +1050,13 @@ new_terms/rendered_terms/questions polozky (term_en, cz, scope_key,
 atd.) - "seznam objektu" samo nestaci, {"term_en": 1} projde touhle
 kontrolou, ale pipeline.py's .strip() na intu stejne spadne (plan-
 consensus kolo 14 IMPORTANT).
+
+Revizni smycka's fatalni-chyba commit (kolo 13) ted deterministicky
+znovu sestavi mentions ze zachovaneho cz a existujiciho glosare misto
+prazdneho seznamu - state.commit_chapter_result() vzdy smaze existujici
+term_mentions pred vlozenim, takze [] by pri --retry-flagged nenavratne
+smazal konkordancni metadata z drivejsiho uspesneho commitu (plan-
+consensus kolo 18 IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
