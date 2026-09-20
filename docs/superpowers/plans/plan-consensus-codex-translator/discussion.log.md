@@ -212,3 +212,16 @@ CodexTranslatorFatalError. Druhy bod OVEREN primo (sqlite3 CLI
 skutecne chybi v tomhle prostredi, `which sqlite3` -> command not
 found) - vlastni kolo-14 fix byl neproveditelna regrese; opraveno
 prechodem na Python stdlib sqlite3 modul.
+
+## Round 16
+
+- Codex: [round-16-codex.md](round-16-codex.md) — CHANGES_NEEDED
+- Claude: [round-16-claude.md](round-16-claude.md) — CHANGES_NEEDED
+
+Opraveno: 2x IMPORTANT, oba v kolo-15's vlastnim fixu. except
+FatalRunError bylo moc siroke - chytalo vsech pet _guard() raise-situ
+(missing sazby, cost-limit, stdin, uzivatel zastavil, LockLostError),
+ne jen "nema sazby"; opraveno novou MissingPriceError podtridou, zuzeny
+except. Bare raise v _cmd_run's CodexTranslatorFatalError handleru
+re-raisovalo neredigovanou zpravu na konzoli navzdory redigovanym
+notes; opraveno konstrukci nove vyjimky s redigovanou zpravou.

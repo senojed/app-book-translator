@@ -118,7 +118,10 @@ FS-risk varování jako `polish`).
   `LockLostError` - kritik je VŽDY Claude, i při `--translator codex`)
   je před-existující chování, mimo rozsah týhle plánu, a NESMÍ dostat
   stejné zacházení jen proto, že translator backend je nastavený na
-  `codex`.
+  `codex`. Re-raise PO zápisu `notes` konstruuje NOVOU `CodexTranslatorFatalError`
+  s REDIGOVANOU zprávou, ne holé `raise` původní (neredigované) výjimky
+  (kolo 16 IMPORTANT, plan-consensus) - outer handler (`main.py`) tiskne
+  zprávu PŘÍMO na konzoli, bare `raise` by tam vynesl raw text.
 - `CodexLLMClient.complete()` má VLASTNÍ `config.STYLIST_ACCEPT_FS_RISK`
   kontrolu, nezávislou na `_client_factory`'s `_polish_preflight()`
   gate (kolo 14 IMPORTANT, plan-consensus - viz Task 3) - stejný vzor
@@ -131,12 +134,16 @@ FS-risk varování jako `polish`).
   14 IMPORTANT, plan-consensus - viz Task 2) - `{"term_en": 1}` by
   jinak prošlo a spadlo na neklasifikovanou `AttributeError` v
   `pipeline.py`'s `.strip()` volání.
-- `PipelineLLMClient.complete()` přebalí `_guard()`'s "nemá sazby"
-  `FatalRunError` na `CodexTranslatorFatalError`, když `self._inner.
-  provider == "codex"` (kolo 15 IMPORTANT, plan-consensus - viz Task 3) -
-  obrana do hloubky (Task 1 garantuje sazby pro `CODEX_MODEL` VŽDY, ale
-  bez správného typu by JAKÁKOLI budoucí desynchronizace nechala
-  kapitolu uvíznout v `processing` stejně jako netypované cesty před
+- `PipelineLLMClient._price()` vyhazuje NOVOU `MissingPriceError`
+  (podtřída `FatalRunError`) místo holého `FatalRunError` - `complete()`
+  přebalí JEN TUHLE (ne KAŽDÝ `_guard()`-raised `FatalRunError` - kolo
+  16 IMPORTANT, plan-consensus - normální cost-guard stop NENÍ Codex-
+  specifická chyba) na `CodexTranslatorFatalError`, když `self._inner.
+  provider == "codex"` (kolo 15 IMPORTANT, zpřesněno kolo 16 IMPORTANT,
+  plan-consensus - viz Task 3) - obrana do hloubky (Task 1 garantuje
+  sazby pro `CODEX_MODEL` VŽDY, ale bez správného typu by JAKÁKOLI
+  budoucí desynchronizace nechala kapitolu uvíznout v `processing`
+  stejně jako netypované cesty před
   koly 10-13).
 
 ---
@@ -1034,10 +1041,14 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   jako `_price()`/audit (už součást kolo-1 opravy níž) - ověřeno
   samostatným testem (kolo 8 IMPORTANT - existující test kryl jen
   výsledný audit řádek, ne `_guard()` samotný). `PipelineLLMClient.
-  complete()`'s `_guard()` volání přebalí `_guard()`'s "nemá sazby"
-  `FatalRunError` na `CodexTranslatorFatalError`, když `self._inner.
-  provider == "codex"` (kolo 15 IMPORTANT - viz níž, PROČ) - obrana do
-  hloubky, ne oprava aktivního bugu.
+  _price()` vyhazuje NOVOU `MissingPriceError` (podtřída `FatalRunError`)
+  místo holého `FatalRunError` (kolo 16 IMPORTANT - viz níž, PROČ
+  přesně TAHLE podtřída, ne širší `except FatalRunError`) -
+  `PipelineLLMClient.complete()`'s `_guard()` volání přebalí JEN
+  `MissingPriceError` na `CodexTranslatorFatalError`, když `self._inner.
+  provider == "codex"` (kolo 15 IMPORTANT, zpřesněno kolo 16 IMPORTANT -
+  viz níž, PROČ) - obrana do hloubky, ne oprava aktivního bugu, a NESMÍ
+  zasáhnout normální cost-guard stop (backend-nezávislé chování).
 
 **Kolo 5 IMPORTANT (plan-consensus) - proč `input_tokens`/`output_tokens`
 nesmí být natvrdo `0`:** `PipelineLLMClient.complete()` (`src/llm/
@@ -1398,12 +1409,13 @@ def test_pipeline_client_guard_uses_billed_model_price_not_caller_model(
 
 def test_pipeline_client_missing_price_for_codex_inner_raises_codex_translator_fatal(
         monkeypatch, tmp_path):
-    """Kolo 15 IMPORTANT (plan-consensus) - `_guard()`'s "nemá sazby"
-    `FatalRunError` je obecný typ - pro Codex-backed inner klient
-    (`.provider == "codex"`) musí být `CodexTranslatorFatalError`, jinak
-    by `_cmd_run` (Task 5) tenhle pád nezachytil typovou větví a
-    kapitola by zůstala v `processing` limbu (stejná třída díry jako
-    kolo 12's `factory()` fix, jen jiné místo)."""
+    """Kolo 15 IMPORTANT (plan-consensus) - `_price()`'s "nemá sazby"
+    `MissingPriceError` (kolo 16 - nová podtřída, viz níž) musí být pro
+    Codex-backed inner klient (`.provider == "codex"`) přebalená na
+    `CodexTranslatorFatalError`, jinak by `_cmd_run` (Task 5) tenhle pád
+    nezachytil typovou větví a kapitola by zůstala v `processing` limbu
+    (stejná třída díry jako kolo 12's `factory()` fix, jen jiné místo)."""
+    from src.llm.client import CodexTranslatorFatalError
     db = _db(tmp_path)
     rid = state.create_run(db, "run")
 
@@ -1419,6 +1431,40 @@ def test_pipeline_client_missing_price_for_codex_inner_raises_codex_translator_f
                           db_path=db, config_mod=config, interactive=False)
     with pytest.raises(CodexTranslatorFatalError):
         c.complete(system="s", user="u", max_tokens=10, model="claude-sonnet-5")
+
+
+def test_pipeline_client_codex_normal_cost_guard_stop_stays_plain_fatal_run_error(
+        monkeypatch, tmp_path):
+    """Kolo 16 IMPORTANT (plan-consensus) - kolo-15's PŮVODNÍ fix
+    (`except FatalRunError`) by chytlo VŠECHNY `_guard()` příčiny, i
+    normální cost-guard stop (limit překročen, non-interactive) - to
+    NENÍ Codex-specifická chyba (Claude by dopadl identicky), takže
+    NESMÍ dostat `CodexTranslatorFatalError` zacházení. Zúženo na
+    `MissingPriceError` (přesně jeden konkrétní `_guard()` raise-site)."""
+    from src.llm.client import CodexTranslatorFatalError
+    db = _db(tmp_path)
+    rid = state.create_run(db, "run")
+    monkeypatch.setattr(config, "PRICE_IN_PER_MTOK",
+                        {**config.PRICE_IN_PER_MTOK, "codex-x": 100.0})
+    monkeypatch.setattr(config, "PRICE_OUT_PER_MTOK",
+                        {**config.PRICE_OUT_PER_MTOK, "codex-x": 100.0})
+    monkeypatch.setattr(config, "MAX_SPEND_USD", 0.0)
+
+    class FakeCodexInner:
+        provider = "codex"
+        billed_model = "codex-x"
+        def complete(self, *, system, user, max_tokens, model):
+            raise AssertionError("nemá se zavolat - guard selže dřív")
+        def count_tokens(self, *, system, user, model):
+            return 10
+
+    c = PipelineLLMClient(FakeCodexInner(), run_id=rid, agent="translator",
+                          db_path=db, config_mod=config, interactive=False)
+    # Cena JE definovaná (žádný MissingPriceError) - guard zastaví na
+    # PŘEKROČENÍ stropu, obyčejný FatalRunError, NE CodexTranslatorFatalError.
+    with pytest.raises(FatalRunError) as exc_info:
+        c.complete(system="s", user="u", max_tokens=100000, model="claude-sonnet-5")
+    assert not isinstance(exc_info.value, CodexTranslatorFatalError)
 ```
 
 Přidej i do `tests/test_pipeline.py` (existující soubor, upravený už Taskem 2 - `_db`/`_factory`/`state`/`pipeline`/`T`/`C` importy tam už jsou; tenhle test potřebuje `CodexLLMClient`/`StylistTimeoutError`, co PŘICHÁZEJÍ AŽ týmhle Taskem 3, proto je až tady, ne u Tasku 2):
@@ -1463,7 +1509,7 @@ pokud tam ještě není na úrovni modulu - zkontroluj.)
 
 - [ ] **Step 2: Ověř selhání**
 
-Run: `pytest tests/test_pipeline_client.py -k "codex_llm_client or pipeline_client_uses_billed_model or guard_uses_billed_model or fatal_error_shows_detail or missing_price_for_codex" -v && pytest tests/test_pipeline.py -k revision_timeout_flags_chapter -v`
+Run: `pytest tests/test_pipeline_client.py -k "codex_llm_client or pipeline_client_uses_billed_model or guard_uses_billed_model or fatal_error_shows_detail or missing_price_for_codex or codex_normal_cost_guard_stop" -v && pytest tests/test_pipeline.py -k revision_timeout_flags_chapter -v`
 Expected: FAIL - `ImportError: cannot import name 'CodexLLMClient'`
 (a `test_pipeline_client_uses_billed_model_for_price_not_caller_model`
 padne jinak - `AttributeError: 'FakeCodexInner' object has no attribute`
@@ -1488,6 +1534,18 @@ class CodexTranslatorFatalError(FatalRunError):
     i při `--translator codex`, protože kritik zůstává vždy `AnthropicClient`) -
     jen TAHLE konkrétní podtřída dostane flagged status před re-raise
     (kolo 11 IMPORTANT, plan-consensus)."""
+
+
+class MissingPriceError(FatalRunError):
+    """`PipelineLLMClient._price()` nenašla sazby pro daný model v
+    `config.PRICE_*_PER_MTOK` - podtřída `FatalRunError`, existující
+    `except FatalRunError` volající kód funguje beze změny. Odlišitelná
+    od OSTATNÍCH `_guard()`-raised `FatalRunError` příčin (cost-guard
+    stop po překročení stropu, stdin nedostupné, uživatel běh zastavil,
+    `LockLostError`) - `PipelineLLMClient.complete()` přebaluje JEN TUHLE
+    na `CodexTranslatorFatalError` pro Codex-backed inner klienty (kolo
+    16 IMPORTANT, plan-consensus - viz Task 3) - normální cost-guard
+    stop NENÍ Codex-specifická chyba, i pro `--translator codex`."""
 ```
 
 V `src/llm/client.py`, HNED ZA `class AnthropicClient` (před
@@ -1736,36 +1794,56 @@ a HNED ZA `from src import state` přidej:
         effective_model = getattr(self._inner, "billed_model", None) or model
 ```
 
+V `src/llm/client.py`'s `_price()` metoda (existující, dnešní řádky
+~135-140), najdi:
+
+```python
+    def _price(self, model: str) -> tuple[float, float]:
+        if model not in self._cfg.PRICE_IN_PER_MTOK or model not in self._cfg.PRICE_OUT_PER_MTOK:
+            raise FatalRunError(
+                f"Model {model!r} nemá sazby v config.PRICE_*_PER_MTOK - "
+                "cost guard by byl slepý. Doplň sazby.")
+        return (self._cfg.PRICE_IN_PER_MTOK[model], self._cfg.PRICE_OUT_PER_MTOK[model])
+```
+
+nahraď (JEN typ výjimky na jednom řádku - kolo 16 IMPORTANT, viz níž,
+PROČ):
+
+```python
+    def _price(self, model: str) -> tuple[float, float]:
+        if model not in self._cfg.PRICE_IN_PER_MTOK or model not in self._cfg.PRICE_OUT_PER_MTOK:
+            raise MissingPriceError(
+                f"Model {model!r} nemá sazby v config.PRICE_*_PER_MTOK - "
+                "cost guard by byl slepý. Doplň sazby.")
+        return (self._cfg.PRICE_IN_PER_MTOK[model], self._cfg.PRICE_OUT_PER_MTOK[model])
+```
+
 Pak nahraď VŠECHNY tři existující výskyty holého `model` (ne `max_tokens`
 ani `self._inner.complete(model=model, ...)` - TAM zůstává PŮVODNÍ
-`model`, viz níž proč) uvnitř týhle metody `effective_model`. Najdi:
+`model`, viz níž proč) uvnitř `complete()` `effective_model`. Najdi:
 
 ```python
         self._guard(system, user, max_tokens, model)
 ```
 
-nahraď (kolo 15 IMPORTANT - viz níž, PROČ `try/except` navíc):
+nahraď (kolo 15 IMPORTANT + kolo 16 IMPORTANT - viz níž, PROČ
+`try/except MissingPriceError`, ne `except FatalRunError`):
 
 ```python
         try:
             self._guard(system, user, max_tokens, effective_model)
-        except FatalRunError as e:
-            # Kolo 15 IMPORTANT (plan-consensus) - `_guard()`'s "nemá
-            # sazby" `FatalRunError` (přes `_price()`, `src/llm/client.py:
-            # 135-140`) je OBECNÝ typ. Pro Codex-backed `self._inner`
-            # (`.provider == "codex"`) ho přebalíme na
-            # `CodexTranslatorFatalError`, ať `_cmd_run` (Task 5) tenhle
-            # pád taky označí `flagged`, místo aby kapitola zůstala v
-            # `processing` limbu - stejná třída díry jako kolo 12's
-            # `factory()` fix, jen JINÉ místo (`PipelineLLMClient` samo,
-            # ne `_client_factory`). Za NORMÁLNÍCH okolností Task 1
-            # garantuje, že `CODEX_MODEL` má cenový záznam VŽDY (stejná
-            # source-of-truth proměnná na sousedním řádku v config.py),
-            # takže tenhle `except` je obrana do hloubky, ne oprava
-            # aktivního bugu - ALE bez správného typu by JAKÁKOLI
-            # budoucí desynchronizace (config edit, refaktor) nechala
-            # kapitolu uvíznout stejně jako ostatní netypované cesty
-            # před koly 10-13.
+        except MissingPriceError as e:
+            # Kolo 16 IMPORTANT (plan-consensus) - `except FatalRunError`
+            # (kolo 15's původní verze) by chytlo VŠECHNY `_guard()`
+            # FatalRunError příčiny - i normální cost-guard stop
+            # (limit překročen, non-interactive), stdin nedostupné,
+            # uživatel běh zastavil, `LockLostError` - a přebalilo by
+            # je na `CodexTranslatorFatalError` pro Codex-backed klienta,
+            # i když s Codexem nemají NIC společného (Claude by dopadl
+            # identicky). `MissingPriceError` (nová podtřída, viz výš) je
+            # PŘESNĚ ohraničená na `_price()`'s "nemá sazby" případ -
+            # jediný, co má smysl přebalovat jako Codex-specifickou
+            # fatální chybu.
             if getattr(self._inner, "provider", None) == "codex":
                 raise CodexTranslatorFatalError(str(e)) from e
             raise
@@ -1863,12 +1941,15 @@ nezavislou na volajicim - stejny vzor jako stylist.polish(), obrana do
 hloubky proti primemu zkonstruovani/zavolani mimo _client_factory's
 gate (plan-consensus kolo 14 IMPORTANT).
 
-PipelineLLMClient.complete() preballi _guard()'s "nema sazby"
-FatalRunError na CodexTranslatorFatalError, kdyz self._inner.provider
-== "codex" - obrana do hloubky, jinak by jakakoli budouci
-desynchronizace cenove tabulky nechala kapitolu uviznout v processing
-stejne jako netypovane cesty pred koly 10-13 (plan-consensus kolo 15
-IMPORTANT).
+_price() vyhazuje novou MissingPriceError (podtrida FatalRunError)
+mesto holeho FatalRunError; PipelineLLMClient.complete() preballi JEN
+tuhle (ne kazdy _guard()-raised FatalRunError - normalni cost-guard
+stop neni Codex-specificka chyba) na CodexTranslatorFatalError, kdyz
+self._inner.provider == "codex" - obrana do hloubky, jinak by jakakoli
+budouci desynchronizace cenove tabulky nechala kapitolu uviznout v
+processing stejne jako netypovane cesty pred koly 10-13 (plan-consensus
+kolo 15 IMPORTANT, zpresneno kolo 16 IMPORTANT - siroky except
+FatalRunError by omylem preballil i normalni cost-guard stop).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
@@ -2063,6 +2144,10 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   zůstala `processing`→`pending` a DALŠÍ `run` by ji tiše znovu zařadil
   bez explicitního `--retry-flagged` (kolo 10 IMPORTANT, mechanismus
   přepracován na typovou podtřídu kolo 11 IMPORTANT, plan-consensus).
+  Re-raise po zápisu `notes` NENÍ holé `raise` (to by re-raisovalo
+  PŮVODNÍ, neredigovanou zprávu na konzoli) - konstruuje NOVOU
+  `CodexTranslatorFatalError` s REDIGOVANOU zprávou (kolo 16 IMPORTANT,
+  plan-consensus).
 
 **Kolo 3 IMPORTANT (plan-consensus) - proč eager preflight:**
 `_client_factory` (Task 4) je LÍNÁ - `_polish_preflight()` se volá AŽ
@@ -2335,6 +2420,29 @@ def test_run_translator_codex_fatal_error_flags_chapter_not_silently_retried(
     assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
     assert state.get_chapter("data/state.sqlite3", 1)["status"] == "flagged"
     assert calls["n"] == 1
+
+
+def test_run_translator_codex_fatal_error_console_output_is_redacted(
+        tmp_path, monkeypatch, capsys):
+    """Kolo 16 IMPORTANT (plan-consensus) - bare `raise` (beze změny
+    zprávy) by re-raisovalo PŮVODNÍ, NEREDIGOVANOU výjimku - `_cmd_run`'s
+    outer `except FatalRunError as e: print(f"Fatální chyba běhu: {e}")`
+    (main.py) by ji vypsal RAW na konzoli, i když `chapters.notes`
+    dostal správně redigovanou verzi. Musí se re-raisovat NOVÁ výjimka
+    s redigovanou zprávou."""
+    from src.llm.client import CodexTranslatorFatalError
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    import src.pipeline as P
+    def boom(db_path, chapter, *, client_factory, guide):
+        raise CodexTranslatorFatalError("tajny-obsah-z-codexu")
+    monkeypatch.setattr(P, "process_chapter", boom)
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
+    out = capsys.readouterr().out
+    assert "tajny-obsah-z-codexu" not in out
+    assert "potlačeny" in out
     # Druhý run BEZ --retry-flagged - queue_for_run vrací jen pending/
     # error, flagged kapitola se NEZAŘADÍ, process_chapter se nezavolá znovu.
     assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 0
@@ -2522,13 +2630,25 @@ nahraď:
                 # re-raise, tenhle zápis ho nepřepíše, jen NAHRADÍ `notes`
                 # obecnější run-úrovňovou diagnostikou (přijatý kompromis -
                 # detailní revizní nález se ztratí, `translated_text` ne).
+                #
+                # Kolo 16 IMPORTANT (plan-consensus) - bare `raise`
+                # (holé, beze změny zprávy) by re-raisoval PŮVODNÍ,
+                # NEREDIGOVANÝ `e` - `_cmd_run`'s outer `except
+                # FatalRunError as e: print(f"Fatální chyba běhu:
+                # {e}")` (main.py) by tak vypsal RAW zprávu na konzoli,
+                # i když `notes` (výš) dostal správně redigovanou verzi.
+                # Zdroje jako `factory()`'s líný preflight (Task 4,
+                # kolo 12) NEjdou přes `stylist._redact_detail()` PŘED
+                # konstrukcí výjimky - `detail` výš je JEDINÉ místo, co
+                # redakci zajišťuje. Musí se tedy re-raisovat NOVÁ
+                # výjimka s REDIGOVANOU zprávou, ne ta původní.
                 detail = stylist._redact_detail(str(e))
                 state.update_chapter(db, ch["idx"], status="flagged",
                                      notes=json.dumps(
                                          {"error": f"fatální chyba běhu: "
                                                   f"{type(e).__name__}: {detail}"},
                                          ensure_ascii=False))
-                raise                      # celý běh KONČÍ i tak
+                raise CodexTranslatorFatalError(detail) from e   # celý běh KONČÍ i tak
             except FatalRunError:
                 raise                      # BEZE ZMĚNY - kritikova chyba
                                            # (cost guard, LockLostError),
@@ -2637,6 +2757,12 @@ args.translator - obecný FatalRunError (kritikův cost guard, kritik je
 VŽDY Claude i při --translator codex) by jinak dostal stejné
 flagged/redakci určené pro Codex-translator selhání, i když s Codexem
 nemá nic společného (plan-consensus kolo 11 IMPORTANT).
+
+Re-raise po zápisu notes konstruuje NOVOU CodexTranslatorFatalError s
+REDIGOVANOU zprávou misto holeho raise původní výjimky - outer handler
+tiskne zpravu primo na konzoli, bare raise by tam vynesl neredigovany
+text (např. z factory()'s líného preflightu, co pres _redact_detail()
+neprochazi pred konstrukci) (plan-consensus kolo 16 IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
