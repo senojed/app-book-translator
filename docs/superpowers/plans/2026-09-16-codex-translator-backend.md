@@ -136,6 +136,16 @@ FS-risk varování jako `polish`).
   Bez tohohle by `--retry-flagged` kapitola, co ZNOVU selže v týhle
   fázi, ztratila staré otevřené otázky navěky (žádný nový `cz`
   neexistuje, `_checkpoint_flagged()` se tu použít nedá).
+- VŠECHNY tři checkpoint-except místa (scénová smyčka, pre-loop kritik,
+  revizní smyčka) chytají i `KeyboardInterrupt`, NE jen `Exception`/
+  `FatalRunError` (kolo 24 IMPORTANT, plan-consensus) - `KeyboardInterrupt`
+  je `BaseException`, ne `Exception` podtřída, takže by holé `except
+  Exception`/`except FatalRunError` uživatelovo Ctrl+C přerušení BĚHEM
+  Codex/kritik volání přeskočilo úplně a checkpoint by se vůbec
+  nespustil - stejná ztráta dat jako bez opravy vůbec, jen jiný trigger.
+  Checkpoint vždy jen ULOŽÍ poslední platný stav a re-raisne - `run`
+  se pořád ZASTAVÍ (main.py žádnou z těchhle výjimek nezachytí), jen
+  DB stav odpovídá poslednímu bezpečně dokončenému kroku.
 - `--translator codex` se ověřuje (`STYLIST_ACCEPT_FS_RISK`/`CODEX_MODEL`/
   CLI) HNED na začátku `_cmd_run`, ne líně až při prvním volání (kolo 3
   IMPORTANT, plan-consensus - viz Task 5) - prázdná/vyfiltrovaná fronta
@@ -827,6 +837,53 @@ def test_scene_loop_fatal_error_restores_existing_open_question(tmp_path, monkey
     assert any(q["scope_key"] == "cand_x" for q in open_qs)
 
 
+def test_scene_loop_keyboard_interrupt_restores_existing_open_question(
+        tmp_path, monkeypatch):
+    """Kolo 24 IMPORTANT (plan-consensus) - `KeyboardInterrupt` (Ctrl+C)
+    NENÍ `Exception` podtřída (je `BaseException`) - holé `except
+    Exception` kolem scénové smyčky (kolo 23) by ho přeskočilo úplně,
+    staré otázky by zůstaly ztracené stejně jako bez opravy vůbec.
+    Uživatelovo přerušení BĚHEM Codex volání je reálný, běžný scénář
+    (dlouho běžící `run`, uživatel chce zastavit)."""
+    db = _db(tmp_path)
+    state.upsert_open_question(db, {
+        "chapter_idx": 1, "kind": "term", "scope_key": "cand_x",
+        "text": "Nový termín 'X' přeložen jako 'Y'. Sedí to?",
+        "guess_answer": "Y", "severity": "guess"})
+    def boom(*a, **k): raise KeyboardInterrupt()
+    monkeypatch.setattr(T, "translate_scene", boom)
+    ch = state.get_chapter(db, 1)
+    with __import__("pytest").raises(KeyboardInterrupt):
+        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    open_qs = state.unanswered_questions(db)
+    assert any(q["scope_key"] == "cand_x" for q in open_qs)
+
+
+def test_revision_keyboard_interrupt_preserves_translation(tmp_path, monkeypatch):
+    """Kolo 24 IMPORTANT (plan-consensus) - stejná mezera jako výš, jen
+    v revizní smyčce (kolo 13/18/20/21/22's `_checkpoint_flagged()`
+    volání): holé `except FatalRunError` by `KeyboardInterrupt` BĚHEM
+    `revise_chapter()` přeskočilo, `cz` (scénový překlad) by propadl
+    stejně, jako kdyby žádný z předchozích kol fix nikdy nebyl."""
+    db = _db(tmp_path)
+    monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
+        "scénový překlad", [], [], []))
+    always_bad = [{"source": "critic", "type": "fidelity", "severity": "critical",
+                   "action": "revise", "term_id": None, "expected": None,
+                   "actual": None, "cz_excerpt": "x", "issue": "chyba", "suggestion": "y"}]
+    monkeypatch.setattr(C, "review", lambda *a, **k: always_bad)
+    def boom(*a, **k): raise KeyboardInterrupt()
+    monkeypatch.setattr(T, "revise_chapter", boom)
+    ch = state.get_chapter(db, 1)
+    with __import__("pytest").raises(KeyboardInterrupt):
+        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    row = state.get_chapter(db, 1)
+    assert row["status"] == "flagged"
+    assert row["translated_text"] == "scénový překlad"
+
+
 def test_pre_loop_critic_fatal_error_preserves_scene_translation(tmp_path, monkeypatch):
     """Kolo 22 IMPORTANT (plan-consensus) - PRVNÍ `_run_critic()` volání
     (PŘED revizní smyčkou) nebylo chráněné VŮBEC - kola 13/18/20/21's
@@ -1193,7 +1250,11 @@ nahraď:
                 rendered.append({"term_id": rt.get("term_id"),
                                  "cz_as_used": rt.get("cz_as_used"),
                                  "scene_idx": scene_idx})
-    except Exception:
+    except (Exception, KeyboardInterrupt):
+        # Kolo 24 IMPORTANT (plan-consensus) - `KeyboardInterrupt`
+        # (Ctrl+C) NENÍ `Exception` podtřída - holé `except Exception`
+        # by přerušení BĚHEM `translate_scene()` přeskočilo, staré
+        # otázky by zůstaly ztracené stejně jako bez týhle opravy vůbec.
         for q in existing_questions:
             state.upsert_open_question(db_path, q)
         raise
@@ -1281,10 +1342,15 @@ nahraď:
 
     try:
         critic_findings, critic_failed = _run_critic(en, cz, client_factory("critic"))
-    except FatalRunError as e:
+    except (FatalRunError, KeyboardInterrupt) as e:
         # Kolo 22 IMPORTANT (plan-consensus) - viz vysvětlení výš -
         # PRVNÍ `_run_critic()` volání (PŘED revizní smyčkou) nebylo
         # chráněné vůbec.
+        # Kolo 24 IMPORTANT (plan-consensus) - `KeyboardInterrupt` (Ctrl+C)
+        # NENÍ `Exception` podtřída (je `BaseException`), takže by holé
+        # `except FatalRunError` přeskočilo úplně - uživatelovo přerušení
+        # BĚHEM čekání na kritika by zahodilo `cz` stejně jako kritikův
+        # `FatalRunError`, jen skrz jiný trigger.
         _checkpoint_flagged(cz, findings, questions, 0, type(e).__name__)
         raise
     findings += critic_findings
@@ -1372,7 +1438,7 @@ nahraď:
             # samotné revize.
             critic_findings, critic_failed = _run_critic(en, cz, client_factory("critic"))
             findings += critic_findings
-        except FatalRunError as e:
+        except (FatalRunError, KeyboardInterrupt) as e:
             # Kolo 13 IMPORTANT (plan-consensus) - BEZ týhle opravy `cz`
             # (scénový překlad, případně částečně revidovaný) propadne
             # s výjimkou, NIKDY se neuloží - `_cmd_run`'s `flagged`
@@ -1384,6 +1450,15 @@ nahraď:
             # logika (mentions rebuild z kola 18, otázky z kola 20+22)
             # teď žije v `_checkpoint_flagged()` (definovaná výš, sdílená
             # s pre-loop kritikem) - zabraňuje TŘETÍ kopii stejného kódu.
+            #
+            # Kolo 24 IMPORTANT (plan-consensus) - `KeyboardInterrupt`
+            # (Ctrl+C) NENÍ `Exception` podtřída - holé `except
+            # FatalRunError` by ho přeskočilo, uživatelovo přerušení
+            # BĚHEM `revise_chapter()`/kritika by zahodilo `cz` stejně
+            # jako `FatalRunError`. Re-raise dál propaguje ven z `run`u
+            # (main.py žádnou z těchhle výjimek nezachytí - správné,
+            # Ctrl+C má CELÝ proces zastavit, checkpoint jen zajistí, že
+            # se PŘED tím uloží poslední platný stav).
             _checkpoint_flagged(cz, findings, questions, rounds, type(e).__name__)
             raise
         except Exception as e:
@@ -3232,12 +3307,16 @@ nahraď:
                                            # Claude-side, mimo rozsah plánu
             except translator.InvalidTranslationOutput as e:
                 # Kolo 6 IMPORTANT (plan-consensus) - `translate_scene()`'s
-                # scénová smyčka (pipeline.py) NENÍ obalená (na rozdíl od
-                # revizní smyčky, viz Task 2) - formát-drift (Codex přestal
+                # scénová smyčka (pipeline.py) NEMÁ vlastní `cz`/status
+                # checkpoint jako revizní smyčka (Task 2) - žádný `cz`
+                # tam ještě neexistuje, takže formát-drift (Codex přestal
                 # dodržovat ===KONEC=== kontrakt) by jinak skončil jako
                 # obyčejný per-kapitolový `error`, a `state.queue_for_run`
                 # (kolo 2 BLOCKING) by ho tiše zkoušel znovu PŘI KAŽDÉM
                 # příštím `run`u, na VŠECH takhle postižených kapitolách.
+                # (Kolo 23's `try/except` kolem scénové smyčky řeší JEN
+                # obnovu starých otevřených otázek, ne tenhle status
+                # problém - jiná vrstva ochrany, viz Task 2.)
                 # Gated JEN na `codex` - Claude formát-drift riziko je out
                 # of scope (spike ho nepozoroval), Claude cesta spadne do
                 # existující generické větve níž, beze změny.

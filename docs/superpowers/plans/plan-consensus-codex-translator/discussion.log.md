@@ -324,3 +324,17 @@ scenove smycky, obnovuje stare otazky pres existujici state.
 upsert_open_question() (zadny zasah do state.py). Posledni nechranena
 faze funkce - checkpoint/otazky oblast ted pokryta v cele process_
 chapter().
+
+## Round 24
+
+- Codex: [round-24-codex.md](round-24-codex.md) — CHANGES_NEEDED
+- Claude: [round-24-claude.md](round-24-claude.md) — CHANGES_NEEDED
+
+Opraveno: IMPORTANT - KeyboardInterrupt je BaseException, ne Exception
+podtrida, takze by Ctrl+C behem Codex/kritik volani obesel VSECHNY tri
+checkpoint-except mista (scenova smycka kolo 23, pre-loop kritik kolo
+22, revizni smycka kolo 13/18/20/21/22) - stejna ztrata cz/otazek jako
+bez tech fixu vubec. Opraveno rozsirenim except klauzuli na (Exception,
+KeyboardInterrupt)/(FatalRunError, KeyboardInterrupt) ve vsech trech
+mistech, dva regresni testy. NIT: zastaraly komentar v Task 5 po
+kolo-23's fixu prepsan.
