@@ -338,3 +338,16 @@ bez tech fixu vubec. Opraveno rozsirenim except klauzuli na (Exception,
 KeyboardInterrupt)/(FatalRunError, KeyboardInterrupt) ve vsech trech
 mistech, dva regresni testy. NIT: zastaraly komentar v Task 5 po
 kolo-23's fixu prepsan.
+
+## Round 25
+
+- Codex: [round-25-codex.md](round-25-codex.md) — CHANGES_NEEDED
+- Claude: [round-25-claude.md](round-25-claude.md) — CHANGES_NEEDED
+
+Opraveno: dva IMPORTANT body. Checkpoint rozsiren na CELOU "kontrola"
+fazi (_verified_rendered/glossary.all_terms/concordance.check_chapter,
+ne jen _run_critic) a na "pripravu transakce B" (posledni nechranene
+misto v cele funkci) - _checkpoint_flagged() ted taky robustni vuci
+glossary_rows nebound scenari (fetchuje si ho znovu sam). Doplnen
+chybejici KeyboardInterrupt test pro pre-loop kritika z kola 24. Pokryti
+ted zahrnuje VSECHNA mista v process_chapter() po begin_chapter().

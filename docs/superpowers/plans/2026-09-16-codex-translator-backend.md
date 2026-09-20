@@ -884,6 +884,80 @@ def test_revision_keyboard_interrupt_preserves_translation(tmp_path, monkeypatch
     assert row["translated_text"] == "scénový překlad"
 
 
+def test_pre_loop_critic_keyboard_interrupt_preserves_scene_translation(
+        tmp_path, monkeypatch):
+    """Kolo 25 IMPORTANT (plan-consensus) - Codex si všiml, že kolo 24
+    přidalo `KeyboardInterrupt` do `except` klauzule PRE-LOOP kritika
+    (kolo 22), ale chyběl pro ni odpovídající regresní test (na rozdíl
+    od scénové smyčky a revizní smyčky, co testy dostaly). Stejný
+    scénář jako `test_pre_loop_critic_fatal_error_preserves_scene_
+    translation`, jen `KeyboardInterrupt` místo `FatalRunError`."""
+    db = _db(tmp_path)
+    monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
+        "scénový překlad", [], [], []))
+    def boom(*a, **k): raise KeyboardInterrupt()
+    monkeypatch.setattr(C, "review", boom)
+    ch = state.get_chapter(db, 1)
+    with __import__("pytest").raises(KeyboardInterrupt):
+        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    row = state.get_chapter(db, 1)
+    assert row["status"] == "flagged"
+    assert row["translated_text"] == "scénový překlad"
+
+
+def test_kontrola_phase_fatal_error_preserves_scene_translation(tmp_path, monkeypatch):
+    """Kolo 25 IMPORTANT (plan-consensus) - `_verified_rendered()`/
+    `glossary.all_terms()`/`concordance.check_chapter()` (MEZI scénovou
+    smyčkou a `_run_critic()` voláním) neměly ŽÁDNÝ checkpoint - jen
+    `_run_critic()` samotné bylo chráněné (kolo 22). Selhání PŘÍMO
+    tady (deterministický kód, ale pořád může selhat - DB čtení
+    glosáře, neočekávaný tvar dat) by zahodilo hotový scénový překlad
+    stejně jako mezery, co kola 20-24 zavřely jinde."""
+    db = _db(tmp_path)
+    from src import concordance
+    monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
+        "scénový překlad", [], [], []))
+    def boom(*a, **k): raise ValueError("rozbita konkordance")
+    monkeypatch.setattr(concordance, "check_chapter", boom)
+    ch = state.get_chapter(db, 1)
+    with __import__("pytest").raises(ValueError):
+        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    row = state.get_chapter(db, 1)
+    assert row["status"] == "flagged"
+    assert row["translated_text"] == "scénový překlad"
+
+
+def test_transakce_b_prep_fatal_error_preserves_final_translation(tmp_path, monkeypatch):
+    """Kolo 25 IMPORTANT (plan-consensus) - "příprava transakce B" (nové
+    termíny do glosáře, `concordance.build_mentions()`, finální
+    `commit_chapter_result()`) běží AŽ PO revizní smyčce, ale nemá
+    ŽÁDNÝ checkpoint - poslední nechráněné místo v celé funkci. `cz` je
+    v tuhle chvíli FINÁLNÍ (nejlepší dostupný překlad), selhání tady by
+    ho zahodilo úplně stejně, jako kdyby k žádnému z předchozích kol
+    fixů nikdy nedošlo."""
+    db = _db(tmp_path)
+    from src import concordance
+    monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
+        "finální překlad", [], [], []))
+    real_build_mentions = concordance.build_mentions
+    calls = {"n": 0}
+    def boom(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:        # 1. volání = transakce B prep (má selhat)
+            raise ValueError("rozbita konkordance pri mentions")
+        return real_build_mentions(*a, **k)   # 2. volání = uvnitř checkpointu
+    monkeypatch.setattr(concordance, "build_mentions", boom)
+    ch = state.get_chapter(db, 1)
+    with __import__("pytest").raises(ValueError):
+        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    row = state.get_chapter(db, 1)
+    assert row["status"] == "flagged"
+    assert row["translated_text"] == "finální překlad"
+
+
 def test_pre_loop_critic_fatal_error_preserves_scene_translation(tmp_path, monkeypatch):
     """Kolo 22 IMPORTANT (plan-consensus) - PRVNÍ `_run_critic()` volání
     (PŘED revizní smyčkou) nebylo chráněné VŮBEC - kola 13/18/20/21's
@@ -1225,18 +1299,24 @@ V `src/pipeline.py`, `process_chapter`'s scénová smyčka - najdi:
 nahraď:
 
 ```python
-    guide_block = _guide_block(guide)
-    glossary_block = _glossary_block(db_path)
-
-    # --- překlad po scénách ---
-    scenes = ingest.split_into_scenes(en, config.CHAPTER_SPLIT_WORD_THRESHOLD)
-    parts, rendered, questions = [], [], []
-    new_terms: dict = {}
     # Kolo 23 IMPORTANT (plan-consensus) - viz vysvětlení výš - scénová
     # smyčka je jediná fáze bez checkpointu; obnov staré otázky PŘED
     # re-raise, ať `--retry-flagged` kapitola, co tu ZNOVU selže, o ně
     # nenávratně nepřijde.
+    # Kolo 25 IMPORTANT (plan-consensus) - `try` rozšířen tak, aby
+    # zahrnul i `_guide_block(guide)`/`_glossary_block(db_path)`/
+    # `ingest.split_into_scenes()` - ty běží PŘED scénovou smyčkou
+    # samotnou, ale POŘÁD PO `begin_chapter()` (co `existing_questions`
+    # už smazal) - selhání PŘÍMO tady (rozbitý `guide`/DB glosář čtení)
+    # by jinak checkpoint úplně obešlo.
     try:
+        guide_block = _guide_block(guide)
+        glossary_block = _glossary_block(db_path)
+
+        # --- překlad po scénách ---
+        scenes = ingest.split_into_scenes(en, config.CHAPTER_SPLIT_WORD_THRESHOLD)
+        parts, rendered, questions = [], [], []
+        new_terms: dict = {}
         for scene_idx, scene in enumerate(scenes):
             res = translator.translate_scene(scene, guide_block, glossary_block,
                                              client_factory("translator"))
@@ -1302,11 +1382,7 @@ nahraď:
 
 ```python
     cz = "\n\n".join(p for p in parts if p)
-    rendered = _verified_rendered(rendered, cz)
-
-    # --- kontrola: deterministicky + nezávislý kritik ---
-    glossary_rows = glossary.all_terms(db_path)
-    findings = concordance.check_chapter(en, cz, glossary_rows, rendered)
+    findings = []
 
     def _checkpoint_flagged(cz_now, findings_now, questions_now, rounds_now, error):
         """Kolo 22 IMPORTANT (plan-consensus) - sdílená pomocná funkce
@@ -1317,7 +1393,18 @@ nahraď:
         dohnat později), otázky jsou SLOUČENÍ `existing_questions`
         (snapshot z ÚVODU funkce, PŘED `begin_chapter()`) A
         `questions_now` (nejistoty z AKTUÁLNÍHO, právě zachráněného
-        výsledku - kolo 22 IMPORTANT, ne jen stará data)."""
+        výsledku - kolo 22 IMPORTANT, ne jen stará data).
+
+        Kolo 25 IMPORTANT (plan-consensus) - `glossary_rows` se FETCHUJE
+        ZNOVU tady uvnitř, NE z vnějšího scope - checkpoint teď může
+        běžet i PŘED tím, než se venkovní `glossary_rows` stihne vůbec
+        nastavit (pokud selže PŘÍMO `glossary.all_terms()` níž, viz
+        rozšířený `try` kolem "kontrola" fáze) - closure capture by
+        jinak skončila na `NameError` MÍSTO uloženi flagged stavu.
+        `rendered` se naopak BEZPEČNĚ čerpá z vnějšího scope - vždy má
+        ASPOŇ scénové (neverifikované) hodnoty, i když `_verified_
+        rendered()` samo selže (LHS přiřazení v tom případě neproběhne,
+        `rendered` si drží svou PŘEDCHOZÍ platnou hodnotu)."""
         pseudo = {"source": "pipeline", "type": "fluency", "severity": "critical",
                  "action": "note", "term_id": None, "expected": None,
                  "actual": None, "cz_excerpt": None,
@@ -1325,7 +1412,11 @@ nahraď:
                           "poslední platný překlad zachován",
                  "suggestion": None}
         saved_findings = findings_mod.assign_ids(findings_now + [pseudo])
-        rebuilt_mentions = concordance.build_mentions(en, cz_now, glossary_rows, rendered)
+        try:
+            gl_rows = glossary.all_terms(db_path)
+        except Exception:
+            gl_rows = []
+        rebuilt_mentions = concordance.build_mentions(en, cz_now, gl_rows, rendered)
         rebuilt_mentions = [{"term_id": m.term_id, "cz_form": m.cz_form,
                              "scene_idx": m.scene_idx, "source": m.source}
                             for m in rebuilt_mentions]
@@ -1340,9 +1431,25 @@ nahraď:
             status="flagged", new_candidates=[], mentions=rebuilt_mentions,
             questions=existing_questions + fresh_db_questions)
 
+    # Kolo 25 IMPORTANT (plan-consensus) - `try` rozšířen na CELOU
+    # "kontrola" fázi (`_verified_rendered()`/`glossary.all_terms()`/
+    # `concordance.check_chapter()`), NE JEN `_run_critic()` volání -
+    # tyhle tři jsou sice deterministické (žádné LLM volání), ale POŘÁD
+    # mohou selhat (rozbitý `rendered` tvar, DB čtení glosáře) a BEZ
+    # rozšíření by `cz` (už hotový, zaplacený scénový překlad) propadlo
+    # BEZ checkpointu úplně stejně jako mezery, co kola 20-24 zavřely
+    # jinde. `findings = []` PŘED try (výš) zaručuje, že `_checkpoint_
+    # flagged()`'s `findings_now` parametr je VŽDY bezpečně bound, i
+    # když selže `concordance.check_chapter()` samo (první přiřazení
+    # `findings`).
     try:
+        rendered = _verified_rendered(rendered, cz)
+
+        # --- kontrola: deterministicky + nezávislý kritik ---
+        glossary_rows = glossary.all_terms(db_path)
+        findings = concordance.check_chapter(en, cz, glossary_rows, rendered)
         critic_findings, critic_failed = _run_critic(en, cz, client_factory("critic"))
-    except (FatalRunError, KeyboardInterrupt) as e:
+    except (Exception, KeyboardInterrupt) as e:
         # Kolo 22 IMPORTANT (plan-consensus) - viz vysvětlení výš -
         # PRVNÍ `_run_critic()` volání (PŘED revizní smyčkou) nebylo
         # chráněné vůbec.
@@ -1351,6 +1458,15 @@ nahraď:
         # `except FatalRunError` přeskočilo úplně - uživatelovo přerušení
         # BĚHEM čekání na kritika by zahodilo `cz` stejně jako kritikův
         # `FatalRunError`, jen skrz jiný trigger.
+        # Kolo 25 IMPORTANT (plan-consensus) - širší `except (Exception,
+        # KeyboardInterrupt)` MÍSTO úzkého `except FatalRunError` -
+        # `_verified_rendered()`/`glossary.all_terms()`/`concordance.
+        # check_chapter()` NEjsou LLM volání s vlastní FatalRunError
+        # klasifikací jako `_run_critic()` - jejich chyba je obyčejný
+        # `Exception` (např. `sqlite3.OperationalError`). Mirror scénové
+        # smyčky (kolo 23/24) - checkpoint VŽDY, bez ohledu na typ, pak
+        # re-raise (main.py dál rozhoduje o finálním statusu/pokračování
+        # podle TOHO, co propadne, stejně jako dřív).
         _checkpoint_flagged(cz, findings, questions, 0, type(e).__name__)
         raise
     findings += critic_findings
@@ -1502,6 +1618,183 @@ nahraď:
 ```python
     elif critic_failed or revision_failed or has_revise_triggers(findings):
         status = "flagged"
+```
+
+**Kolo 25 IMPORTANT (plan-consensus) - poslední nechráněné místo:
+"příprava transakce B" + samotný `state.commit_chapter_result()` volání:**
+Tahle fáze (kandidáti glosáře z `new_terms`, `concordance.build_mentions()`,
+sestavení `db_questions`, finální commit) běží AŽ PO revizní smyčce -
+`cz` je v tuhle chvíli FINÁLNÍ (nejlepší dostupný překlad), ale
+NIC ho tu nechrání. Selhání PŘÍMO tady (např. `glossary.resolve_surface()`
+DB chyba, `concordance.build_mentions()` na neočekávaném tvaru dat)
+propaguje z `process_chapter()` BEZ checkpointu - identická třída
+chyby jako kola 20/22/23/25's dřívější nálezy, jen POSLEDNÍ zbývající
+místo v celé funkci.
+
+**Oprava:** Obal celou fázi (od `new_candidates, extra_mentions = [],
+[]` po `result = state.commit_chapter_result(...)`) v `try/except
+(Exception, KeyboardInterrupt)`, co zavolá `_checkpoint_flagged(cz,
+findings, questions, rounds, type(e).__name__)` a re-raisne. `return`
+zůstává MIMO try - dosáhne se ho jen po ÚSPĚŠNÉM `commit_chapter_
+result()` volání.
+
+V `src/pipeline.py`, `process_chapter`'s příprava transakce B - najdi:
+
+```python
+    # --- příprava transakce B ---
+    new_candidates, extra_mentions = [], []
+    db_questions = []
+    for nt in new_terms.values():
+        term_en = (nt.get("term_en") or "").strip()
+        if not term_en:
+            continue
+        cz_form = nt.get("cz") or ""
+        # termín se mohl přes revize z finálního překladu vytratit
+        mention_form = cz_form if (cz_form and concordance.contains_form(cz, cz_form)) else None
+        mention_source = "rendered" if mention_form else "omission"
+        existing = glossary.resolve_surface(db_path, term_en)
+        if existing:
+            extra_mentions.append({"term_id": existing, "cz_form": mention_form,
+                                   "scene_idx": None, "source": mention_source})
+            continue
+        cand = {"term_id": "cand_" + glossary.slugify(term_en),
+                "canonical_en": term_en, "aliases": [], "cz": cz_form,
+                "accepted_alt": [], "note": nt.get("note", ""),
+                "type": nt.get("type", "term"), "status": "candidate"}
+        new_candidates.append(cand)
+        extra_mentions.append({"term_id": cand["term_id"], "cz_form": mention_form,
+                               "scene_idx": None, "source": mention_source})
+        db_questions.append({
+            "chapter_idx": idx, "kind": "term", "scope_key": cand["term_id"],
+            "text": f"Nový termín '{term_en}' přeložen jako '{cz_form}'. Sedí to?",
+            "guess_answer": cz_form, "severity": "guess"})
+
+    glossary_rows_all = glossary_rows + new_candidates
+    mentions = concordance.build_mentions(en, cz, glossary_rows_all, rendered)
+    mentions = [{"term_id": m.term_id, "cz_form": m.cz_form,
+                 "scene_idx": m.scene_idx, "source": m.source} for m in mentions]
+    mentions += extra_mentions
+
+    for q in questions:
+        db_questions.append({
+            "chapter_idx": idx, "kind": q.get("kind") or "other",
+            "scope_key": _scope_key_for(q), "text": q.get("text") or "",
+            "guess_answer": q.get("guess_answer"),
+            "severity": q.get("severity") or "guess"})
+    for f in findings:
+        if f.get("action") != "question":
+            continue
+        db_questions.append({
+            "chapter_idx": idx, "kind": "term", "scope_key": f.get("term_id") or "",
+            "text": f.get("issue") or "", "guess_answer": f.get("actual"),
+            "severity": "guess"})
+    for q in db_questions:
+        q["scope_key"] = _scope_key_for(q)
+
+    has_blocking = any(q["severity"] == "blocking" for q in db_questions)
+    if has_blocking:
+        status = "needs_human"
+    elif critic_failed or revision_failed or has_revise_triggers(findings):
+        status = "flagged"
+    else:
+        status = "done"
+
+    from src import findings as findings_mod
+    findings = findings_mod.assign_ids(findings)
+
+    result = state.commit_chapter_result(
+        db_path, idx, translated_text=cz, revision_rounds=rounds,
+        notes_json=json.dumps(findings, ensure_ascii=False), status=status,
+        new_candidates=new_candidates, mentions=mentions, questions=db_questions)
+
+    return {"idx": idx, "status": status, "revision_rounds": rounds,
+            "new_terms": len(new_candidates),
+            "questions_created": result["questions_created"],
+            "findings": findings}
+```
+
+nahraď:
+
+```python
+    try:
+        # --- příprava transakce B ---
+        new_candidates, extra_mentions = [], []
+        db_questions = []
+        for nt in new_terms.values():
+            term_en = (nt.get("term_en") or "").strip()
+            if not term_en:
+                continue
+            cz_form = nt.get("cz") or ""
+            # termín se mohl přes revize z finálního překladu vytratit
+            mention_form = cz_form if (cz_form and concordance.contains_form(cz, cz_form)) else None
+            mention_source = "rendered" if mention_form else "omission"
+            existing = glossary.resolve_surface(db_path, term_en)
+            if existing:
+                extra_mentions.append({"term_id": existing, "cz_form": mention_form,
+                                       "scene_idx": None, "source": mention_source})
+                continue
+            cand = {"term_id": "cand_" + glossary.slugify(term_en),
+                    "canonical_en": term_en, "aliases": [], "cz": cz_form,
+                    "accepted_alt": [], "note": nt.get("note", ""),
+                    "type": nt.get("type", "term"), "status": "candidate"}
+            new_candidates.append(cand)
+            extra_mentions.append({"term_id": cand["term_id"], "cz_form": mention_form,
+                                   "scene_idx": None, "source": mention_source})
+            db_questions.append({
+                "chapter_idx": idx, "kind": "term", "scope_key": cand["term_id"],
+                "text": f"Nový termín '{term_en}' přeložen jako '{cz_form}'. Sedí to?",
+                "guess_answer": cz_form, "severity": "guess"})
+
+        glossary_rows_all = glossary_rows + new_candidates
+        mentions = concordance.build_mentions(en, cz, glossary_rows_all, rendered)
+        mentions = [{"term_id": m.term_id, "cz_form": m.cz_form,
+                     "scene_idx": m.scene_idx, "source": m.source} for m in mentions]
+        mentions += extra_mentions
+
+        for q in questions:
+            db_questions.append({
+                "chapter_idx": idx, "kind": q.get("kind") or "other",
+                "scope_key": _scope_key_for(q), "text": q.get("text") or "",
+                "guess_answer": q.get("guess_answer"),
+                "severity": q.get("severity") or "guess"})
+        for f in findings:
+            if f.get("action") != "question":
+                continue
+            db_questions.append({
+                "chapter_idx": idx, "kind": "term", "scope_key": f.get("term_id") or "",
+                "text": f.get("issue") or "", "guess_answer": f.get("actual"),
+                "severity": "guess"})
+        for q in db_questions:
+            q["scope_key"] = _scope_key_for(q)
+
+        has_blocking = any(q["severity"] == "blocking" for q in db_questions)
+        if has_blocking:
+            status = "needs_human"
+        elif critic_failed or revision_failed or has_revise_triggers(findings):
+            status = "flagged"
+        else:
+            status = "done"
+
+        from src import findings as findings_mod
+        findings = findings_mod.assign_ids(findings)
+
+        result = state.commit_chapter_result(
+            db_path, idx, translated_text=cz, revision_rounds=rounds,
+            notes_json=json.dumps(findings, ensure_ascii=False), status=status,
+            new_candidates=new_candidates, mentions=mentions, questions=db_questions)
+    except (Exception, KeyboardInterrupt) as e:
+        # Kolo 25 IMPORTANT (plan-consensus) - viz vysvětlení výš -
+        # poslední nechráněné místo v `process_chapter()`. `cz` je tu
+        # už FINÁLNÍ (po revizní smyčce) - bez checkpointu by selhání
+        # PŘÍMO v přípravě transakce B (DB čtení glosáře, konkordanční
+        # výpočet) zahodilo i tenhle, už hotový výsledek.
+        _checkpoint_flagged(cz, findings, questions, rounds, type(e).__name__)
+        raise
+
+    return {"idx": idx, "status": status, "revision_rounds": rounds,
+            "new_terms": len(new_candidates),
+            "questions_created": result["questions_created"],
+            "findings": findings}
 ```
 
 - [ ] **Step 4: Ověř úspěch**
