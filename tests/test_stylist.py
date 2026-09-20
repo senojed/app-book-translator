@@ -178,7 +178,7 @@ def test_polish_raises_on_missing_output_file(tmp_path):
 def test_polish_raises_on_timeout(tmp_path):
     fake = tmp_path / "slow.py"
     fake.write_text("import time; time.sleep(5)")
-    with pytest.raises(stylist.StylistError, match="timeout"):
+    with pytest.raises(stylist.StylistTimeoutError, match="timeout"):
         stylist.polish("EN", "CZ", codex_cmd=[sys.executable, str(fake)], timeout=1)
 
 

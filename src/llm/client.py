@@ -23,6 +23,29 @@ class LockLostError(FatalRunError):
     kontrola pro STEJNOU podmínku."""
 
 
+class CodexTranslatorFatalError(FatalRunError):
+    """Fatální chyba VZNIKLÁ PŘÍMO v Codex-translator volání
+    (`CodexLLMClient.complete()`) - podtřída `FatalRunError`, ať VŠECHNO,
+    co dnes odchytává `except FatalRunError` funguje beze změny. `main.
+    _cmd_run` (Task 5) ji rozlišuje SAMOSTATNĚ od obecného `FatalRunError`
+    (kritikův cost guard, `LockLostError`, atd. - ty jsou VŽDY Claude-side,
+    i při `--translator codex`, protože kritik zůstává vždy `AnthropicClient`) -
+    jen TAHLE konkrétní podtřída dostane flagged status před re-raise
+    (kolo 11 IMPORTANT, plan-consensus)."""
+
+
+class MissingPriceError(FatalRunError):
+    """`PipelineLLMClient._price()` nenašla sazby pro daný model v
+    `config.PRICE_*_PER_MTOK` - podtřída `FatalRunError`, existující
+    `except FatalRunError` volající kód funguje beze změny. Odlišitelná
+    od OSTATNÍCH `_guard()`-raised `FatalRunError` příčin (cost-guard
+    stop po překročení stropu, stdin nedostupné, uživatel běh zastavil,
+    `LockLostError`) - `PipelineLLMClient.complete()` přebaluje JEN TUHLE
+    na `CodexTranslatorFatalError` pro Codex-backed inner klienty (kolo
+    16 IMPORTANT, plan-consensus - viz Task 3) - normální cost-guard
+    stop NENÍ Codex-specifická chyba, i pro `--translator codex`."""
+
+
 @dataclass
 class Completion:
     text: str
@@ -89,6 +112,168 @@ class AnthropicClient:
         return r.input_tokens
 
 
+class CodexLLMClient:
+    """`LLMClient` obal nad `codex exec` subprocess voláním (`stylist.
+    _exec_codex`) - stejný protokol jako `AnthropicClient`, takže
+    `PipelineLLMClient` ho obalí beze změny (stejný audit/cost-guard
+    kód, jen s cenou $0/token - viz `billed_model`/`config.PRICE_IN_
+    PER_MTOK[CODEX_MODEL]`). Používá se pro `agent="translator"` při
+    `--translator codex` (main.py `_client_factory`) - kritik zůstává
+    VŽDY na `AnthropicClient` (spike 2026-09-16 ukázal nespolehlivost
+    Codex jako kritika, viz spec)."""
+    provider = "codex"
+
+    def __init__(self, codex_cmd: list[str], codex_model: str,
+                 timeout: int | None = None):
+        self._codex_cmd = codex_cmd
+        self._codex_model = codex_model
+        self._timeout = timeout
+        # Kolo 1 BLOCKING (plan-consensus) - `pipeline.process_chapter`
+        # volá `translator.translate_scene`/`revise_chapter` BEZ
+        # `model=` argumentu, takže `translator.py` VŽDY defaultuje na
+        # `config.MODEL_TRANSLATOR` ("claude-sonnet-5"), bez ohledu na
+        # to, jaký klient je skutečně pod kapotou. `PipelineLLMClient`
+        # (viz jeho oprava níž) čte TENHLE atribut MÍSTO toho
+        # caller-supplied `model` pro cenu/audit - jinak by Codex
+        # volání dostala cenu Claude modelu a audit log by lhal o tom,
+        # co skutečně běželo.
+        self.billed_model = codex_model
+
+    def complete(self, *, system: str, user: str, max_tokens: int, model: str) -> Completion:
+        # Lokální import (ne na úrovni modulu) - `client.py` je
+        # nízkoúrovňová provider vrstva, `src.agents.stylist` je
+        # agent-vrstva o patro výš (config/subprocess specifika pro
+        # Codex CLI). Import na úrovni modulu by obrátil směr závislosti,
+        # co zbytek souboru dodržuje (stejný vzor jako `PipelineLLMClient.
+        # complete()`'s `from src import state`).
+        import config
+        from src.agents import stylist
+        # Kolo 14 IMPORTANT (plan-consensus) - `stylist.polish()` má
+        # TENHLE check UVNITŘ SEBE (`src/agents/stylist.py:505-511`),
+        # nezávisle na volajícím - `CodexLLMClient` by bez týhle kontroly
+        # šlo zkonstruovat a zavolat PŘÍMO (test, budoucí kód), obejít
+        # `_client_factory`'s `_polish_preflight()` gate ÚPLNĚ, a spustit
+        # Codex exec (FS-risk agent) bez opt-inu. Obrana do hloubky -
+        # `_client_factory` (Task 4) tohle za normálních okolností už
+        # nikdy nepustí sem s `False`, ale kontrakt musí platit i pro
+        # PŘÍMOU konstrukci `CodexLLMClient`, ne jen přes tenhle jeden
+        # vstupní bod.
+        if config.STYLIST_ACCEPT_FS_RISK is not True:
+            raise CodexTranslatorFatalError(
+                "CodexLLMClient.complete() vyžaduje "
+                "config.STYLIST_ACCEPT_FS_RISK = True (stejné riziko "
+                "jako stylist.polish(), viz config.py).")
+        prompt = f"{system}\n\n{user}"
+        timeout = self._timeout or config.CODEX_TRANSLATE_TIMEOUT_SECONDS
+        # Kolo 2 BLOCKING (plan-consensus) - `_exec_codex`'s `StylistError`
+        # (rozbitý CLI, vypršelá autentizace, špatný exit kód, prázdná/
+        # rozbitá odpověď - VŠECHNO KROMĚ timeoutu, ten je výjimka, viz
+        # `StylistTimeoutError` níž, kolo 9 IMPORTANT) se přebaluje na
+        # `FatalRunError`, ne necháváme propadnout jako obyčejnou
+        # výjimku. `state.queue_for_
+        # run()` (main.py `_cmd_run`'s fronta) automaticky ZNOVU zkouší
+        # `error` kapitoly PŘI KAŽDÉM příštím `run`u (na rozdíl od
+        # `flagged`/`needs_human`, co čekají na člověka) - bez tyhle
+        # opravy by rozbitá Codex cesta potichu selhávala kapitolu po
+        # kapitole, běh po běhu, dokud by si toho uživatel nevšiml.
+        # `FatalRunError` využije existující `_cmd_run`'s `except
+        # FatalRunError: raise` (main.py, BEZE ZMĚNY) - celý běh se
+        # zastaví HNED, s jasnou hláškou. ŽÁDNÝ proaktivní limit
+        # velikosti promptu navíc (na rozdíl od `polish`'s `STYLIST_
+        # MAX_CHARS`) - zvažováno a ZAMÍTNUTO (kolo 2 IMPORTANT,
+        # plan-consensus): `timeout` je jediná pojistka proti oversized
+        # promptu. Bezpečné i pro delší kapitoly díky Tasku 2 (kolo 3
+        # IMPORTANT) - `pipeline.process_chapter`'s revizní smyčka teď
+        # MÁ checkpoint PŘED revizí, takže výjimka (útlum/timeout/
+        # useknutý výstup) BĚHEM revize kapitolu jen označí `flagged` s
+        # POSLEDNÍM platným překladem, nezahodí ho.
+        try:
+            text = stylist._exec_codex(prompt, codex_cmd=self._codex_cmd,
+                                       codex_model=self._codex_model,
+                                       timeout=timeout, label="translator")
+        except stylist.StylistTimeoutError:
+            # Kolo 9 IMPORTANT (plan-consensus) - timeout JEDNOHO volání
+            # je PER-CALL/transientní (tenhle prompt byl tentokrát moc
+            # velký/pomalý), NE nutně systémové selhání CELÉHO Codex
+            # backendu jako auth/launch/exit-kód níž - NEpřebaluje se na
+            # `FatalRunError` (to by zahodilo hotový scénový překlad při
+            # selhání revize, viz Task 2, a zbytečně zastavilo celý run
+            # kvůli jednomu pomalému volání). Necháváme propadnout beze
+            # změny - scénová smyčka ji zpracuje jako per-kapitolový
+            # `error` (auto-retry PŘÍŠTÍ `run` je tady správně, timeout
+            # může být jen dočasný), revizní smyčka (Task 2) ji zachytí
+            # a kapitolu označí `flagged` s posledním platným překladem.
+            # MUSÍ být PŘED `except stylist.StylistError` níž (podtřída -
+            # jinak by ji ten širší `except` pohltil první).
+            raise
+        except (stylist.StylistError, OSError, UnicodeError) as e:
+            # Kolo 7 IMPORTANT (plan-consensus) - `_exec_codex()`'s
+            # výstupní soubor se čte (`open(out_path, encoding="utf-8")
+            # .read()`) BEZ VLASTNÍHO try/except, MIMO `StylistError`
+            # kontrakt - `OSError` (zámek/oprávnění na dočasném souboru)
+            # nebo `UnicodeDecodeError` (poškozený zápis, špatné kódování)
+            # by jinak unikly jako obyčejná výjimka, propadly by až do
+            # `_cmd_run`'s generické větve jako per-kapitolový `error`, a
+            # `state.queue_for_run` by je tiše retryovalo navěky - STEJNÉ
+            # riziko jako `StylistError` výš, jen jiný zdroj. `_exec_codex`/
+            # `stylist.py` samotné zůstávají beze změny (mimo rozsah, viz
+            # spec) - širší `except` tady stačí.
+            #
+            # Kolo 8 IMPORTANT (plan-consensus) - `stylist._redact_detail()`
+            # PŘES CELOU zprávu, ne jen `str(e)` přímo - `_cmd_run`'s
+            # outer `except FatalRunError` (main.py) tiskne zprávu PŘÍMO
+            # na konzoli (main.py:1037 `print(f"Fatální chyba běhu:
+            # {e}")`), bez další redakce. `_redact_detail`'s VLASTNÍ
+            # docstring (`src/agents/stylist.py:206-215`) výslovně jmenuje
+            # "`str(e)` neočekávané výjimky" jako jednu z kategorií, co
+            # redaguje - `OSError`/`UnicodeDecodeError` z čtení výstupního
+            # souboru jsou přesně tenhle případ. `StylistError`'s zprávy
+            # bývají ČÁSTEČNĚ pre-redagované (stderr uvnitř `_exec_codex`
+            # už prošel `_redact_detail`), ale ne VŽDY (statické hlášky
+            # typu "auth expired" z Popen selhání nesou syrový text OS
+            # chyby) - jednotná redakce na výstupu z `CodexLLMClient` je
+            # bezpečnější než spoléhat na to, že KAŽDÁ cesta uvnitř
+            # `_exec_codex` redakci nezapomene.
+            #
+            # Kolo 11 IMPORTANT (plan-consensus) - `CodexTranslatorFatalError`
+            # (podtřída `FatalRunError`), NE holý `FatalRunError` - `_cmd_run`
+            # (Task 5) potřebuje ROZLIŠIT "tahle fatální chyba vznikla
+            # PŘÍMO v Codex-translator volání" od "kritik (VŽDY Claude,
+            # i při `--translator codex`) narazil na cost guard/lock
+            # ztrátu" - obojí je dnes STEJNÝ `FatalRunError` typ, takže
+            # podmínka `if args.translator == "codex":` v `_cmd_run`
+            # (kolo 10 fix) by omylem flagovala/redigovala i Claude-side
+            # kritikovu chybu jen proto, že translator backend je nastavený
+            # na `codex` - v přímém rozporu s "Claude cesta beze změny".
+            raise CodexTranslatorFatalError(stylist._redact_detail(str(e))) from e
+        # `truncated` VŽDY False (zdokumentovaný limit, viz spec "Známé
+        # limity") - Codex nedává spolehlivý signál o useknutí na limitu
+        # jako Claude `stop_reason`. Skutečné useknutí spadne na
+        # chybějící `===KONEC===` marker uvnitř `translator._parse()`
+        # (ValueError, Task 2, kolo 3 BLOCKING), ne na tenhle příznak.
+        # Kolo 5 IMPORTANT (plan-consensus) - NENULOVÝ konzervativní
+        # odhad (stejný vzorec jako count_tokens() níž), ne natvrdo 0 -
+        # PipelineLLMClient.complete() tyhle hodnoty zapíše do audit
+        # logu beze změny, main._print_usage() je sčítá napříč celým
+        # během. Natvrdo 0 by po zpracování celé knihy ukázalo "0
+        # tokenů" - cena $0 je správně (billed_model), ale objem
+        # zpracovaného textu by byl neviditelný.
+        # Kolo 27 NIT (plan-consensus) - `max(1, ...)` MÍSTO holého
+        # `//2` - kolo 5's záměr byl "NENULOVÝ odhad", ale `//2` samo
+        # pro krátký NEprázdný vstup/výstup (1-2 znaky) vrátí `0`,
+        # stejný problém jako "natvrdo 0", jen ve výjimečném edge-case.
+        return Completion(text=text, truncated=False,
+                          input_tokens=max(1, (len(system) + len(user)) // 2),
+                          output_tokens=max(1, len(text) // 2))
+
+    def count_tokens(self, *, system: str, user: str, model: str) -> int:
+        # Stejná konzervativní aproximace jako `PipelineLLMClient._guard()`'s
+        # vlastní fallback (main.py existující kód, `(len(system)+len(user))
+        # //2`) - Codex nemá API pro přesné počítání tokenů.
+        # Kolo 27 NIT (plan-consensus) - `max(1, ...)` viz `complete()` výš.
+        return max(1, (len(system) + len(user)) // 2)
+
+
 class FakeLLMClient:
     """Testovací klient - buď fronta hotových odpovědí, nebo callable(**kwargs)."""
     provider = "fake"
@@ -134,7 +319,7 @@ class PipelineLLMClient:
 
     def _price(self, model: str) -> tuple[float, float]:
         if model not in self._cfg.PRICE_IN_PER_MTOK or model not in self._cfg.PRICE_OUT_PER_MTOK:
-            raise FatalRunError(
+            raise MissingPriceError(
                 f"Model {model!r} nemá sazby v config.PRICE_*_PER_MTOK - "
                 "cost guard by byl slepý. Doplň sazby.")
         return (self._cfg.PRICE_IN_PER_MTOK[model], self._cfg.PRICE_OUT_PER_MTOK[model])
@@ -194,6 +379,16 @@ class PipelineLLMClient:
 
     def complete(self, *, system: str, user: str, max_tokens: int, model: str) -> Completion:
         from src import state
+        # Kolo 1 BLOCKING (plan-consensus 2026-09-16) - `self._inner`
+        # může ignorovat `model` param úplně (`CodexLLMClient` vždy
+        # execuje SVŮJ fixní `billed_model`, bez ohledu na to, co
+        # `translator.py` defaultně pošle - `config.MODEL_TRANSLATOR`).
+        # Cost guard i audit musí odrážet, co SE SKUTEČNĚ spustilo (a
+        # za co se SKUTEČNĚ platí), ne co volající předpokládal.
+        # `AnthropicClient`/`FakeLLMClient` nemají `billed_model` -
+        # `getattr(...) is None` spadne zpátky na `model` param beze
+        # změny chování pro existující Claude cestu.
+        effective_model = getattr(self._inner, "billed_model", None) or model
         # Kontrola PŘED `_guard()`, ne jen po ní - `_guard()` v
         # interaktivním režimu (CLI `_cmd_polish`) může při překročení
         # stropu vyzvat uživatele a na potvrzení zavolat `state.set_run_
@@ -208,13 +403,29 @@ class PipelineLLMClient:
                 "Zámek ztracen před LLM voláním - jiný proces teď píše "
                 "do DB, zastavuji dřív, než cost guard stihne zapsat "
                 "nový strop bez ověřeného vlastnictví.")
-        self._guard(system, user, max_tokens, model)
+        try:
+            self._guard(system, user, max_tokens, effective_model)
+        except MissingPriceError as e:
+            # Kolo 16 IMPORTANT (plan-consensus) - `except FatalRunError`
+            # (kolo 15's původní verze) by chytlo VŠECHNY `_guard()`
+            # FatalRunError příčiny - i normální cost-guard stop
+            # (limit překročen, non-interactive), stdin nedostupné,
+            # uživatel běh zastavil, `LockLostError` - a přebalilo by
+            # je na `CodexTranslatorFatalError` pro Codex-backed klienta,
+            # i když s Codexem nemají NIC společného (Claude by dopadl
+            # identicky). `MissingPriceError` (nová podtřída, viz výš) je
+            # PŘESNĚ ohraničená na `_price()`'s "nemá sazby" případ -
+            # jediný, co má smysl přebalovat jako Codex-specifickou
+            # fatální chybu.
+            if getattr(self._inner, "provider", None) == "codex":
+                raise CodexTranslatorFatalError(str(e)) from e
+            raise
         if self._require_lock is not None and not self._require_lock():
             raise LockLostError(
                 "Zámek ztracen během LLM volání - jiný proces teď píše "
                 "do DB, zastavuji dřív, než se stihne zapsat auditní "
                 "záznam bez ověřeného vlastnictví.")
-        in_rate, out_rate = self._price(model)
+        in_rate, out_rate = self._price(effective_model)
         status, err, comp = "ok", None, None
         try:
             comp = self._inner.complete(system=system, user=user,
@@ -240,6 +451,6 @@ class PipelineLLMClient:
                 state.record_llm_call(
                     self._db, run_id=self._run_id, agent=self._agent,
                     provider=getattr(self._inner, "provider", "unknown"),
-                    model=model, input_tokens=it, output_tokens=ot, cost_usd=cost,
-                    truncated=bool(comp.truncated) if comp else False,
+                    model=effective_model, input_tokens=it, output_tokens=ot,
+                    cost_usd=cost, truncated=bool(comp.truncated) if comp else False,
                     status=status, error_class=err)

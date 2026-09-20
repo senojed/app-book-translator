@@ -157,6 +157,17 @@ class StylistError(Exception):
     nepovedla', ne jako fatální chybu běhu."""
 
 
+class StylistTimeoutError(StylistError):
+    """`_exec_codex()` timeout - podtřída `StylistError` (existující
+    `except StylistError` volající kód, např. `_polish_one_chapter`,
+    funguje beze změny). Odlišitelná od ostatních `StylistError` příčin
+    (auth/exit kód/prázdná odpověď) - timeout jednoho volání je PER-
+    CALL/transientní, ne nutně systémové selhání celého Codex backendu
+    (`CodexLLMClient.complete()`, plan-consensus kolo 9 IMPORTANT, ji
+    NEpřebaluje na `FatalRunError`, na rozdíl od ostatních `StylistError`
+    příčin)."""
+
+
 _LINE_ENDING_RE = re.compile(r"\r\n|\r")
 
 
@@ -395,7 +406,7 @@ def _exec_codex(prompt_text: str, *, codex_cmd: list[str], codex_model: str,
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 pass   # udělali jsme, co šlo - nenecháme volajícího viset
-            raise StylistError(f"codex exec překročil timeout {timeout}s. [{label}]")
+            raise StylistTimeoutError(f"codex exec překročil timeout {timeout}s. [{label}]")
         except BaseException:
             # Odchylka od specu (plan-consensus kolo 2 IMPORTANT): spec
             # ukončí potomka JEN při TimeoutExpired. KeyboardInterrupt

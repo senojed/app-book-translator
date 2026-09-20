@@ -233,3 +233,289 @@ def test_require_lock_lost_during_call_skips_log_but_keeps_result(tmp_path):
     with state.connect(db) as conn:
         rows = list(conn.execute("SELECT * FROM llm_calls"))
     assert rows == []   # ale auditní řádek se NEZAPSAL
+
+
+def test_codex_llm_client_calls_exec_codex_and_wraps_result(monkeypatch):
+    from src.llm.client import CodexLLMClient
+    seen = {}
+    def fake_exec(prompt, *, codex_cmd, codex_model, timeout, label):
+        seen.update(prompt=prompt, codex_cmd=codex_cmd, codex_model=codex_model,
+                    timeout=timeout, label=label)
+        return "===PREKLAD===\ntext\n===METADATA===\n{}"
+    monkeypatch.setattr("src.agents.stylist._exec_codex", fake_exec)
+    c = CodexLLMClient(["codex"], "gpt-5.6-terra", timeout=42)
+    # Kolo 7 IMPORTANT (plan-consensus) - `model=` ÚMYSLNĚ JINÝ než
+    # `codex_model` ("claude-sonnet-5", přesně to, co translator.py
+    # reálně posílá vždy - žádný explicitní model= argument z
+    # pipeline.py). Test se STEJNÝM modelem na obou místech by nezachytil
+    # regresi, kdy implementace omylem použije caller-supplied `model`
+    # místo `self._codex_model` pro `_exec_codex()`'s `codex_model=`.
+    comp = c.complete(system="SYS", user="USR", max_tokens=1000, model="claude-sonnet-5")
+    assert comp.text == "===PREKLAD===\ntext\n===METADATA===\n{}"
+    assert comp.truncated is False
+    # Kolo 5 IMPORTANT (plan-consensus) - NENULOVÝ odhad (konzervativní,
+    # stejný vzor jako count_tokens()), ne natvrdo 0 - jinak _print_usage()
+    # ukáže "0 tokenů" i po zpracování celé knihy, přestože cena je
+    # správně $0 (billed_model price entry, ne nulový objem).
+    # Kolo 6 BLOCKING (plan-consensus) - vzorec MUSÍ sedět s implementací
+    # (`len(system)+len(user)`, BEZ `"\n\n"` oddělovače mezi nimi - ten
+    # je jen v samotném promptu pro Codex, ne v tomhle odhadu) - `len
+    # ("SYS")+len("USR")=6`, NE `len("SYS\n\nUSR")=8`.
+    assert comp.input_tokens == (len("SYS") + len("USR")) // 2
+    assert comp.output_tokens == len("===PREKLAD===\ntext\n===METADATA===\n{}") // 2
+    assert seen["prompt"] == "SYS\n\nUSR"
+    assert seen["codex_cmd"] == ["codex"]
+    assert seen["codex_model"] == "gpt-5.6-terra"
+    assert seen["timeout"] == 42
+
+
+def test_codex_llm_client_default_timeout_from_config(monkeypatch):
+    from src.llm.client import CodexLLMClient
+    import config
+    monkeypatch.setattr(config, "CODEX_TRANSLATE_TIMEOUT_SECONDS", 111)
+    seen = {}
+    def fake_exec(prompt, *, codex_cmd, codex_model, timeout, label):
+        seen["timeout"] = timeout
+        return "ok"
+    monkeypatch.setattr("src.agents.stylist._exec_codex", fake_exec)
+    c = CodexLLMClient(["codex"], "m")   # timeout NEZADÁN
+    c.complete(system="s", user="u", max_tokens=10, model="m")
+    assert seen["timeout"] == 111
+
+
+def test_codex_llm_client_count_tokens_is_conservative_estimate():
+    from src.llm.client import CodexLLMClient
+    c = CodexLLMClient(["codex"], "m")
+    assert c.count_tokens(system="abcd", user="efgh", model="m") == 4   # (4+4)//2
+
+
+def test_codex_llm_client_billed_model_is_codex_model_not_caller_model():
+    from src.llm.client import CodexLLMClient
+    c = CodexLLMClient(["codex"], "gpt-5.6-terra")
+    assert c.billed_model == "gpt-5.6-terra"
+
+
+def test_codex_llm_client_wraps_stylist_error_as_fatal_run_error(monkeypatch):
+    """Kolo 2 BLOCKING (plan-consensus) - viz vysvětlení výš u Tasku 2 -
+    `_exec_codex` selhání (rozbitý CLI, timeout, špatný exit kód) NESMÍ
+    propadnout jako obyčejná výjimka, co by `_cmd_run` zpracoval jako
+    per-kapitolový `error` (automaticky retrying přes `state.queue_for_
+    run`) - musí zastavit CELÝ běh.
+
+    Kolo 8 IMPORTANT (plan-consensus) - zpráva jde přes `stylist.
+    _redact_detail()`, takže defaultně (`STYLIST_REPORT_REJECTED_TEXT`
+    `False`, test fixture default) NEOBSAHUJE raw text - ověřuje
+    REDIGOVANOU podobu, ne `match="auth expired"` (to ověřuje samostatný
+    test níž s explicitním opt-inem).
+
+    Kolo 11 IMPORTANT (plan-consensus) - ověřuje PŘESNÝ typ
+    `CodexTranslatorFatalError`, ne jen `FatalRunError` - `_cmd_run`
+    (Task 5) na TOMHLE typu rozlišuje flagged/redakci od obecného
+    `FatalRunError` (kritikův cost guard atd.)."""
+    from src.llm.client import CodexLLMClient, CodexTranslatorFatalError
+    from src.agents.stylist import StylistError
+    def boom(*a, **k):
+        raise StylistError("codex exec skončil s kódem 1: auth expired")
+    monkeypatch.setattr("src.agents.stylist._exec_codex", boom)
+    c = CodexLLMClient(["codex"], "m")
+    with pytest.raises(CodexTranslatorFatalError) as exc_info:
+        c.complete(system="s", user="u", max_tokens=10, model="m")
+    assert "auth expired" not in str(exc_info.value)
+    assert "potlačeny" in str(exc_info.value)
+
+
+def test_codex_llm_client_fatal_error_shows_detail_when_report_rejected_text_true(
+        monkeypatch):
+    """Kolo 8 IMPORTANT (plan-consensus) - explicitní opt-in
+    (`config.STYLIST_REPORT_REJECTED_TEXT = True`) ukáže PŮVODNÍ zprávu -
+    stejná brána, co `_cmd_polish`'s chybové cesty už používají."""
+    from src.llm.client import CodexLLMClient
+    from src.agents.stylist import StylistError
+    monkeypatch.setattr(config, "STYLIST_REPORT_REJECTED_TEXT", True)
+    def boom(*a, **k):
+        raise StylistError("codex exec skončil s kódem 1: auth expired")
+    monkeypatch.setattr("src.agents.stylist._exec_codex", boom)
+    c = CodexLLMClient(["codex"], "m")
+    with pytest.raises(FatalRunError, match="auth expired"):
+        c.complete(system="s", user="u", max_tokens=10, model="m")
+
+
+def test_codex_llm_client_wraps_os_and_unicode_errors_as_fatal_run_error(monkeypatch):
+    """Kolo 7 IMPORTANT (plan-consensus) - `_exec_codex()`'s výstupní
+    soubor se čte BEZ vlastního try/except, mimo `StylistError`
+    kontrakt - `OSError` (zámek/oprávnění) i `UnicodeDecodeError`
+    (poškozený zápis) musí projít STEJNOU cestou jako `StylistError`
+    výš, jinak by unikly jako obyčejná výjimka a `state.queue_for_run`
+    by je tiše retryovalo navěky."""
+    from src.llm.client import CodexLLMClient
+    for exc in (OSError("soubor je zamčený"),
+               UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")):
+        def boom(*a, _exc=exc, **k):
+            raise _exc
+        monkeypatch.setattr("src.agents.stylist._exec_codex", boom)
+        c = CodexLLMClient(["codex"], "m")
+        with pytest.raises(FatalRunError):
+            c.complete(system="s", user="u", max_tokens=10, model="m")
+
+
+def test_codex_llm_client_does_not_wrap_timeout_as_fatal_run_error(monkeypatch):
+    """Kolo 9 IMPORTANT (plan-consensus) - timeout jednoho volání je
+    PER-CALL/transientní, ne nutně systémové selhání celého Codex
+    backendu jako auth/launch/exit-kód výš - NESMÍ se stát FatalRunError
+    (to by zahodilo i hotový scénový překlad při selhání revize, viz
+    Task 2, a zbytečně zastavilo celý run kvůli jednomu pomalému
+    volání). Necháváme propadnout jako StylistTimeoutError beze změny -
+    scénová smyčka ji zpracuje jako per-kapitolový error (auto-retry
+    příští run je tady správně), revizní smyčka (Task 2) ji zachytí a
+    kapitolu označí flagged s posledním platným překladem."""
+    from src.llm.client import CodexLLMClient
+    from src.agents.stylist import StylistTimeoutError
+    def boom(*a, **k):
+        raise StylistTimeoutError("codex exec překročil timeout 300s. [translator]")
+    monkeypatch.setattr("src.agents.stylist._exec_codex", boom)
+    c = CodexLLMClient(["codex"], "m")
+    with pytest.raises(StylistTimeoutError):
+        c.complete(system="s", user="u", max_tokens=10, model="m")
+
+
+def test_codex_llm_client_refuses_without_fs_risk_optin(monkeypatch):
+    """Kolo 14 IMPORTANT (plan-consensus) - obrana do hloubky -
+    CodexLLMClient jde zkonstruovat a zavolat PŘÍMO, mimo `_client_
+    factory`'s `_polish_preflight()` gate (Task 4) - `complete()` musí
+    mít VLASTNÍ kontrolu, stejný vzor jako `stylist.polish()`."""
+    from src.llm.client import CodexLLMClient, CodexTranslatorFatalError
+    monkeypatch.setattr(config, "STYLIST_ACCEPT_FS_RISK", False)
+    def boom(*a, **k):
+        raise AssertionError("_exec_codex se nemá volat bez FS_RISK opt-inu")
+    monkeypatch.setattr("src.agents.stylist._exec_codex", boom)
+    c = CodexLLMClient(["codex"], "m")
+    with pytest.raises(CodexTranslatorFatalError):
+        c.complete(system="s", user="u", max_tokens=10, model="m")
+
+
+def test_pipeline_client_uses_billed_model_for_price_not_caller_model(monkeypatch, tmp_path):
+    """Kolo 1 BLOCKING (plan-consensus) - jádro opravy. `PipelineLLMClient`
+    dostane `model="claude-sonnet-5"` (přesně to, co `translator.py`
+    reálně posílá), ale `self._inner` (Codex) má `billed_model="codex-x"`
+    s NULOVOU cenou - cena/audit MUSÍ použít `billed_model`, ne
+    `"claude-sonnet-5"` (co by mělo nenulovou cenu a spadlo by na
+    přísahu FatalRunError "nemá sazby", protože `"claude-sonnet-5"`
+    sazby MÁ, ale skutečně běžel Codex, ne Claude)."""
+    db = _db(tmp_path)
+    rid = state.create_run(db, "run")
+    monkeypatch.setattr(config, "PRICE_IN_PER_MTOK",
+                        {**config.PRICE_IN_PER_MTOK, "codex-x": 0.0})
+    monkeypatch.setattr(config, "PRICE_OUT_PER_MTOK",
+                        {**config.PRICE_OUT_PER_MTOK, "codex-x": 0.0})
+
+    class FakeCodexInner:
+        provider = "codex"
+        billed_model = "codex-x"
+        def complete(self, *, system, user, max_tokens, model):
+            return Completion(text="ok", truncated=False, input_tokens=100, output_tokens=50)
+        def count_tokens(self, *, system, user, model):
+            return 10
+
+    c = PipelineLLMClient(FakeCodexInner(), run_id=rid, agent="translator",
+                          db_path=db, config_mod=config)
+    # `model="claude-sonnet-5"` - PŘESNĚ to, co `translator.py` reálně
+    # posílá (žádný explicitní `model=` argument z `pipeline.py`).
+    c.complete(system="s", user="u", max_tokens=10, model="claude-sonnet-5")
+    with state.connect(db) as conn:
+        row = conn.execute("SELECT * FROM llm_calls").fetchone()
+    assert row["model"] == "codex-x"        # NE "claude-sonnet-5"
+    assert row["cost_usd"] == 0.0            # nulová cena z `billed_model`
+
+
+def test_pipeline_client_guard_uses_billed_model_price_not_caller_model(
+        monkeypatch, tmp_path):
+    """Kolo 8 IMPORTANT (plan-consensus) - test výš ověřuje jen VÝSLEDNÝ
+    audit řádek (`llm_calls`), ne že `_guard()` (cost-limit kontrola
+    PŘED voláním) taky použije `effective_model`. Bez týhle části opravy
+    by `_guard()` mohl počítat s Claude cenou pro Codex volání a
+    zbytečně/chybně zastavit běh (false-positive cost-limit stop), i
+    když efektivní cena Codexu je $0."""
+    db = _db(tmp_path)
+    rid = state.create_run(db, "run")
+    monkeypatch.setattr(config, "PRICE_IN_PER_MTOK",
+                        {**config.PRICE_IN_PER_MTOK, "codex-x": 0.0})
+    monkeypatch.setattr(config, "PRICE_OUT_PER_MTOK",
+                        {**config.PRICE_OUT_PER_MTOK, "codex-x": 0.0})
+    monkeypatch.setattr(config, "MAX_SPEND_USD", 0.0)
+
+    class FakeCodexInner:
+        provider = "codex"
+        billed_model = "codex-x"
+        def complete(self, *, system, user, max_tokens, model):
+            return Completion(text="ok", truncated=False, input_tokens=100, output_tokens=50)
+        def count_tokens(self, *, system, user, model):
+            return 10
+
+    c = PipelineLLMClient(FakeCodexInner(), run_id=rid, agent="translator",
+                          db_path=db, config_mod=config, interactive=False)
+    # NESMÍ vyhodit FatalRunError - s effective_model="codex-x" (cena $0)
+    # je odhad $0, MAX_SPEND_USD=0.0 projde. Kdyby _guard() použil
+    # "claude-sonnet-5" (nenulová cena) místo effective_model, velký
+    # max_tokens by vygeneroval nenulový odhad a FatalRunError by
+    # vyletěl i s $0 utraceno.
+    c.complete(system="s", user="u", max_tokens=100000, model="claude-sonnet-5")
+
+
+def test_pipeline_client_missing_price_for_codex_inner_raises_codex_translator_fatal(
+        monkeypatch, tmp_path):
+    """Kolo 15 IMPORTANT (plan-consensus) - `_price()`'s "nemá sazby"
+    `MissingPriceError` (kolo 16 - nová podtřída, viz níž) musí být pro
+    Codex-backed inner klient (`.provider == "codex"`) přebalená na
+    `CodexTranslatorFatalError`, jinak by `_cmd_run` (Task 5) tenhle pád
+    nezachytil typovou větví a kapitola by zůstala v `processing` limbu
+    (stejná třída díry jako kolo 12's `factory()` fix, jen jiné místo)."""
+    from src.llm.client import CodexTranslatorFatalError
+    db = _db(tmp_path)
+    rid = state.create_run(db, "run")
+
+    class FakeCodexInner:
+        provider = "codex"
+        billed_model = "codex-missing-price"   # ŽÁDNÝ záznam v PRICE_*_PER_MTOK
+        def complete(self, *, system, user, max_tokens, model):
+            raise AssertionError("nemá se zavolat - guard selže dřív")
+        def count_tokens(self, *, system, user, model):
+            return 10
+
+    c = PipelineLLMClient(FakeCodexInner(), run_id=rid, agent="translator",
+                          db_path=db, config_mod=config, interactive=False)
+    with pytest.raises(CodexTranslatorFatalError):
+        c.complete(system="s", user="u", max_tokens=10, model="claude-sonnet-5")
+
+
+def test_pipeline_client_codex_normal_cost_guard_stop_stays_plain_fatal_run_error(
+        monkeypatch, tmp_path):
+    """Kolo 16 IMPORTANT (plan-consensus) - kolo-15's PŮVODNÍ fix
+    (`except FatalRunError`) by chytlo VŠECHNY `_guard()` příčiny, i
+    normální cost-guard stop (limit překročen, non-interactive) - to
+    NENÍ Codex-specifická chyba (Claude by dopadl identicky), takže
+    NESMÍ dostat `CodexTranslatorFatalError` zacházení. Zúženo na
+    `MissingPriceError` (přesně jeden konkrétní `_guard()` raise-site)."""
+    from src.llm.client import CodexTranslatorFatalError
+    db = _db(tmp_path)
+    rid = state.create_run(db, "run")
+    monkeypatch.setattr(config, "PRICE_IN_PER_MTOK",
+                        {**config.PRICE_IN_PER_MTOK, "codex-x": 100.0})
+    monkeypatch.setattr(config, "PRICE_OUT_PER_MTOK",
+                        {**config.PRICE_OUT_PER_MTOK, "codex-x": 100.0})
+    monkeypatch.setattr(config, "MAX_SPEND_USD", 0.0)
+
+    class FakeCodexInner:
+        provider = "codex"
+        billed_model = "codex-x"
+        def complete(self, *, system, user, max_tokens, model):
+            raise AssertionError("nemá se zavolat - guard selže dřív")
+        def count_tokens(self, *, system, user, model):
+            return 10
+
+    c = PipelineLLMClient(FakeCodexInner(), run_id=rid, agent="translator",
+                          db_path=db, config_mod=config, interactive=False)
+    # Cena JE definovaná (žádný MissingPriceError) - guard zastaví na
+    # PŘEKROČENÍ stropu, obyčejný FatalRunError, NE CodexTranslatorFatalError.
+    with pytest.raises(FatalRunError) as exc_info:
+        c.complete(system="s", user="u", max_tokens=100000, model="claude-sonnet-5")
+    assert not isinstance(exc_info.value, CodexTranslatorFatalError)

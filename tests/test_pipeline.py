@@ -1,4 +1,5 @@
 import json
+import config
 from src import state, glossary, pipeline
 from src.llm.client import Completion
 from src.agents import translator as T, critic as C
@@ -585,3 +586,37 @@ def test_pre_loop_critic_fatal_error_preserves_new_question_from_current_attempt
             "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
     open_qs = state.unanswered_questions(db)
     assert any(q["scope_key"] == "cand_new" for q in open_qs)
+
+
+def test_revision_timeout_flags_chapter_preserves_translation_integration(
+        tmp_path, monkeypatch):
+    """Kolo 9 IMPORTANT (plan-consensus) - integrační test PRES CELY
+    stack (CodexLLMClient -> PipelineLLMClient -> pipeline.py revizni
+    smycka, Task 2), ne jen mockovany ValueError jako Task 2's vlastni
+    test - timeout BEHEM revize (StylistTimeoutError) nesmi zastavit
+    cely beh ani zahodit hotovy scenovy preklad."""
+    from src.llm.client import CodexLLMClient, PipelineLLMClient
+    from src.agents.stylist import StylistTimeoutError
+    db = _db(tmp_path)
+    rid = state.create_run(db, "run")
+    calls = {"n": 0}
+    def fake_exec(prompt, *, codex_cmd, codex_model, timeout, label):
+        calls["n"] += 1
+        if calls["n"] == 1:      # 1. volani = scenovy preklad, uspeje
+            return ("===PREKLAD===\nprvotní scénový překlad\n"
+                    "===METADATA===\n{}\n===KONEC===")
+        raise StylistTimeoutError("codex exec překročil timeout 300s. [translator]")
+    monkeypatch.setattr("src.agents.stylist._exec_codex", fake_exec)
+    always_bad = [{"source": "critic", "type": "fidelity", "severity": "critical",
+                   "action": "revise", "term_id": None, "expected": None,
+                   "actual": None, "cz_excerpt": "x", "issue": "chyba", "suggestion": "y"}]
+    monkeypatch.setattr(C, "review", lambda *a, **k: always_bad)
+    def cf(agent):
+        inner = CodexLLMClient(["codex"], config.CODEX_MODEL) if agent == "translator" else None
+        return PipelineLLMClient(inner, run_id=rid, agent=agent,
+                                 db_path=db, config_mod=config)
+    ch = state.get_chapter(db, 1)
+    out = pipeline.process_chapter(db, ch, client_factory=cf, guide={
+        "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    assert out["status"] == "flagged"
+    assert state.get_chapter(db, 1)["translated_text"] == "prvotní scénový překlad"
