@@ -225,3 +225,13 @@ ne jen "nema sazby"; opraveno novou MissingPriceError podtridou, zuzeny
 except. Bare raise v _cmd_run's CodexTranslatorFatalError handleru
 re-raisovalo neredigovanou zpravu na konzoli navzdory redigovanym
 notes; opraveno konstrukci nove vyjimky s redigovanou zpravou.
+
+## Round 17
+
+- Codex: [round-17-codex.md](round-17-codex.md) — CHANGES_NEEDED
+- Claude: [round-17-claude.md](round-17-claude.md) — CHANGES_NEEDED
+
+Opraveno: BLOCKING - kopirovaci artefakt v kolo-16's testu (prebytecne
+radky s nedefinovanou calls promennou, zkopirovane z predchoziho
+testu behem Edit vkladani). Opraveno odstranenim prebytecnych radku
+(pokryti "druhy run" uz existuje v sesterskem testu).

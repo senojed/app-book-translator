@@ -2443,11 +2443,6 @@ def test_run_translator_codex_fatal_error_console_output_is_redacted(
     out = capsys.readouterr().out
     assert "tajny-obsah-z-codexu" not in out
     assert "potlačeny" in out
-    # Druhý run BEZ --retry-flagged - queue_for_run vrací jen pending/
-    # error, flagged kapitola se NEZAŘADÍ, process_chapter se nezavolá znovu.
-    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 0
-    assert calls["n"] == 1
-    assert state.get_chapter("data/state.sqlite3", 1)["status"] == "flagged"
 
 
 def test_run_translator_codex_generic_fatal_run_error_from_critic_not_flagged(
