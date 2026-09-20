@@ -921,9 +921,14 @@ def test_kontrola_phase_fatal_error_preserves_scene_translation(tmp_path, monkey
     def boom(*a, **k): raise ValueError("rozbita konkordance")
     monkeypatch.setattr(concordance, "check_chapter", boom)
     ch = state.get_chapter(db, 1)
-    with __import__("pytest").raises(ValueError):
-        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
-            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    # Kolo 27 IMPORTANT (plan-consensus) - obyčejný `Exception` (ne
+    # `FatalRunError`/`KeyboardInterrupt`) checkpoint teď VRÁTÍ jako
+    # výsledek funkce MÍSTO re-raise - `process_chapter()` tedy
+    # NEVYHODÍ výjimku, jen vrátí `flagged` výsledek (jinak by main.py's
+    # generický `except Exception: status="error"` `flagged` přepsal).
+    result = pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+        "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    assert result["status"] == "flagged"
     row = state.get_chapter(db, 1)
     assert row["status"] == "flagged"
     assert row["translated_text"] == "scénový překlad"
@@ -950,9 +955,9 @@ def test_transakce_b_prep_fatal_error_preserves_final_translation(tmp_path, monk
         return real_build_mentions(*a, **k)   # 2. volání = uvnitř checkpointu
     monkeypatch.setattr(concordance, "build_mentions", boom)
     ch = state.get_chapter(db, 1)
-    with __import__("pytest").raises(ValueError):
-        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
-            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    result = pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+        "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    assert result["status"] == "flagged"
     row = state.get_chapter(db, 1)
     assert row["status"] == "flagged"
     assert row["translated_text"] == "finální překlad"
@@ -977,9 +982,9 @@ def test_checkpoint_glossary_fetch_failure_preserves_existing_mentions(
     monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
         "scénový překlad", [], [], []))
     ch = state.get_chapter(db, 1)
-    with __import__("pytest").raises(RuntimeError):
-        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
-            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    result = pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+        "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    assert result["status"] == "flagged"
     row = state.get_chapter(db, 1)
     assert row["status"] == "flagged"
     assert row["translated_text"] == "scénový překlad"
@@ -1485,7 +1490,18 @@ nahraď:
         check_chapter()`, ne z translatoru) se tam TAKY překlápí do
         DB otázek. Bez týhle větve by zachráněný `cz` mohl mít uložený
         minor/candidate nález BEZ odpovídající otázky v `questions`
-        tabulce - nekonzistence oproti normálnímu dokončení."""
+        tabulce - nekonzistence oproti normálnímu dokončení.
+
+        Kolo 27 IMPORTANT (plan-consensus) - VRACÍ `process_chapter()`-
+        tvarovaný výsledek (ne `None`) - pro NEfatální výjimku (viz
+        volající `except Exception` klauzule níž) tenhle výsledek
+        volající přímo VRÁTÍ místo re-raise, protože holé `raise` by
+        po úspěšném uložení `flagged` propagovalo do `_cmd_run` (main.py),
+        co by ho svým GENERICKÝM `except Exception: status="error"`
+        přepsalo zpátky na `error` - status, co `state.queue_for_run()`
+        AUTOMATICKY zkusí znovu při každém dalším `run`u, MÍSTO `flagged`,
+        co čeká na explicitní `--retry-flagged` (přesně to, co kolo
+        10/11 zavedlo a co by tenhle přehlédnutý re-raise tiše rušilo)."""
         pseudo = {"source": "pipeline", "type": "fluency", "severity": "critical",
                  "action": "note", "term_id": None, "expected": None,
                  "actual": None, "cz_excerpt": None,
@@ -1513,11 +1529,20 @@ nahraď:
              "text": f.get("issue") or "", "guess_answer": f.get("actual"),
              "severity": "guess"}
             for f in findings_now if f.get("action") == "question"]
-        state.commit_chapter_result(
+        commit_result = state.commit_chapter_result(
             db_path, idx, translated_text=cz_now, revision_rounds=rounds_now,
             notes_json=json.dumps(saved_findings, ensure_ascii=False),
             status="flagged", new_candidates=[], mentions=rebuilt_mentions,
             questions=existing_questions + fresh_db_questions)
+        # Kolo 27 IMPORTANT (plan-consensus) - vrací hotový `process_
+        # chapter()`-tvarovaný výsledek (viz vysvětlení u volajících
+        # `except` klauzulí níž) - volající pro NEfatální výjimku tenhle
+        # výsledek přímo VRÁTÍ MÍSTO re-raise, ať `_cmd_run` (main.py)
+        # nemá šanci `flagged` status přepsat zpátky na auto-retry-ovaný
+        # `error`.
+        return {"idx": idx, "status": "flagged", "revision_rounds": rounds_now,
+                "new_terms": 0, "questions_created": commit_result["questions_created"],
+                "findings": saved_findings}
 
     # Kolo 25 IMPORTANT (plan-consensus) - `try` rozšířen na CELOU
     # "kontrola" fázi (`_verified_rendered()`/`glossary.all_terms()`/
@@ -1537,7 +1562,7 @@ nahraď:
         glossary_rows = glossary.all_terms(db_path)
         findings = concordance.check_chapter(en, cz, glossary_rows, rendered)
         critic_findings, critic_failed = _run_critic(en, cz, client_factory("critic"))
-    except (Exception, KeyboardInterrupt) as e:
+    except (FatalRunError, KeyboardInterrupt) as e:
         # Kolo 22 IMPORTANT (plan-consensus) - viz vysvětlení výš -
         # PRVNÍ `_run_critic()` volání (PŘED revizní smyčkou) nebylo
         # chráněné vůbec.
@@ -1546,17 +1571,29 @@ nahraď:
         # `except FatalRunError` přeskočilo úplně - uživatelovo přerušení
         # BĚHEM čekání na kritika by zahodilo `cz` stejně jako kritikův
         # `FatalRunError`, jen skrz jiný trigger.
-        # Kolo 25 IMPORTANT (plan-consensus) - širší `except (Exception,
-        # KeyboardInterrupt)` MÍSTO úzkého `except FatalRunError` -
-        # `_verified_rendered()`/`glossary.all_terms()`/`concordance.
-        # check_chapter()` NEjsou LLM volání s vlastní FatalRunError
-        # klasifikací jako `_run_critic()` - jejich chyba je obyčejný
-        # `Exception` (např. `sqlite3.OperationalError`). Mirror scénové
-        # smyčky (kolo 23/24) - checkpoint VŽDY, bez ohledu na typ, pak
-        # re-raise (main.py dál rozhoduje o finálním statusu/pokračování
-        # podle TOHO, co propadne, stejně jako dřív).
+        # Kolo 27 IMPORTANT (plan-consensus) - `FatalRunError`/
+        # `KeyboardInterrupt` jsou OPRAVDU fatální (kritikův cost guard/
+        # auth, uživatelovo přerušení) - checkpoint uloží, PAK re-raise,
+        # CELÝ `run` se zastaví (main.py žádnou z nich nezachytí zvlášť,
+        # jen obecně - správné chování, beze změny oproti dřívějším
+        # kolům).
         _checkpoint_flagged(cz, findings, questions, 0, type(e).__name__)
         raise
+    except Exception as e:
+        # Kolo 27 IMPORTANT (plan-consensus) - `_verified_rendered()`/
+        # `glossary.all_terms()`/`concordance.check_chapter()` NEJSOU
+        # LLM volání s vlastní FatalRunError klasifikací jako `_run_
+        # critic()` - jejich chyba je OBYČEJNÝ `Exception` (např.
+        # `sqlite3.OperationalError`), CO NECHCEME nechat zastavit
+        # CELÝ run (na rozdíl od fatální větve výš). Checkpoint uloží
+        # `flagged` A rovnou ho VRÁTÍ jako výsledek funkce - HOLÉ
+        # `raise` by tu propagovalo do `_cmd_run`'s generického `except
+        # Exception: status="error"` (main.py), co by `flagged` status
+        # tiše přepsal na `error` (auto-retry PŘI KAŽDÉM dalším `run`u,
+        # MÍSTO čekání na explicitní `--retry-flagged`) - přesně to, co
+        # kolo 10/11 zavedlo pro Codex-translator selhání a co by tenhle
+        # přehlédnutý re-raise pro pipeline-interní selhání tiše rušilo.
+        return _checkpoint_flagged(cz, findings, questions, 0, type(e).__name__)
     findings += critic_findings
 ```
 
@@ -1870,14 +1907,28 @@ nahraď:
             db_path, idx, translated_text=cz, revision_rounds=rounds,
             notes_json=json.dumps(findings, ensure_ascii=False), status=status,
             new_candidates=new_candidates, mentions=mentions, questions=db_questions)
-    except (Exception, KeyboardInterrupt) as e:
+    except (FatalRunError, KeyboardInterrupt) as e:
         # Kolo 25 IMPORTANT (plan-consensus) - viz vysvětlení výš -
         # poslední nechráněné místo v `process_chapter()`. `cz` je tu
         # už FINÁLNÍ (po revizní smyčce) - bez checkpointu by selhání
         # PŘÍMO v přípravě transakce B (DB čtení glosáře, konkordanční
         # výpočet) zahodilo i tenhle, už hotový výsledek.
+        # Kolo 27 IMPORTANT (plan-consensus) - v týhle fázi žádné LLM
+        # volání neběží (`FatalRunError` je tu tedy nepravděpodobný), ale
+        # `KeyboardInterrupt` (Ctrl+C) může přijít kdykoli - checkpoint
+        # uloží, PAK re-raise, run se zastaví (konzistentní s ostatními
+        # dvěma checkpoint místy).
         _checkpoint_flagged(cz, findings, questions, rounds, type(e).__name__)
         raise
+    except Exception as e:
+        # Kolo 27 IMPORTANT (plan-consensus) - OBYČEJNÝ `Exception` (DB
+        # chyba, neočekávaný tvar dat) NESMÍ zastavit CELÝ run - checkpoint
+        # uloží `flagged` A rovnou ho VRÁTÍ jako výsledek funkce. Holé
+        # `raise` by tu propagovalo do `_cmd_run`'s generického `except
+        # Exception: status="error"` (main.py), co by `flagged` (needs-
+        # human, čeká na `--retry-flagged`) tiše přepsal na `error`
+        # (auto-retry PŘI KAŽDÉM dalším `run`u) - RUŠÍ smysl checkpointu.
+        return _checkpoint_flagged(cz, findings, questions, rounds, type(e).__name__)
 
     return {"idx": idx, "status": status, "revision_rounds": rounds,
             "new_terms": len(new_candidates),
@@ -2671,15 +2722,20 @@ class CodexLLMClient:
         # během. Natvrdo 0 by po zpracování celé knihy ukázalo "0
         # tokenů" - cena $0 je správně (billed_model), ale objem
         # zpracovaného textu by byl neviditelný.
+        # Kolo 27 NIT (plan-consensus) - `max(1, ...)` MÍSTO holého
+        # `//2` - kolo 5's záměr byl "NENULOVÝ odhad", ale `//2` samo
+        # pro krátký NEprázdný vstup/výstup (1-2 znaky) vrátí `0`,
+        # stejný problém jako "natvrdo 0", jen ve výjimečném edge-case.
         return Completion(text=text, truncated=False,
-                          input_tokens=(len(system) + len(user)) // 2,
-                          output_tokens=len(text) // 2)
+                          input_tokens=max(1, (len(system) + len(user)) // 2),
+                          output_tokens=max(1, len(text) // 2))
 
     def count_tokens(self, *, system: str, user: str, model: str) -> int:
         # Stejná konzervativní aproximace jako `PipelineLLMClient._guard()`'s
         # vlastní fallback (main.py existující kód, `(len(system)+len(user))
         # //2`) - Codex nemá API pro přesné počítání tokenů.
-        return (len(system) + len(user)) // 2
+        # Kolo 27 NIT (plan-consensus) - `max(1, ...)` viz `complete()` výš.
+        return max(1, (len(system) + len(user)) // 2)
 ```
 
 **Kolo 9 IMPORTANT oprava - `stylist.StylistTimeoutError`** (`src/agents/

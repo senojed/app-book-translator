@@ -365,3 +365,18 @@ take ignoroval findings-odvozene otazky (action=="question" polozky z
 concordance.check_chapter(), druhy zdroj otazek vedle questions_now z
 translatoru) - opraveno rozsirenim fresh_db_questions. Dva regresni
 testy.
+
+## Round 27
+
+- Codex: [round-27-codex.md](round-27-codex.md) — CHANGES_NEEDED
+- Claude: [round-27-claude.md](round-27-claude.md) — CHANGES_NEEDED
+
+Opraveno: IMPORTANT - checkpoint (kolo 25) ulozil flagged, ale pak
+blindly re-raisoval i pro NEfatalni chyby - main.py's genericky
+except Exception: status="error" pak flagged tise prepsal na error
+(auto-retry pri kazdem dalsim run, rusi smysl checkpointu). Opraveno
+rozdelenim except klauzuli na fatalni (FatalRunError/KeyboardInterrupt -
+checkpoint+raise) a nefatalni (Exception - checkpoint+return, zadny
+re-raise). _checkpoint_flagged() ted vraci tvarovany vysledek. Tri
+existujici testy upraveny. NIT: max(1, ...) proti nulovemu token
+odhadu pro kratky neprazdny text.
