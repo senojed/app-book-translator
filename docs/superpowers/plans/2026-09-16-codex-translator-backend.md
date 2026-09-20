@@ -3010,8 +3010,14 @@ Přidej do `tests/test_cli.py`:
 ```python
 def test_client_factory_translator_backend_codex_uses_codex_client(monkeypatch):
     from src.llm.client import CodexLLMClient
+    # Kolo 28 NIT (plan-consensus) - `factory()` teď staví `CodexLLMClient`
+    # z RAW `config.CODEX_MODEL`, NE z `_polish_preflight()`'s ořezaného
+    # návratu (viz vysvětlení u `_client_factory` výš) - mock preflightu
+    # tedy `model` element ignoruje (`"ignored"`, nikdy nepoužit), test
+    # ověřuje proti `config.CODEX_MODEL` mocku místo toho.
     monkeypatch.setattr("main._polish_preflight",
-                        lambda: ("m", ["codex", "resolved"], None))
+                        lambda: ("ignored", ["codex", "resolved"], None))
+    monkeypatch.setattr(config, "CODEX_MODEL", "m")
     factory = main._client_factory(1, interactive=False, translator_backend="codex")
     client = factory("translator")
     assert isinstance(client._inner, CodexLLMClient)
@@ -3087,7 +3093,18 @@ def _client_factory(run_id: int, *, interactive: bool, require_lock=None,
     `_polish_preflight()` se pro ně vůbec nevolá."""
     def factory(agent: str):
         if agent == "translator" and translator_backend == "codex":
-            model, codex_cmd, preflight_err = _polish_preflight()
+            # Kolo 28 NIT (plan-consensus) - `_polish_preflight()` vrací
+            # OŘEZANÝ model (`(config.CODEX_MODEL or "").strip()`, main.py:
+            # 1158) - jen pro VLASTNÍ prázdný-string check, NIKDY
+            # nepoužívat pro `CodexLLMClient(codex_model=...)` níž. Task
+            # 1's `PRICE_IN_PER_MTOK[CODEX_MODEL] = 0.0` (a `billed_model`
+            # napříč Task 3) používá RAW `config.CODEX_MODEL` jako klíč -
+            # kdyby měl `CODEX_MODEL` (dnes bez mezer) NĚKDY okolní
+            # whitespace, ořezaná vs. neořezaná verze by se v `PRICE_IN_
+            # PER_MTOK` dict lookupu (`_price()`, kolo 16) rozešly a
+            # `MissingPriceError` by vyletěla i přes SPRÁVNĚ nastavenou
+            # cenu. `_` níž zahazuje ořezanou hodnotu úmyslně.
+            _, codex_cmd, preflight_err = _polish_preflight()
             if preflight_err:
                 # Kolo 12 IMPORTANT (plan-consensus) - `CodexTranslatorFatalError`,
                 # NE holý `FatalRunError` - tahle LÍNÁ kontrola běží AŽ
@@ -3099,7 +3116,7 @@ def _client_factory(run_id: int, *, interactive: bool, require_lock=None,
                 # (Task 3), ať `_cmd_run` (Task 5) tenhle pád taky
                 # označí `flagged`, ne nechá kapitolu uvízlou.
                 raise CodexTranslatorFatalError(preflight_err)
-            inner = CodexLLMClient(codex_cmd, model)
+            inner = CodexLLMClient(codex_cmd, config.CODEX_MODEL)
         else:
             inner = AnthropicClient()
         return PipelineLLMClient(inner, run_id=run_id, agent=agent,

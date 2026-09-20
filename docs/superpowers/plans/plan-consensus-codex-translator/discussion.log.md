@@ -380,3 +380,17 @@ checkpoint+raise) a nefatalni (Exception - checkpoint+return, zadny
 re-raise). _checkpoint_flagged() ted vraci tvarovany vysledek. Tri
 existujici testy upraveny. NIT: max(1, ...) proti nulovemu token
 odhadu pro kratky neprazdny text.
+
+## Round 28
+
+- Codex: [round-28-codex.md](round-28-codex.md) — CONSENSUS
+- Claude: [round-28-claude.md](round-28-claude.md) — CONSENSUS
+
+Opraveno: NIT - _polish_preflight() vraci orezany CODEX_MODEL, ale
+Task 1's price-table klic pouziva RAW hodnotu - latentni, dnes
+nereachovatelny mismatch (CODEX_MODEL nema whitespace), opraveno pro
+konzistenci (_client_factory ted staví CodexLLMClient primo z config.
+CODEX_MODEL, ne z preflightu). Vlastni nezavisly pruchod nenasel zadny
+novy BLOCKING/IMPORTANT bod. OBE strany CONSENSUS ve stejnem kole.
+
+## VYSLEDEK: CONSENSUS po 28 kolech.
