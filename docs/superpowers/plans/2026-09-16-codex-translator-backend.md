@@ -958,6 +958,63 @@ def test_transakce_b_prep_fatal_error_preserves_final_translation(tmp_path, monk
     assert row["translated_text"] == "finální překlad"
 
 
+def test_checkpoint_glossary_fetch_failure_preserves_existing_mentions(
+        tmp_path, monkeypatch):
+    """Kolo 26 IMPORTANT (plan-consensus) - `_checkpoint_flagged()`'s
+    vlastní `glossary.all_terms()` re-fetch (kolo 25) může SAMO selhat -
+    pád na `gl_rows=[]` by `concordance.build_mentions()` vrátilo
+    prázdný seznam a `commit_chapter_result()` (VŽDY smaže existující
+    `term_mentions` před vložením, kolo 18) by je nenávratně smazal.
+    Fallback musí být `existing_mentions` (snapshot PŘED `begin_
+    chapter()`), NE `[]` - stejná třída chyby jako kolo-18's původní
+    nález, teď uvnitř checkpointu samotného."""
+    db = _db(tmp_path)
+    state.replace_term_mentions(db, 1, [{"term_id": "cand_x", "cz_form": "Y",
+                                         "scene_idx": 0, "source": "rendered"}])
+    from src import glossary
+    def boom(*a, **k): raise RuntimeError("DB nedostupná")
+    monkeypatch.setattr(glossary, "all_terms", boom)
+    monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
+        "scénový překlad", [], [], []))
+    ch = state.get_chapter(db, 1)
+    with __import__("pytest").raises(RuntimeError):
+        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    row = state.get_chapter(db, 1)
+    assert row["status"] == "flagged"
+    assert row["translated_text"] == "scénový překlad"
+    mentions = state.chapter_mentions(db, 1)
+    assert any(m["term_id"] == "cand_x" for m in mentions)
+
+
+def test_checkpoint_preserves_question_from_concordance_finding(tmp_path, monkeypatch):
+    """Kolo 26 IMPORTANT (plan-consensus) - normální transakce B
+    (`src/pipeline.py:157-162`) překlápí `findings` položky s `action==
+    "question"` (z `concordance.check_chapter()`, NE z translatoru) do
+    DB otázek stejně jako `questions_now`. `_checkpoint_flagged()` bez
+    týhle větve by zachráněný `cz` uložil s nálezem v `notes`, ale BEZ
+    odpovídající strukturované otázky v `questions` tabulce -
+    nekonzistence oproti normálnímu dokončení."""
+    db = _db(tmp_path)
+    from src.llm.client import FatalRunError
+    from src import concordance
+    monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
+        "scénový překlad", [], [], []))
+    finding_q = [{"source": "concordance", "type": "omission", "severity": "guess",
+                  "action": "question", "term_id": "cand_y", "expected": None,
+                  "actual": "Y?", "cz_excerpt": "x",
+                  "issue": "Termín 'Y' se v překladu nenašel. OK?", "suggestion": None}]
+    monkeypatch.setattr(concordance, "check_chapter", lambda *a, **k: finding_q)
+    def boom(*a, **k): raise FatalRunError("codex auth expired")
+    monkeypatch.setattr(C, "review", boom)
+    ch = state.get_chapter(db, 1)
+    with __import__("pytest").raises(FatalRunError):
+        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    open_qs = state.unanswered_questions(db)
+    assert any(q["scope_key"] == "cand_y" for q in open_qs)
+
+
 def test_pre_loop_critic_fatal_error_preserves_scene_translation(tmp_path, monkeypatch):
     """Kolo 22 IMPORTANT (plan-consensus) - PRVNÍ `_run_critic()` volání
     (PŘED revizní smyčkou) nebylo chráněné VŮBEC - kola 13/18/20/21's
@@ -1244,6 +1301,13 @@ def process_chapter(db_path: str, chapter: dict, *, client_factory, guide: dict)
     existing_questions = [q for q in state.unanswered_questions(db_path)
                           if q.get("chapter_idx") == idx]
 
+    # Kolo 26 IMPORTANT (plan-consensus) - snapshot existujících `term_
+    # mentions` PŘED `begin_chapter()`, ze STEJNÉHO důvodu jako `existing_
+    # questions` výš - `_checkpoint_flagged()` (níž) potřebuje BEZPEČNÝ
+    # fallback pro případ, že si vlastní `glossary.all_terms()` fetch
+    # nepovede (viz kolo 25/26's vysvětlení u `_checkpoint_flagged()`).
+    existing_mentions = state.chapter_mentions(db_path, idx)
+
     state.begin_chapter(db_path, idx)          # transakce A
 ```
 
@@ -1404,7 +1468,24 @@ nahraď:
         `rendered` se naopak BEZPEČNĚ čerpá z vnějšího scope - vždy má
         ASPOŇ scénové (neverifikované) hodnoty, i když `_verified_
         rendered()` samo selže (LHS přiřazení v tom případě neproběhne,
-        `rendered` si drží svou PŘEDCHOZÍ platnou hodnotu)."""
+        `rendered` si drží svou PŘEDCHOZÍ platnou hodnotu).
+
+        Kolo 26 IMPORTANT (plan-consensus) - když `glossary.all_terms()`
+        selže, NEPADAT na `gl_rows=[]` → `build_mentions(..., [], ...)`
+        → prázdný rebuild → `commit_chapter_result()` VŽDY smaže
+        existující `term_mentions` PŘED vložením (kolo 18) → prázdný
+        seznam by je nenávratně smazal. Fallback je místo toho
+        `existing_mentions` (snapshot PŘED `begin_chapter()`, stejný
+        vzor jako `existing_questions`) - horší než čerstvý rebuild
+        (nemusí odrážet TENHLE run), ale nekonečně lepší než `[]`.
+
+        Kolo 26 IMPORTANT (plan-consensus) - `questions_now` (z
+        translatoru) NEBYL jediný zdroj otázek v normální transakci B -
+        `findings_now` položky s `action=="question"` (z `concordance.
+        check_chapter()`, ne z translatoru) se tam TAKY překlápí do
+        DB otázek. Bez týhle větve by zachráněný `cz` mohl mít uložený
+        minor/candidate nález BEZ odpovídající otázky v `questions`
+        tabulce - nekonzistence oproti normálnímu dokončení."""
         pseudo = {"source": "pipeline", "type": "fluency", "severity": "critical",
                  "action": "note", "term_id": None, "expected": None,
                  "actual": None, "cz_excerpt": None,
@@ -1414,17 +1495,24 @@ nahraď:
         saved_findings = findings_mod.assign_ids(findings_now + [pseudo])
         try:
             gl_rows = glossary.all_terms(db_path)
+            rebuilt_mentions = concordance.build_mentions(en, cz_now, gl_rows, rendered)
+            rebuilt_mentions = [{"term_id": m.term_id, "cz_form": m.cz_form,
+                                 "scene_idx": m.scene_idx, "source": m.source}
+                                for m in rebuilt_mentions]
         except Exception:
-            gl_rows = []
-        rebuilt_mentions = concordance.build_mentions(en, cz_now, gl_rows, rendered)
-        rebuilt_mentions = [{"term_id": m.term_id, "cz_form": m.cz_form,
-                             "scene_idx": m.scene_idx, "source": m.source}
-                            for m in rebuilt_mentions]
+            rebuilt_mentions = existing_mentions
         fresh_db_questions = [{"chapter_idx": idx, "kind": q.get("kind") or "other",
                                "scope_key": _scope_key_for(q), "text": q.get("text") or "",
                                "guess_answer": q.get("guess_answer"),
                                "severity": q.get("severity") or "guess"}
                               for q in questions_now]
+        fresh_db_questions += [
+            {"chapter_idx": idx, "kind": "term",
+             "scope_key": _scope_key_for({"scope_key": f.get("term_id"),
+                                          "text": f.get("issue")}),
+             "text": f.get("issue") or "", "guess_answer": f.get("actual"),
+             "severity": "guess"}
+            for f in findings_now if f.get("action") == "question"]
         state.commit_chapter_result(
             db_path, idx, translated_text=cz_now, revision_rounds=rounds_now,
             notes_json=json.dumps(saved_findings, ensure_ascii=False),

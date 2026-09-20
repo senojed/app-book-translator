@@ -351,3 +351,17 @@ misto v cele funkci) - _checkpoint_flagged() ted taky robustni vuci
 glossary_rows nebound scenari (fetchuje si ho znovu sam). Doplnen
 chybejici KeyboardInterrupt test pro pre-loop kritika z kola 24. Pokryti
 ted zahrnuje VSECHNA mista v process_chapter() po begin_chapter().
+
+## Round 26
+
+- Codex: [round-26-codex.md](round-26-codex.md) — CHANGES_NEEDED
+- Claude: [round-26-claude.md](round-26-claude.md) — CHANGES_NEEDED
+
+Opraveno: dva IMPORTANT body, oba regrese v kole 25's vlastnim kodu.
+gl_rows=[] fallback by nenavratne smazal existujici term_mentions
+(stejna trida chyby jako kolo 18) - opraveno snapshotem existing_
+mentions pred begin_chapter(), pouzitym jako fallback misto []. Checkpoint
+take ignoroval findings-odvozene otazky (action=="question" polozky z
+concordance.check_chapter(), druhy zdroj otazek vedle questions_now z
+translatoru) - opraveno rozsirenim fresh_db_questions. Dva regresni
+testy.
