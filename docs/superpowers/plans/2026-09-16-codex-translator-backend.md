@@ -2632,7 +2632,16 @@ def _cmd_run(args) -> int:
         # ověřeného Codex volání.
         _, _, preflight_err = _polish_preflight()
         if preflight_err:
-            _say(preflight_err)
+            # Kolo 19 NIT (plan-consensus) - `_polish_preflight()`'s
+            # hláška začíná "polish je vypnutý..." (sdílená s `_cmd_
+            # polish`, main.py:1152) - matoucí pro `run --translator
+            # codex`, co `polish` vůbec nevolá. Krátký kontextový
+            # prefix MÍSTO parametrizace `_polish_preflight()`'s
+            # signatury (ta by si vyžádala update KAŽDÉHO existujícího
+            # test mocku `lambda: (...)` napříč Tasky 4/5 - moc
+            # invazivní pro NIT).
+            _say(f"--translator codex sdílí stejnou FS-risk bránu jako "
+                f"polish:\n{preflight_err}")
             return 1
     if args.retry_flagged is not None:
         n = state.retry_flagged(db, args.retry_flagged or None)
@@ -2902,6 +2911,14 @@ for row in conn.execute(
         ('translator',)):
     print(row)
 "
+# Kolo 19 IMPORTANT (plan-consensus) - EXPLICITNÍ prefix, ne spoléhání
+# na to, že si uživatel domyslí "se stejným BOOK_TRANSLATOR_PROJECT_DIR
+# nastaveným" z prózy níž - bash tenhle blok nastavuje proměnnou INLINE
+# per-příkaz (ne `export`), takže bez prefixu by `polish` běžel nad
+# OSTROU `data/state.sqlite3` a REÁLNĚ ji zapsal (polish, na rozdíl od
+# `status`, mění stav kapitoly).
+BOOK_TRANSLATOR_PROJECT_DIR=/tmp/codex-translator-smoke \
+  python main.py polish --only <idx>
 ```
 
 PowerShell (kolo 2 IMPORTANT, plan-consensus - projekt běží primárně na
@@ -2932,15 +2949,16 @@ for row in conn.execute(
         ('translator',)):
     print(row)
 "
+python main.py polish --only <idx>
 ```
 
 Zkontroluj: kapitola má rozumný český text, `new_terms`/`questions` (pokud
 kapitola nějaké má) vypadají smysluplně, `llm_calls` řádek pro
 `agent='translator'` má `provider='codex'` a `cost_usd=0.0` (kolo 7
 IMPORTANT - ověřuje kolo 1's `billed_model` opravu na reálném běhu, ne
-jen v testech), `python main.py polish --only <idx>` (Codex, beze
-změny, se stejným `BOOK_TRANSLATOR_PROJECT_DIR` nastaveným) na výsledku
-projde stejně jako dřív. Teprve PO tomhle ověření zkus `--translator
+jen v testech), `polish --only <idx>` (příkaz výš, Codex, beze změny)
+na výsledku projde stejně jako dřív. Teprve PO tomhle ověření zkus
+`--translator
 codex` i nad reálnou `data/state.sqlite3` (bez `BOOK_TRANSLATOR_PROJECT_
 DIR`/po zavření PowerShell session, co proměnnou nastavila), na jedné
 konkrétní `pending` kapitole.

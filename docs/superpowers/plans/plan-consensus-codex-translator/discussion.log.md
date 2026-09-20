@@ -249,3 +249,17 @@ uspesneho commitu by [] tyhle mentions nenavratne smazal i pres
 zachovany translated_text. Opraveno deterministickym znovusestavenim
 mentions ze zachovaneho cz a existujiciho glosare (concordance.
 build_mentions, stejne volani jako normalni commit cesta).
+
+## Round 19
+
+- Codex: [round-19-codex.md](round-19-codex.md) — CHANGES_NEEDED
+- Claude: [round-19-claude.md](round-19-claude.md) — CHANGES_NEEDED
+
+Opraveno: IMPORTANT - Task 6's bash blok nastavoval
+BOOK_TRANSLATOR_PROJECT_DIR jen inline per-prikaz, ne export - navazujici
+"polish --only <idx>" instrukce v proze (bez ukazaneho prikazu) by se
+snadno spustila bez prefixu, proti ostre data/state.sqlite3 (polish
+realne zapisuje). Opraveno explicitnim prikazem v obou blocich.
+NIT - _polish_preflight()'s hlaska "polish je vypnuty" je matouci pro
+run --translator codex kontext - opraveno kratkym kontextovym prefixem
+pri volani, bez zasahu do sdilene funkce/existujicich testu.
