@@ -108,7 +108,26 @@ FS-risk varování jako `polish`).
   kritikovo `FatalRunError` PO úspěšné revizi by jinak obešlo checkpoint
   a zahodilo nově získané `cz`. Jakákoli jiná výjimka smyčku přeruší a
   kapitola jde do `flagged` s POSLEDNÍM platným překladem, ne do
-  `error` se ztraceným textem.
+  `error` se ztraceným textem. Checkpoint (sdílená `_checkpoint_flagged()`
+  pomocná funkce) navíc chrání i PRVNÍ `_run_critic()` volání PŘED
+  revizní smyčkou (kolo 22 IMPORTANT, plan-consensus) - bez tohohle by
+  kritikovo selhání HNED PO úspěšném scénovém překladu (chybějící klíč,
+  cost guard) zahodilo `cz` a kapitola by zůstala `processing` limbo.
+  Obnovené `questions` jsou SLOUČENÍ snapshotu (kolo 20) a otázek z
+  POSLEDNÍHO platného `cz` (kolo 22 IMPORTANT, plan-consensus) - snapshot
+  samotný nese jen otázky z PŘEDCHOZÍHO DB běhu, ne nové nejistoty z
+  právě zachovaného scénového/revidovaného výsledku.
+- `_cmd_run`'s eager preflight (kolo 3/8) ověří JEN Codex stranu - kritik
+  zůstává VŽDY `AnthropicClient`, i při `--translator codex` (viz výš), a
+  konstruuje se LÍNĚ až při prvním `client_factory("critic")` volání, PO
+  dokončení scénového překladu. Eager kontrola `config.ANTHROPIC_API_KEY`
+  PŘED zpracováním fronty (kolo 22 IMPORTANT, plan-consensus - viz Task 5)
+  - bez ní by chybějící klíč nechal proběhnout celý zaplacený Codex
+  překlad, než by run selhal na kritikovi. PŘÍMÁ kontrola klíče (stejná
+  podmínka jako `AnthropicClient.__init__`), NE konstrukce skutečného
+  `AnthropicClient()` - ta by zavedla novou závislost na klíči do
+  existujících testů, co dnes mockují `pipeline.process_chapter` a klíč
+  nikdy reálně nepotřebují.
 - `--translator codex` se ověřuje (`STYLIST_ACCEPT_FS_RISK`/`CODEX_MODEL`/
   CLI) HNED na začátku `_cmd_run`, ne líně až při prvním volání (kolo 3
   IMPORTANT, plan-consensus - viz Task 5) - prázdná/vyfiltrovaná fronta
@@ -773,11 +792,58 @@ def test_revision_fatal_error_from_critic_after_successful_revision_preserves_ne
     row = state.get_chapter(db, 1)
     assert row["status"] == "flagged"
     assert row["translated_text"] == "revidovaný překlad"
+
+
+def test_pre_loop_critic_fatal_error_preserves_scene_translation(tmp_path, monkeypatch):
+    """Kolo 22 IMPORTANT (plan-consensus) - PRVNÍ `_run_critic()` volání
+    (PŘED revizní smyčkou) nebylo chráněné VŮBEC - kola 13/18/20/21's
+    checkpointy jsou UVNITŘ `while` smyčky. Fatální chyba kritika (VŽDY
+    Claude, i při `--translator codex`) HNED po úspěšném (a zaplaceném
+    přes Codex) scénovém překladu by `cz` zahodila stejně jako mezery,
+    co předchozí kola opravila uvnitř smyčky - jen o krok DŘÍV."""
+    db = _db(tmp_path)
+    from src.llm.client import FatalRunError
+    monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
+        "scénový překlad", [], [], []))
+    def boom(*a, **k): raise FatalRunError("codex auth expired")
+    monkeypatch.setattr(C, "review", boom)
+    ch = state.get_chapter(db, 1)
+    with __import__("pytest").raises(FatalRunError):
+        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    row = state.get_chapter(db, 1)
+    assert row["status"] == "flagged"
+    assert row["translated_text"] == "scénový překlad"
+
+
+def test_pre_loop_critic_fatal_error_preserves_new_question_from_current_attempt(
+        tmp_path, monkeypatch):
+    """Kolo 22 IMPORTANT (plan-consensus) - `existing_questions` (kolo 20)
+    samo neslo NOVÉ nejistoty z AKTUÁLNÍHO (právě zachráněného) výsledku -
+    jen STARÉ z PŘED `begin_chapter()`. Fatální chyba po úspěšném
+    scénovém překladu s NOVOU otázkou (z `translate_scene()`'s `res.
+    questions`) by tu novou otázku ztratila, i když překlad, na který se
+    ptá, se zachová - nekonzistence mezi uloženým textem a otázkami o
+    něm."""
+    db = _db(tmp_path)
+    from src.llm.client import FatalRunError
+    monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
+        "překlad s otázkou", [], [],
+        [{"kind": "term", "scope_key": "cand_new", "guess_answer": "Y",
+          "text": "Nový termín?", "severity": "guess"}]))
+    def boom(*a, **k): raise FatalRunError("codex auth expired")
+    monkeypatch.setattr(C, "review", boom)
+    ch = state.get_chapter(db, 1)
+    with __import__("pytest").raises(FatalRunError):
+        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    open_qs = state.unanswered_questions(db)
+    assert any(q["scope_key"] == "cand_new" for q in open_qs)
 ```
 
 - [ ] **Step 2: Ověř selhání**
 
-Run: `pytest tests/test_translator.py tests/test_pipeline.py -k "end_marker or duplicate_end or content_after_end or missing_metadata_marker or duplicate_translation_marker or duplicate_metadata_marker or markers_out_of_order or invalid_translation_output_type or system_prompts_instruct or marker_like_text or crlf_line_endings or metadata_not_a_dict or metadata_field or revision_recoverable or revision_fatal" -v`
+Run: `pytest tests/test_translator.py tests/test_pipeline.py -k "end_marker or duplicate_end or content_after_end or missing_metadata_marker or duplicate_translation_marker or duplicate_metadata_marker or markers_out_of_order or invalid_translation_output_type or system_prompts_instruct or marker_like_text or crlf_line_endings or metadata_not_a_dict or metadata_field or revision_recoverable or revision_fatal or pre_loop_critic" -v`
 Expected: FAIL - `translator.MARK_END` neexistuje (`AttributeError`),
 `_parse()` ještě netestuje konec/strukturu, revizní smyčka v
 `pipeline.py` ještě neobaluje `revise_chapter()` voláním (výjimka
@@ -1017,6 +1083,101 @@ def process_chapter(db_path: str, chapter: dict, *, client_factory, guide: dict)
     state.begin_chapter(db_path, idx)          # transakce A
 ```
 
+**Kolo 22 IMPORTANT (plan-consensus) - proč PRVNÍ `_run_critic()` volání
+(PŘED revizní smyčkou) taky potřebuje checkpoint:** Kolo 13/18/20/21's
+opravy chrání jen `while` smyčku - `_run_critic(en, cz, client_factory
+("critic"))` volání PŘED smyčkou (`process_chapter`'s "kontrola" blok)
+zůstalo ÚPLNĚ NECHRÁNĚNÉ. Fatální chyba kritika (chybějící/neplatný
+`ANTHROPIC_API_KEY`, cost guard - VŽDY Claude, i při `--translator
+codex`) HNED po úspěšném (a zaplaceném přes Codex) scénovém překladu
+by `cz` zahodila STEJNĚ jako mezery, co kola 13/18/20/21 opravily uvnitř
+smyčky - jen o krok DŘÍV.
+
+**Kolo 22 IMPORTANT (plan-consensus) - proč `questions=existing_
+questions` (kolo 20) samo nestačí:** Snapshot z ÚVODU funkce nese jen
+STARÉ otázky (z DŘÍVĚJŠÍHO úspěšného běhu, pokud existoval). Ignoruje
+lokální `questions` proměnnou - NOVÉ nejistoty (`guess`/`blocking`),
+co AKTUÁLNÍ (právě zachráněný) scénový překlad nebo úspěšné revizní
+kolo SKUTEČNĚ vygenerovaly. `translated_text` se zachrání, ale otázky
+O NĚM se ztratí - nekonzistence mezi tím, co je ULOŽENÉ, a tím, na co
+se PTÁME.
+
+**Oprava:** Sdílená pomocná funkce `_checkpoint_flagged()` (nahrazuje
+TŘI oddělené kopie stejné logiky - dřívější revizní-smyčkové provedení,
+teď navíc i pre-loop kritik) - `questions` parametr je SLOUČENÍ
+`existing_questions` (staré) A `questions_now` (aktuální, právě
+zachráněný výsledek).
+
+V `src/pipeline.py`, `process_chapter`'s "kontrola" blok - najdi:
+
+```python
+    cz = "\n\n".join(p for p in parts if p)
+    rendered = _verified_rendered(rendered, cz)
+
+    # --- kontrola: deterministicky + nezávislý kritik ---
+    glossary_rows = glossary.all_terms(db_path)
+    findings = concordance.check_chapter(en, cz, glossary_rows, rendered)
+    critic_findings, critic_failed = _run_critic(en, cz, client_factory("critic"))
+    findings += critic_findings
+```
+
+nahraď:
+
+```python
+    cz = "\n\n".join(p for p in parts if p)
+    rendered = _verified_rendered(rendered, cz)
+
+    # --- kontrola: deterministicky + nezávislý kritik ---
+    glossary_rows = glossary.all_terms(db_path)
+    findings = concordance.check_chapter(en, cz, glossary_rows, rendered)
+
+    def _checkpoint_flagged(cz_now, findings_now, questions_now, rounds_now, error):
+        """Kolo 22 IMPORTANT (plan-consensus) - sdílená pomocná funkce
+        (dřív duplikovaná pro pre-loop kritika a revizní smyčku zvlášť,
+        kolo 13/18/20/21) - uloží POSLEDNÍ platný `cz_now` jako `flagged`
+        PŘED re-raise fatální chyby: mentions se DETERMINISTICKY znovu
+        sestaví z `cz_now`/glosáře (žádní noví kandidáti - ty se dají
+        dohnat později), otázky jsou SLOUČENÍ `existing_questions`
+        (snapshot z ÚVODU funkce, PŘED `begin_chapter()`) A
+        `questions_now` (nejistoty z AKTUÁLNÍHO, právě zachráněného
+        výsledku - kolo 22 IMPORTANT, ne jen stará data)."""
+        pseudo = {"source": "pipeline", "type": "fluency", "severity": "critical",
+                 "action": "note", "term_id": None, "expected": None,
+                 "actual": None, "cz_excerpt": None,
+                 "issue": f"zpracování přerušeno fatální chybou ({error}) - "
+                          "poslední platný překlad zachován",
+                 "suggestion": None}
+        saved_findings = findings_mod.assign_ids(findings_now + [pseudo])
+        rebuilt_mentions = concordance.build_mentions(en, cz_now, glossary_rows, rendered)
+        rebuilt_mentions = [{"term_id": m.term_id, "cz_form": m.cz_form,
+                             "scene_idx": m.scene_idx, "source": m.source}
+                            for m in rebuilt_mentions]
+        fresh_db_questions = [{"chapter_idx": idx, "kind": q.get("kind") or "other",
+                               "scope_key": _scope_key_for(q), "text": q.get("text") or "",
+                               "guess_answer": q.get("guess_answer"),
+                               "severity": q.get("severity") or "guess"}
+                              for q in questions_now]
+        state.commit_chapter_result(
+            db_path, idx, translated_text=cz_now, revision_rounds=rounds_now,
+            notes_json=json.dumps(saved_findings, ensure_ascii=False),
+            status="flagged", new_candidates=[], mentions=rebuilt_mentions,
+            questions=existing_questions + fresh_db_questions)
+
+    try:
+        critic_findings, critic_failed = _run_critic(en, cz, client_factory("critic"))
+    except FatalRunError as e:
+        # Kolo 22 IMPORTANT (plan-consensus) - viz vysvětlení výš -
+        # PRVNÍ `_run_critic()` volání (PŘED revizní smyčkou) nebylo
+        # chráněné vůbec.
+        _checkpoint_flagged(cz, findings, questions, 0, type(e).__name__)
+        raise
+    findings += critic_findings
+```
+
+(`from src import findings as findings_mod` potřeba na začátku
+`_checkpoint_flagged()` NEBO na úrovni modulu `pipeline.py` - zkontroluj,
+jestli tam už není, ať se neimportuje dvakrát zbytečně.)
+
 V `src/pipeline.py`, `process_chapter`'s revizní smyčka - najdi (CELOU,
 včetně "ocasu" za `cz = res.translation`, dnes NEobalenou - viz kolo 21
 IMPORTANT níž):
@@ -1101,57 +1262,13 @@ nahraď:
             # s výjimkou, NIKDY se neuloží - `_cmd_run`'s `flagged`
             # status (kolo 10/11) je pak jen KOSMETICKÝ, skutečný
             # PŘEKLAD zůstává ztracený (commit běží až na konci funkce,
-            # `raise`/re-raise ho nikdy nedosáhne). Uložíme HO PŘED
-            # re-raise - minimální "transakce B" (bez nových glosářových
-            # kandidátů/otázek - ty se dají dohnat později, ztráta
-            # CELÉHO překladu ne).
+            # `raise`/re-raise ho nikdy nedosáhne).
             #
-            # Kolo 18 IMPORTANT (plan-consensus) - `mentions=[]` (PŮVODNÍ
-            # kolo-13 verze) NENÍ "jen bez nových mentions" - `state.
-            # commit_chapter_result()` PŘED vložením VŽDY smaže VŠECHNY
-            # existující `term_mentions` řádky pro tuhle kapitolu
-            # (`DELETE FROM term_mentions WHERE chapter_idx=?`, `src/
-            # state.py:660`), bez ohledu na to, co se posílá. Pro
-            # kapitolu, co se PRVNÍKRÁT překládá, žádné existující
-            # mentions nejsou (žádná ztráta) - ALE pro `--retry-flagged`
-            # kapitolu, co UŽ MĚLA mentions z dřívějšího úspěšného
-            # commitu, by prázdný seznam ty existující nenávratně smazal
-            # (konkordanční metadata pro `run_drift_check` atd.), i když
-            # `translated_text` zůstal zachovaný. `mentions=[]` bylo
-            # nepřesné tvrzení, ne jen zjednodušení.
-            #
-            # Oprava: mentions se DETERMINISTICKY znovu sestaví ze
-            # zachovaného `cz` a existujícího glosáře (`glossary_rows`,
-            # bez nových kandidátů - ty jsme se rozhodli nedohánět) -
-            # STEJNÉ volání jako normální "transakce B" prep níž.
-            #
-            # Kolo 20 IMPORTANT (plan-consensus) - `questions=[]`
-            # (PŮVODNÍ kolo-13 verze) byla STEJNÁ třída chyby jako
-            # kolo-18's `mentions=[]`, jen JINÝ zdroj - `begin_chapter()`
-            # (na začátku funkce) UŽ smazal VŠECHNY nezodpovězené
-            # otázky týhle kapitoly; `commit_chapter_result()` je
-            # nesmaže znovu, jen upsertuje, co dostane - `[]` by tedy
-            # OBNOVU nezajistilo vůbec, ztráta by byla TRVALÁ pro
-            # `--retry-flagged` kapitolu s existujícími otázkami.
-            # `existing_questions` (snapshot z ÚVODU funkce, PŘED
-            # `begin_chapter()`) je vrátí zpátky.
-            from src import findings as findings_mod
-            pseudo = {"source": "pipeline", "type": "fluency", "severity": "critical",
-                     "action": "note", "term_id": None, "expected": None,
-                     "actual": None, "cz_excerpt": None,
-                     "issue": f"revize přerušena fatální chybou ({type(e).__name__}) - "
-                              "poslední platný překlad zachován",
-                     "suggestion": None}
-            saved_findings = findings_mod.assign_ids(findings + [pseudo])
-            rebuilt_mentions = concordance.build_mentions(en, cz, glossary_rows, rendered)
-            rebuilt_mentions = [{"term_id": m.term_id, "cz_form": m.cz_form,
-                                 "scene_idx": m.scene_idx, "source": m.source}
-                                for m in rebuilt_mentions]
-            state.commit_chapter_result(
-                db_path, idx, translated_text=cz, revision_rounds=rounds,
-                notes_json=json.dumps(saved_findings, ensure_ascii=False),
-                status="flagged", new_candidates=[], mentions=rebuilt_mentions,
-                questions=existing_questions)
+            # Kolo 22 IMPORTANT (plan-consensus) - stejná checkpoint
+            # logika (mentions rebuild z kola 18, otázky z kola 20+22)
+            # teď žije v `_checkpoint_flagged()` (definovaná výš, sdílená
+            # s pre-loop kritikem) - zabraňuje TŘETÍ kopii stejného kódu.
+            _checkpoint_flagged(cz, findings, questions, rounds, type(e).__name__)
             raise
         except Exception as e:
             # Kolo 3 IMPORTANT (plan-consensus) - `revise_chapter()`
@@ -2538,6 +2655,11 @@ def test_run_translator_flag_passed_to_client_factory(tmp_path, monkeypatch):
     # kontrolu (reálný filesystem/PATH lookup) a v CI bez codex binárky
     # by spadl na "== 0" dřív, než se spy factory vůbec zavolá.
     monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    # Kolo 22 (plan-consensus) - eager preflight teď navíc ověří
+    # ANTHROPIC_API_KEY (kritik je vždy Claude) - test-prostředí ho
+    # nemusí mít, bez mocku by test spadl na "== 0" dřív, než se spy
+    # factory vůbec zavolá.
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")
     import src.pipeline as P
     seen = {}
     def fake_process(db_path, chapter, *, client_factory, guide):
@@ -2620,6 +2742,30 @@ def test_run_translator_codex_fs_risk_checked_even_with_empty_queue(tmp_path, mo
     assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
 
 
+def test_run_translator_codex_missing_anthropic_key_fails_eager(tmp_path, monkeypatch, capsys):
+    """Kolo 22 IMPORTANT (plan-consensus) - eager preflight výš (kolo 3/8)
+    ověří JEN Codex stranu; kritik zůstává VŽDY `AnthropicClient`, i při
+    `--translator codex`, a konstruuje se LÍNĚ (`client_factory("critic")`)
+    až PO dokončení scénového překladu. Bez týhle kontroly by chybějící
+    `ANTHROPIC_API_KEY` nechal proběhnout celý (zaplacený) Codex překlad,
+    než by run selhal na kritikovi."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", None)
+    import src.pipeline as P
+    calls = {"n": 0}
+    def boom(db_path, chapter, *, client_factory, guide):
+        calls["n"] += 1
+        return {"idx": chapter["idx"], "status": "done", "revision_rounds": 0}
+    monkeypatch.setattr(P, "process_chapter", boom)
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
+    assert calls["n"] == 0   # zaplacený Codex překlad se VŮBEC nespustí
+    out = capsys.readouterr().out
+    assert "ANTHROPIC_API_KEY" in out
+
+
 def test_run_translator_codex_error_notes_are_redacted(tmp_path, monkeypatch):
     """Kolo 3 IMPORTANT (plan-consensus) - `extract_json()`'s `ValueError`
     nese až 2000 raw znaků modelové odpovědi; `--translator codex` chyby
@@ -2630,6 +2776,7 @@ def test_run_translator_codex_error_notes_are_redacted(tmp_path, monkeypatch):
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
     monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
     import src.pipeline as P
     def boom(db_path, chapter, *, client_factory, guide):
         raise ValueError("Nevalidní JSON. Raw:\ntajny-obsah-z-codexu")
@@ -2670,6 +2817,7 @@ def test_run_translator_codex_invalid_translation_output_is_fatal(tmp_path, monk
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
     monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
     import src.pipeline as P
     from src.agents.translator import InvalidTranslationOutput
     def boom(db_path, chapter, *, client_factory, guide):
@@ -2695,6 +2843,7 @@ def test_run_translator_codex_fatal_error_flags_chapter_not_silently_retried(
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
     monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
     import src.pipeline as P
     calls = {"n": 0}
     def boom(db_path, chapter, *, client_factory, guide):
@@ -2719,6 +2868,7 @@ def test_run_translator_codex_fatal_error_console_output_is_redacted(
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
     monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
     import src.pipeline as P
     def boom(db_path, chapter, *, client_factory, guide):
         raise CodexTranslatorFatalError("tajny-obsah-z-codexu")
@@ -2740,6 +2890,7 @@ def test_run_translator_codex_generic_fatal_run_error_from_critic_not_flagged(
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
     monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
     import src.pipeline as P
     def boom(db_path, chapter, *, client_factory, guide):
         raise FatalRunError("Cost guard: strop $5.00 překročen")
@@ -2768,6 +2919,7 @@ def test_run_translator_codex_lazy_preflight_failure_flags_chapter(tmp_path, mon
             return ("m", ["codex"], None)   # eager (main._cmd_run) uspěje
         return (None, None, "Codex CLI mezitím přestalo fungovat")   # línÁ (factory) selže
     monkeypatch.setattr("main._polish_preflight", preflight)
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
     assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
     assert state.get_chapter("data/state.sqlite3", 1)["status"] == "flagged"
 
@@ -2862,6 +3014,27 @@ def _cmd_run(args) -> int:
             # invazivní pro NIT).
             _say(f"--translator codex sdílí stejnou FS-risk bránu jako "
                 f"polish:\n{preflight_err}")
+            return 1
+        # Kolo 22 IMPORTANT (plan-consensus) - eager preflight výš
+        # ověří JEN Codex stranu - kritik zůstává VŽDY `AnthropicClient`
+        # (Global Constraints), i při `--translator codex`, a ten se
+        # konstruuje LÍNĚ (`_client_factory`'s `factory("critic")`) až
+        # při PRVNÍM volání - PO dokončení scénového překladu první
+        # kapitoly. Bez týhle kontroly by chybějící `ANTHROPIC_API_KEY`
+        # nechal proběhnout celý (zaplacený) Codex překlad, než by run
+        # selhal na kritikovi.
+        # Kolo 22 (plan-consensus, self-review): PŘÍMÁ kontrola `config.
+        # ANTHROPIC_API_KEY` (stejná podmínka jako `AnthropicClient.
+        # __init__`, src/llm/client.py:51-58), NE konstrukce skutečného
+        # `AnthropicClient()` - ta by nově vyžadovala `ANTHROPIC_API_KEY`
+        # mock v ~6 existujících testech (Task 5), co dnes mockují
+        # `_polish_preflight` na úspěch a `pipeline.process_chapter`
+        # samotné (takže se `client_factory("critic")` nikdy reálně
+        # nezavolá) - bez závislosti na klíči. Přímá kontrola stejnou
+        # podmínku ověří bez týhle vedlejší závislosti.
+        if not config.ANTHROPIC_API_KEY:
+            _say("--translator codex stále vyžaduje funkční Claude API "
+                "pro kritika: Chybí ANTHROPIC_API_KEY v prostředí.")
             return 1
     if args.retry_flagged is not None:
         n = state.retry_flagged(db, args.retry_flagged or None)

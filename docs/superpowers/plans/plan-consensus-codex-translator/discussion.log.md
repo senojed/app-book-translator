@@ -291,3 +291,21 @@ ne nasledujici _run_critic() volani ve stejne iteraci - kritikovo
 zahodilo nove ziskane cz. Opraveno rozsirenim try/except na CELOU
 iteraci revizni smycky (revize + critic recheck), rounds += 1 zustava
 jedine mimo try. Pridan presne pozadovany regresni test.
+
+## Round 22
+
+- Codex: [round-22-codex.md](round-22-codex.md) — CHANGES_NEEDED
+- Claude: [round-22-claude.md](round-22-claude.md) — CHANGES_NEEDED
+
+Opraveno: tri IMPORTANT body. (1) checkpoint rozsiren i na PRVNI
+_run_critic() volani PRED revizni smyckou pres novou sdilenou
+_checkpoint_flagged() pomocnou funkci (nahrazuje treti kopii
+duplikovane logiky). (2) eager preflight (_cmd_run) overi i
+ANTHROPIC_API_KEY pro kritika - zvolena primo kontrola config.
+ANTHROPIC_API_KEY (ne konstrukce AnthropicClient()) kvuli nulovemu
+dopadu na existujici testy; presto 7 existujicich testu dostalo
+ANTHROPIC_API_KEY mock, protoze eager kontrola je nove zasahne. (3)
+checkpoint's obnovene otazky slucuji stary snapshot (kolo 20) s
+otazkami z posledniho platneho cz, ne jen snapshot samotny. Ctvrte
+kolo v rade "kolo N naslo mezeru v kole M's fixu" pro checkpoint
+logiku.
