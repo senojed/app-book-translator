@@ -1679,3 +1679,299 @@ def test_client_factory_translator_backend_codex_preflight_failure_raises_fatal(
     factory = main._client_factory(1, interactive=False, translator_backend="codex")
     with pytest.raises(CodexTranslatorFatalError, match="Codex CLI není použitelné"):
         factory("translator")
+
+
+def test_run_translator_flag_passed_to_client_factory(tmp_path, monkeypatch):
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    # Kolo 4 BLOCKING (plan-consensus) - kolo 3 přidalo eager preflight
+    # na začátek _cmd_run (main._polish_preflight()); bez mocku by test
+    # narazil na SKUTEČNOU STYLIST_ACCEPT_FS_RISK/CODEX_MODEL/CLI
+    # kontrolu (reálný filesystem/PATH lookup) a v CI bez codex binárky
+    # by spadl na "== 0" dřív, než se spy factory vůbec zavolá.
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    # Kolo 22 (plan-consensus) - eager preflight teď navíc ověří
+    # ANTHROPIC_API_KEY (kritik je vždy Claude) - test-prostředí ho
+    # nemusí mít, bez mocku by test spadl na "== 0" dřív, než se spy
+    # factory vůbec zavolá.
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")
+    import src.pipeline as P
+    seen = {}
+    def fake_process(db_path, chapter, *, client_factory, guide):
+        seen["client_factory"] = client_factory
+        state.update_chapter(db_path, chapter["idx"], status="done",
+                             translated_text="hotovo")
+        return {"idx": chapter["idx"], "status": "done", "revision_rounds": 0}
+    monkeypatch.setattr(P, "process_chapter", fake_process)
+    real_factory = main._client_factory
+    captured = {}
+    def spy_factory(rid, *, interactive, require_lock=None, translator_backend="claude"):
+        captured["translator_backend"] = translator_backend
+        return real_factory(rid, interactive=interactive, require_lock=require_lock,
+                            translator_backend=translator_backend)
+    monkeypatch.setattr(main, "_client_factory", spy_factory)
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 0
+    assert captured["translator_backend"] == "codex"
+
+
+def test_run_translator_flag_defaults_to_claude(tmp_path, monkeypatch):
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    import src.pipeline as P
+    monkeypatch.setattr(P, "process_chapter",
+                        lambda db_path, chapter, *, client_factory, guide: {
+                            "idx": chapter["idx"], "status": "done", "revision_rounds": 0})
+    real_factory = main._client_factory
+    captured = {}
+    def spy_factory(rid, *, interactive, require_lock=None, translator_backend="claude"):
+        captured["translator_backend"] = translator_backend
+        return real_factory(rid, interactive=interactive, require_lock=require_lock,
+                            translator_backend=translator_backend)
+    monkeypatch.setattr(main, "_client_factory", spy_factory)
+    assert _run(["run"], tmp_path, monkeypatch) == 0   # BEZ --translator
+    assert captured["translator_backend"] == "claude"
+
+
+def test_run_translator_codex_without_fs_risk_optin_is_fatal(tmp_path, monkeypatch):
+    """Stejná brána jako `polish` - `--translator codex` bez opt-inu
+    nesmí tiše spadnout zpátky na Claude ani projít bez varování.
+    Kolo 3 IMPORTANT (plan-consensus) - `_cmd_run` teď ověřuje eager,
+    PŘED frontou (main.py, ne líné `_client_factory`), takže `pipeline.
+    process_chapter` se v tomhle testu vůbec nezavolá."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "STYLIST_ACCEPT_FS_RISK", False)
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
+    assert state.get_chapter("data/state.sqlite3", 1)["status"] in ("pending", "processing")
+
+
+def test_run_translator_codex_preflight_failure_still_recovers_processing(
+        tmp_path, monkeypatch):
+    """Kolo 8 IMPORTANT (plan-consensus) - kapitola uvízlá v `processing`
+    z dřívějšího pádu MUSÍ být zotavená (vrácená do `pending`) i když
+    `--translator codex` preflight selže - `state.recover_processing`
+    je vždy úplně první krok KAŽDÉHO `run`, bez výjimky (jinak by
+    zůstala navěky neviditelná pro `queue_for_run`, co vrací jen
+    "pending"/"error", nikdy "processing")."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    state.set_status("data/state.sqlite3", 1, "processing")
+    monkeypatch.setattr(config, "STYLIST_ACCEPT_FS_RISK", False)
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
+    assert state.get_chapter("data/state.sqlite3", 1)["status"] == "pending"
+
+
+def test_run_translator_codex_fs_risk_checked_even_with_empty_queue(tmp_path, monkeypatch):
+    """Kolo 3 IMPORTANT (plan-consensus) - bez eager kontroly by prázdná
+    fronta (kapitola už `done`) preflight úplně obešla - `client_factory
+    ("translator")` by se nikdy nezavolalo, `--translator codex` by
+    tiše "uspělo" (0 kapitol) bez jediného ověřeného Codex volání."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    state.update_chapter("data/state.sqlite3", 1, status="done", translated_text="x")
+    monkeypatch.setattr(config, "STYLIST_ACCEPT_FS_RISK", False)
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
+
+
+def test_run_translator_codex_missing_anthropic_key_fails_eager(tmp_path, monkeypatch, capsys):
+    """Kolo 22 IMPORTANT (plan-consensus) - eager preflight výš (kolo 3/8)
+    ověří JEN Codex stranu; kritik zůstává VŽDY `AnthropicClient`, i při
+    `--translator codex`, a konstruuje se LÍNĚ (`client_factory("critic")`)
+    až PO dokončení scénového překladu. Bez týhle kontroly by chybějící
+    `ANTHROPIC_API_KEY` nechal proběhnout celý (zaplacený) Codex překlad,
+    než by run selhal na kritikovi."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", None)
+    import src.pipeline as P
+    calls = {"n": 0}
+    def boom(db_path, chapter, *, client_factory, guide):
+        calls["n"] += 1
+        return {"idx": chapter["idx"], "status": "done", "revision_rounds": 0}
+    monkeypatch.setattr(P, "process_chapter", boom)
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
+    assert calls["n"] == 0   # zaplacený Codex překlad se VŮBEC nespustí
+    out = capsys.readouterr().out
+    assert "ANTHROPIC_API_KEY" in out
+
+
+def test_run_translator_codex_error_notes_are_redacted(tmp_path, monkeypatch):
+    """Kolo 3 IMPORTANT (plan-consensus) - `extract_json()`'s `ValueError`
+    nese až 2000 raw znaků modelové odpovědi; `--translator codex` chyby
+    musí projít stejnou redakcí jako `_cmd_polish` (`stylist.
+    _redact_detail`), jinak by `chapters.notes` dostalo raw Codex výstup
+    bez ohledu na `config.STYLIST_REPORT_REJECTED_TEXT`."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
+    import src.pipeline as P
+    def boom(db_path, chapter, *, client_factory, guide):
+        raise ValueError("Nevalidní JSON. Raw:\ntajny-obsah-z-codexu")
+    monkeypatch.setattr(P, "process_chapter", boom)
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 0
+    notes = state.get_chapter("data/state.sqlite3", 1)["notes"]
+    assert "tajny-obsah-z-codexu" not in notes
+    assert "potlačeny" in notes
+
+
+def test_run_translator_claude_error_notes_not_redacted(tmp_path, monkeypatch):
+    """Beze změny chování pro default `claude` backend - žádná regrese v
+    debugovatelnosti běžných Claude chyb (nemají s FS-risk nic společného)."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    import src.pipeline as P
+    def boom(db_path, chapter, *, client_factory, guide):
+        raise ValueError("nejaka claude chyba")
+    monkeypatch.setattr(P, "process_chapter", boom)
+    assert _run(["run"], tmp_path, monkeypatch) == 0   # BEZ --translator
+    notes = state.get_chapter("data/state.sqlite3", 1)["notes"]
+    assert "nejaka claude chyba" in notes
+
+
+def test_run_translator_codex_invalid_translation_output_is_fatal(tmp_path, monkeypatch):
+    """Kolo 6 IMPORTANT (plan-consensus) - InvalidTranslationOutput ze
+    scénové smyčky (translator._parse(), formát driftl) NESMÍ skončit
+    jako per-kapitolový error - state.queue_for_run by ji jinak tiše
+    zkoušel znovu při KAŽDÉM příštím run, na VŠECH takhle postižených
+    kapitolách (stejné riziko jako kolo 2's StylistError fix, jiná
+    příčina).
+
+    Kolo 10 IMPORTANT (plan-consensus) - status je teď `flagged`, ne
+    `pending`/`processing` - persistentní záznam, že tahle KONKRÉTNÍ
+    kapitola spadla, vyžaduje explicitní `--retry-flagged`."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
+    import src.pipeline as P
+    from src.agents.translator import InvalidTranslationOutput
+    def boom(db_path, chapter, *, client_factory, guide):
+        raise InvalidTranslationOutput("chybí ===KONEC===")
+    monkeypatch.setattr(P, "process_chapter", boom)
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
+    assert state.get_chapter("data/state.sqlite3", 1)["status"] == "flagged"
+
+
+def test_run_translator_codex_fatal_error_flags_chapter_not_silently_retried(
+        tmp_path, monkeypatch):
+    """Kolo 10 IMPORTANT (plan-consensus) - kapitola, na které vyletí
+    CodexTranslatorFatalError (rozbitý CLI/auth), musí dostat
+    persistentní `flagged` status, NE zůstat `processing`→`pending`
+    limbo, co by DALŠÍ `run` (bez explicitního `--retry-flagged`) tiše
+    znovu zkusil.
+
+    Kolo 11 IMPORTANT (plan-consensus) - mock používá SPECIFICKY
+    `CodexTranslatorFatalError` (ne holý `FatalRunError`) - `_cmd_run`
+    teď rozlišuje podle TYPU, ne podle `args.translator`."""
+    from src.llm.client import CodexTranslatorFatalError
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
+    import src.pipeline as P
+    calls = {"n": 0}
+    def boom(db_path, chapter, *, client_factory, guide):
+        calls["n"] += 1
+        raise CodexTranslatorFatalError("codex auth expired")
+    monkeypatch.setattr(P, "process_chapter", boom)
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
+    assert state.get_chapter("data/state.sqlite3", 1)["status"] == "flagged"
+    assert calls["n"] == 1
+
+
+def test_run_translator_codex_fatal_error_console_output_is_redacted(
+        tmp_path, monkeypatch, capsys):
+    """Kolo 16 IMPORTANT (plan-consensus) - bare `raise` (beze změny
+    zprávy) by re-raisovalo PŮVODNÍ, NEREDIGOVANOU výjimku - `_cmd_run`'s
+    outer `except FatalRunError as e: print(f"Fatální chyba běhu: {e}")`
+    (main.py) by ji vypsal RAW na konzoli, i když `chapters.notes`
+    dostal správně redigovanou verzi. Musí se re-raisovat NOVÁ výjimka
+    s redigovanou zprávou."""
+    from src.llm.client import CodexTranslatorFatalError
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
+    import src.pipeline as P
+    def boom(db_path, chapter, *, client_factory, guide):
+        raise CodexTranslatorFatalError("tajny-obsah-z-codexu")
+    monkeypatch.setattr(P, "process_chapter", boom)
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
+    out = capsys.readouterr().out
+    assert "tajny-obsah-z-codexu" not in out
+    assert "potlačeny" in out
+
+
+def test_run_translator_codex_generic_fatal_run_error_from_critic_not_flagged(
+        tmp_path, monkeypatch):
+    """Kolo 11 IMPORTANT (plan-consensus) - obecný FatalRunError (např.
+    kritikův cost guard - kritik zůstává VŽDY Claude, i při --translator
+    codex) NESMÍ dostat flagged/redakci určenou pro Codex-translator
+    selhání - beze změny oproti chování PŘED tímhle plánem (kapitola
+    zůstane processing, žádná falešná diagnostika o "chybě od Codexu")."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
+    import src.pipeline as P
+    def boom(db_path, chapter, *, client_factory, guide):
+        raise FatalRunError("Cost guard: strop $5.00 překročen")
+    monkeypatch.setattr(P, "process_chapter", boom)
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
+    assert state.get_chapter("data/state.sqlite3", 1)["status"] in ("pending", "processing")
+
+
+def test_run_translator_codex_lazy_preflight_failure_flags_chapter(tmp_path, monkeypatch):
+    """Kolo 12 IMPORTANT (plan-consensus) - eager preflight (main.
+    _cmd_run, kolo 8) může uspět, ale LÍNÁ kontrola uvnitř `_client_
+    factory`'s `factory()` (Task 4) - volaná AŽ při prvním `factory
+    ("translator")`, PO `state.begin_chapter()` (kapitola už `processing`) -
+    může selhat SAMOSTATNĚ (jiné volání, jiný okamžik). I tenhle pád
+    musí kapitolu označit `flagged`, ne ji nechat uvíznout - `factory()`
+    teď vyhazuje `CodexTranslatorFatalError` (Task 4's kolo-12 fix),
+    stejný typ jako `CodexLLMClient.complete()`, takže `_cmd_run`'s
+    typová větev (kolo 11) ho zachytí stejně."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    calls = {"n": 0}
+    def preflight():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ("m", ["codex"], None)   # eager (main._cmd_run) uspěje
+        return (None, None, "Codex CLI mezitím přestalo fungovat")   # línÁ (factory) selže
+    monkeypatch.setattr("main._polish_preflight", preflight)
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
+    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
+    assert state.get_chapter("data/state.sqlite3", 1)["status"] == "flagged"
+
+
+def test_run_translator_claude_invalid_translation_output_stays_per_chapter_error(
+        tmp_path, monkeypatch):
+    """Beze změny chování pro default `claude` backend - formát-drift
+    riziko je specifické pro Codex (spike ho u Claude nepozoroval),
+    takže Claude cesta zůstává na existujícím per-kapitolovém error."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    import src.pipeline as P
+    from src.agents.translator import InvalidTranslationOutput
+    def boom(db_path, chapter, *, client_factory, guide):
+        raise InvalidTranslationOutput("rozbité JSON metadata")
+    monkeypatch.setattr(P, "process_chapter", boom)
+    assert _run(["run"], tmp_path, monkeypatch) == 0   # BEZ --translator
+    assert state.get_chapter("data/state.sqlite3", 1)["status"] == "error"

@@ -31,7 +31,7 @@ from src import findings as findings_mod
 from src import ingest, pipeline, polish_store, requeue, state
 from src import reference as reference_mod
 from src import reference_mine, textnorm
-from src.agents import scout, stylist
+from src.agents import scout, stylist, translator
 from src.llm.client import (AnthropicClient, CodexLLMClient, CodexTranslatorFatalError,
                            FatalRunError, LockLostError, OutputTruncated, PipelineLLMClient)
 
@@ -1025,7 +1025,55 @@ def _cmd_polish_review(args) -> int:
 
 def _cmd_run(args) -> int:
     db = config.DB_PATH
+    # Kolo 8 IMPORTANT (plan-consensus) - `recover_processing` MUSÍ
+    # proběhnout PŘED eager preflight (ne po něm) - jinak by `--translator
+    # codex` s nesplněnou podmínkou (FS_RISK/CLI) vrátilo 1 HNED, a
+    # kapitoly uvízlé v `processing` z dřívějšího pádu by zůstaly uvízlé
+    # (queue_for_run vrací jen "pending"/"error", NE "processing") - na
+    # rozdíl od KAŽDÉHO jiného `run` (i `--translator claude`), co
+    # recovery dělá VŽDY jako úplně první krok. Recovery je levná a
+    # backend-nezávislá - nemá důvod čekat na preflight.
     state.recover_processing(db)
+    if args.translator == "codex":
+        # Kolo 3 IMPORTANT (plan-consensus) - eager, PŘED frontou (stejný
+        # vzor jako `_cmd_polish`) - `_client_factory` je líná, takže bez
+        # tyhle kontroly by prázdná/vyfiltrovaná fronta preflight úplně
+        # obešla a `--translator codex` by tiše "uspělo" bez jediného
+        # ověřeného Codex volání.
+        _, _, preflight_err = _polish_preflight()
+        if preflight_err:
+            # Kolo 19 NIT (plan-consensus) - `_polish_preflight()`'s
+            # hláška začíná "polish je vypnutý..." (sdílená s `_cmd_
+            # polish`, main.py:1152) - matoucí pro `run --translator
+            # codex`, co `polish` vůbec nevolá. Krátký kontextový
+            # prefix MÍSTO parametrizace `_polish_preflight()`'s
+            # signatury (ta by si vyžádala update KAŽDÉHO existujícího
+            # test mocku `lambda: (...)` napříč Tasky 4/5 - moc
+            # invazivní pro NIT).
+            _say(f"--translator codex sdílí stejnou FS-risk bránu jako "
+                f"polish:\n{preflight_err}")
+            return 1
+        # Kolo 22 IMPORTANT (plan-consensus) - eager preflight výš
+        # ověří JEN Codex stranu - kritik zůstává VŽDY `AnthropicClient`
+        # (Global Constraints), i při `--translator codex`, a ten se
+        # konstruuje LÍNĚ (`_client_factory`'s `factory("critic")`) až
+        # při PRVNÍM volání - PO dokončení scénového překladu první
+        # kapitoly. Bez týhle kontroly by chybějící `ANTHROPIC_API_KEY`
+        # nechal proběhnout celý (zaplacený) Codex překlad, než by run
+        # selhal na kritikovi.
+        # Kolo 22 (plan-consensus, self-review): PŘÍMÁ kontrola `config.
+        # ANTHROPIC_API_KEY` (stejná podmínka jako `AnthropicClient.
+        # __init__`, src/llm/client.py:51-58), NE konstrukce skutečného
+        # `AnthropicClient()` - ta by nově vyžadovala `ANTHROPIC_API_KEY`
+        # mock v ~6 existujících testech (Task 5), co dnes mockují
+        # `_polish_preflight` na úspěch a `pipeline.process_chapter`
+        # samotné (takže se `client_factory("critic")` nikdy reálně
+        # nezavolá) - bez závislosti na klíči. Přímá kontrola stejnou
+        # podmínku ověří bez týhle vedlejší závislosti.
+        if not config.ANTHROPIC_API_KEY:
+            _say("--translator codex stále vyžaduje funkční Claude API "
+                "pro kritika: Chybí ANTHROPIC_API_KEY v prostředí.")
+            return 1
     if args.retry_flagged is not None:
         n = state.retry_flagged(db, args.retry_flagged or None)
         print(f"Vráceno do fronty (flagged → pending): {n}")
@@ -1033,7 +1081,8 @@ def _cmd_run(args) -> int:
     status = "fatal"
     try:
         g = guide_mod.load_guide(config.GUIDE_PATH)
-        cf = _client_factory(rid, interactive=True)
+        cf = _client_factory(rid, interactive=True,
+                             translator_backend=args.translator)
         queue = state.queue_for_run(db)
         if args.only:
             # Pilot: přelož jen vyjmenované kapitoly, zbytek nech ve frontě.
@@ -1046,12 +1095,104 @@ def _cmd_run(args) -> int:
         for ch in queue:
             try:
                 summary = pipeline.process_chapter(db, ch, client_factory=cf, guide=g)
+            except CodexTranslatorFatalError as e:
+                # Kolo 11 IMPORTANT (plan-consensus) - SAMOSTATNÁ větev
+                # PŘED obecným `except FatalRunError` níž - TYP sám
+                # garantuje, že chyba vznikla PŘÍMO v Codex-translator
+                # volání (CodexLLMClient), NE v kritikovi (VŽDY Claude,
+                # i při `--translator codex`, viz Global Constraints) -
+                # žádná `if args.translator == "codex":` běhová podmínka
+                # potřeba, typ to už zaručuje (na rozdíl od kola 10's
+                # původní verze, co gatovala podle `args.translator`
+                # a omylem flagovala i Claude-side kritikovy chyby).
+                #
+                # Kolo 10 IMPORTANT (plan-consensus) - BEZ týhle opravy
+                # zůstane kapitola v `processing` - příští `run` (main.py,
+                # kolo 8 fix) ji přes `state.recover_processing()` vrátí
+                # na `pending`, `queue_for_run()` ji ZNOVU zařadí, BEZ
+                # persistentního záznamu, že tahle KONKRÉTNÍ kapitola už
+                # jednou takhle spadla. `flagged` vyžaduje explicitní
+                # `--retry-flagged` - nedbalé "spusť run znova" ji tiše
+                # nezkusí znovu bez vědomého rozhodnutí.
+                #
+                # Kolo 13 - `state.update_chapter()` mění JEN explicitně
+                # předané sloupce (`status`/`notes`), NE `translated_text` -
+                # pokud tahle chyba přišla BĚHEM revize, `pipeline.py`
+                # (Task 2, kolo 13 fix) už `translated_text` uložil PŘED
+                # re-raise, tenhle zápis ho nepřepíše, jen NAHRADÍ `notes`
+                # obecnější run-úrovňovou diagnostikou (přijatý kompromis -
+                # detailní revizní nález se ztratí, `translated_text` ne).
+                #
+                # Kolo 16 IMPORTANT (plan-consensus) - bare `raise`
+                # (holé, beze změny zprávy) by re-raisoval PŮVODNÍ,
+                # NEREDIGOVANÝ `e` - `_cmd_run`'s outer `except
+                # FatalRunError as e: print(f"Fatální chyba běhu:
+                # {e}")` (main.py) by tak vypsal RAW zprávu na konzoli,
+                # i když `notes` (výš) dostal správně redigovanou verzi.
+                # Zdroje jako `factory()`'s líný preflight (Task 4,
+                # kolo 12) NEjdou přes `stylist._redact_detail()` PŘED
+                # konstrukcí výjimky - `detail` výš je JEDINÉ místo, co
+                # redakci zajišťuje. Musí se tedy re-raisovat NOVÁ
+                # výjimka s REDIGOVANOU zprávou, ne ta původní.
+                detail = stylist._redact_detail(str(e))
+                state.update_chapter(db, ch["idx"], status="flagged",
+                                     notes=json.dumps(
+                                         {"error": f"fatální chyba běhu: "
+                                                  f"{type(e).__name__}: {detail}"},
+                                         ensure_ascii=False))
+                raise CodexTranslatorFatalError(detail) from e   # celý běh KONČÍ i tak
             except FatalRunError:
-                raise                      # celý běh končí, kapitola zůstane rozpracovaná
-            except Exception as e:         # OutputTruncated i ValueError sem patří
+                raise                      # BEZE ZMĚNY - kritikova chyba
+                                           # (cost guard, LockLostError),
+                                           # Claude-side, mimo rozsah plánu
+            except translator.InvalidTranslationOutput as e:
+                # Kolo 6 IMPORTANT (plan-consensus) - `translate_scene()`'s
+                # scénová smyčka (pipeline.py) NEMÁ vlastní `cz`/status
+                # checkpoint jako revizní smyčka (Task 2) - žádný `cz`
+                # tam ještě neexistuje, takže formát-drift (Codex přestal
+                # dodržovat ===KONEC=== kontrakt) by jinak skončil jako
+                # obyčejný per-kapitolový `error`, a `state.queue_for_run`
+                # (kolo 2 BLOCKING) by ho tiše zkoušel znovu PŘI KAŽDÉM
+                # příštím `run`u, na VŠECH takhle postižených kapitolách.
+                # (Kolo 23's `try/except` kolem scénové smyčky řeší JEN
+                # obnovu starých otevřených otázek, ne tenhle status
+                # problém - jiná vrstva ochrany, viz Task 2.)
+                # Gated JEN na `codex` - Claude formát-drift riziko je out
+                # of scope (spike ho nepozoroval), Claude cesta spadne do
+                # existující generické větve níž, beze změny.
+                if args.translator == "codex":
+                    # `CodexTranslatorFatalError` (kolo 11), NE holý
+                    # `FatalRunError` - `raise` UVNITŘ týhle except větve
+                    # neprojde přes sesterskou `except CodexTranslatorFatalError`
+                    # výš (raise uvnitř except propadá z CELÉHO try/except),
+                    # takže flagged logiku duplikujeme (stejná jako výš).
+                    detail = stylist._redact_detail(str(e))
+                    state.update_chapter(db, ch["idx"], status="flagged",
+                                         notes=json.dumps(
+                                             {"error": f"neplatný formát překladu: {detail}"},
+                                             ensure_ascii=False))
+                    raise CodexTranslatorFatalError(
+                        f"Neplatný formát překladu od Codexu: {detail}") from e
                 state.update_chapter(db, ch["idx"], status="error",
                                      notes=json.dumps(
                                          {"error": f"{type(e).__name__}: {e}"},
+                                         ensure_ascii=False))
+                print(f"Kapitola {ch['idx']}: chyba ({type(e).__name__}), pokračuji.")
+                continue
+            except Exception as e:         # OutputTruncated i ValueError sem patří
+                # Kolo 3 IMPORTANT (plan-consensus) - `extract_json()`'s
+                # `ValueError` nese až 2000 raw znaků modelové odpovědi;
+                # `--translator codex` chyby musí projít stejnou redakcí
+                # jako `_cmd_polish` (`stylist._redact_detail`), jinak
+                # by `chapters.notes` dostalo raw Codex výstup bez ohledu
+                # na `config.STYLIST_REPORT_REJECTED_TEXT`. Gated JEN na
+                # `codex` - Claude-only `run` (default) zůstává beze
+                # změny, žádná regrese v debugovatelnosti.
+                detail = (stylist._redact_detail(str(e))
+                         if args.translator == "codex" else str(e))
+                state.update_chapter(db, ch["idx"], status="error",
+                                     notes=json.dumps(
+                                         {"error": f"{type(e).__name__}: {detail}"},
                                          ensure_ascii=False))
                 print(f"Kapitola {ch['idx']}: chyba ({type(e).__name__}), pokračuji.")
                 continue
@@ -1563,6 +1704,10 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="vrať flagged kapitoly do fronty (bez IDX = všechny)")
     p_run.add_argument("--only", nargs="+", type=int, default=None,
                        help="přelož jen tyhle kapitoly (pilot); zbytek zůstane ve frontě")
+    p_run.add_argument("--translator", choices=["claude", "codex"],
+                       default="claude",
+                       help="překladatelský backend (default claude; "
+                            "codex vyžaduje STYLIST_ACCEPT_FS_RISK=True)")
     p_run.set_defaults(func=_cmd_run)
 
     p_pol = sub.add_parser("polish", help="stylistický průchod přes Codex (nad hotovými kapitolami)")
