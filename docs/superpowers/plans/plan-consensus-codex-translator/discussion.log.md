@@ -263,3 +263,19 @@ realne zapisuje). Opraveno explicitnim prikazem v obou blocich.
 NIT - _polish_preflight()'s hlaska "polish je vypnuty" je matouci pro
 run --translator codex kontext - opraveno kratkym kontextovym prefixem
 pri volani, bez zasahu do sdilene funkce/existujicich testu.
+
+## Round 20
+
+- Codex: [round-20-codex.md](round-20-codex.md) — CHANGES_NEEDED
+- Claude: [round-20-claude.md](round-20-claude.md) — CHANGES_NEEDED
+
+Opraveno: IMPORTANT - begin_chapter() unconditionally smaze
+nezodpovezene otazky kapitoly hned na zacatku process_chapter(),
+commit_chapter_result() je znovu nesmaze - questions=[] ve fatal-commit
+vetvi (kolo 13) by tedy ztratilo existujici otazky trvale. Opraveno
+snapshotem pred begin_chapter() a obnovou. Sporny bod: staticke markery
+mohou kolidovat s legitimni prozou (nejpravdepodobneji "===KONEC===").
+Souhlas s rizikem, nesouhlas s navrhovanym fixem (per-volani nonce,
+~66 vyskytu k prepsani) jako proporcionalni reakci na nizko-
+pravdepodobne, bezpecne-selhavajici riziko - zdokumentovano jako
+vedome prijate omezeni v Global Constraints (stejny vzor jako kolo-2).

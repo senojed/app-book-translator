@@ -58,7 +58,23 @@ FS-risk varování jako `polish`).
   `re.MULTILINE`), NE substring `in`/`count`/`index` (kolo 9 IMPORTANT,
   plan-consensus - viz Task 2) - substring by odmítl legitimní překlad/
   JSON hodnotu s markerem-podobným textem UPROSTŘED (citace, popis
-  nápisu v knize) jako "poškozený výstup". `_parse()` normalizuje
+  nápisu v knize) jako "poškozený výstup". STATICKÉ markery (`===
+  PREKLAD===`/`===METADATA===`/`===KONEC===`), NE per-volání nonce
+  delimitery - ZVAŽOVÁNO a ZAMÍTNUTO (kolo 20 IMPORTANT, plan-consensus) -
+  legitimní próza s doslovnou standalone řádkou přesně odpovídající
+  markeru (nejpravděpodobněji `===KONEC===` - "konec" je běžné české
+  slovo, na rozdíl od "PREKLAD"/"METADATA") by se odmítla jako duplicitní
+  marker. Riziko je REÁLNÉ, ale NÍZKÉ (vyžaduje PŘESNÝ formát - velká
+  písmena, trojité rovnítko na obou stranách, nic jiného na řádku - ne
+  jen výskyt slova) a selhání je BEZPEČNÉ (kapitola skončí `flagged`/
+  `error` k lidské kontrole, ŽÁDNÁ tichá korupce) - na rozdíl od per-
+  volání nonce (marker s náhodným tagem PRO KAŽDÉ volání zvlášť), co by
+  riziko ELIMINOVAL, ale vyžadoval by přestavět `_FORMAT_RULES`/
+  `SYSTEM_PROMPT_*` ze statických konstant na per-volání generované
+  hodnoty A přepsat ~66 výskytů marker-literálů napříč testy v týhle
+  plánu - mechanická, chybami náchylná změna (kolo 17 už jednou ukázalo,
+  jak snadno se do velkého kopírování vloudí chyba) za nejistý přínos
+  proti nízko-pravděpodobnému, bezpečně-selhávajícímu riziku. `_parse()` normalizuje
   CRLF/CR na LF JAKO PRVNÍ krok, PŘED validací (kolo 11 IMPORTANT,
   plan-consensus - viz Task 2) - `^marker$` by na CRLF řádku bez
   normalizace neprošlo (Windows-primární projekt). `_parse()` validuje i
@@ -81,7 +97,12 @@ FS-risk varování jako `polish`).
   (kolo 18 IMPORTANT, plan-consensus - `state.commit_chapter_result()`
   VŽDY smaže existující `term_mentions` před vložením, takže `[]` by
   při `--retry-flagged` nenávratně smazal konkordanční metadata z
-  dřívějšího úspěšného commitu), jakákoli jiná výjimka smyčku přeruší a
+  dřívějšího úspěšného commitu) - `questions` se OBNOVÍ ze snapshotu
+  pořízeného PŘED `state.begin_chapter()`, NE `[]` (kolo 20 IMPORTANT,
+  plan-consensus - `begin_chapter()` nezodpovězené otázky kapitoly
+  UNCONDITIONALLY smaže hned na začátku funkce, `commit_chapter_
+  result()` je znovu nesmaže, jen upsertuje, co dostane - `[]` by tedy
+  ztrátu vůbec nenapravilo). Jakákoli jiná výjimka smyčku přeruší a
   kapitola jde do `flagged` s POSLEDNÍM platným překladem, ne do
   `error` se ztraceným textem.
 - `--translator codex` se ověřuje (`STYLIST_ACCEPT_FS_RISK`/`CODEX_MODEL`/
@@ -683,6 +704,36 @@ def test_revision_fatal_error_preserves_existing_term_mentions(tmp_path, monkeyp
         pipeline.process_chapter(db, ch, client_factory=_factory, guide={
             "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
     assert 1 in state.chapters_mentioning_term(db, "t1")
+
+
+def test_revision_fatal_error_preserves_existing_open_questions(tmp_path, monkeypatch):
+    """Kolo 20 IMPORTANT (plan-consensus) - `state.begin_chapter()`
+    (úplný začátek `process_chapter()`) UNCONDITIONALLY smaže všechny
+    nezodpovězené otázky kapitoly - `commit_chapter_result()` je znovu
+    nesmaže, jen upsertuje, co dostane. `questions=[]` (kolo-13 původní
+    verze) by tedy TRVALE ztratilo existující otevřené otázky z
+    dřívějšího úspěšného běhu pro `--retry-flagged` scénář (stejná
+    třída chyby jako kolo-18's mentions, jiný zdroj)."""
+    db = _db(tmp_path)
+    from src.llm.client import FatalRunError
+    state.upsert_open_question(db, {
+        "chapter_idx": 1, "kind": "term", "scope_key": "cand_x",
+        "text": "Nový termín 'X' přeložen jako 'Y'. Sedí to?",
+        "guess_answer": "Y", "severity": "guess"})
+    monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
+        "Text.", [], [], []))
+    always_bad = [{"source": "critic", "type": "fidelity", "severity": "critical",
+                   "action": "revise", "term_id": None, "expected": None,
+                   "actual": None, "cz_excerpt": "x", "issue": "chyba", "suggestion": "y"}]
+    monkeypatch.setattr(C, "review", lambda *a, **k: always_bad)
+    def boom(*a, **k): raise FatalRunError("codex auth expired")
+    monkeypatch.setattr(T, "revise_chapter", boom)
+    ch = state.get_chapter(db, 1)
+    with __import__("pytest").raises(FatalRunError):
+        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    open_qs = state.unanswered_questions(db)
+    assert any(q["scope_key"] == "cand_x" for q in open_qs)
 ```
 
 - [ ] **Step 2: Ověř selhání**
@@ -877,6 +928,56 @@ def _parse(raw: str) -> TranslationResult:
         questions=list(meta.get("questions") or []))
 ```
 
+**Kolo 20 IMPORTANT (plan-consensus) - proč `process_chapter()` musí
+snapshotovat otázky PŘED `begin_chapter()`:** `state.begin_chapter()`
+(`src/state.py:600-607`, transakce A, VOLÁ SE JAKO ÚPLNĚ PRVNÍ řádek
+`process_chapter()`'s těla) UNCONDITIONALLY maže `DELETE FROM questions
+WHERE chapter_idx=? AND answer IS NULL` - VŠECHNY dosud nezodpovězené
+otázky týhle kapitoly, ještě PŘED jakýmkoli LLM voláním. Dokumentovaný
+záměr ("rerun kapitoly začíná načisto") počítá s tím, že normální běh
+je NAHRADÍ fresh otázkami z aktuálního výsledku (`db_questions` v
+"transakci B"). Kolo 13/18's fatal-commit větev (revizní smyčka níž)
+ale posílá `questions=[]` (ne jen `mentions=[]`, co kolo 18 už opravilo) -
+`commit_chapter_result()` NEDĚLÁ vlastní `DELETE` na otázkách (jen
+upsertuje, co dostane), takže smazání z `begin_chapter()` zůstává
+TRVALÉ, pokud se nic nevrátí. Pro `--retry-flagged` kapitolu s
+existujícími otevřenými otázkami z dřívějšího úspěšného běhu (např.
+"guess" potvrzení nového termínu) by tak fatální selhání revize
+NENÁVRATNĚ smazalo i tyhle otázky - STEJNÁ třída díry jako kolo-18's
+mentions fix, jen JINÝ zdroj (mentions se mažou AŽ v `commit_chapter_
+result()`, otázky HNED na začátku funkce).
+
+**Oprava:** Snapshot existujících otevřených otázek PŘED `begin_
+chapter()`, obnovení v `questions=` fatal-commit parametru.
+
+V `src/pipeline.py`, `process_chapter`'s ÚVOD, najdi:
+
+```python
+def process_chapter(db_path: str, chapter: dict, *, client_factory, guide: dict) -> dict:
+    idx = chapter["idx"]
+    en = chapter["raw_text"]
+
+    state.begin_chapter(db_path, idx)          # transakce A
+```
+
+nahraď:
+
+```python
+def process_chapter(db_path: str, chapter: dict, *, client_factory, guide: dict) -> dict:
+    idx = chapter["idx"]
+    en = chapter["raw_text"]
+
+    # Kolo 20 IMPORTANT (plan-consensus) - snapshot PŘED `begin_chapter()`
+    # (viz vysvětlení výš) - `begin_chapter()` nezodpovězené otázky týhle
+    # kapitoly nenávratně smaže, revizní smyčka's fatal-commit větev
+    # (níž) je při selhání obnoví, ať se pro --retry-flagged scénář
+    # neztratí navěky.
+    existing_questions = [q for q in state.unanswered_questions(db_path)
+                          if q.get("chapter_idx") == idx]
+
+    state.begin_chapter(db_path, idx)          # transakce A
+```
+
 V `src/pipeline.py`, `process_chapter`'s revizní smyčka - najdi:
 
 ```python
@@ -929,6 +1030,17 @@ nahraď:
             # zachovaného `cz` a existujícího glosáře (`glossary_rows`,
             # bez nových kandidátů - ty jsme se rozhodli nedohánět) -
             # STEJNÉ volání jako normální "transakce B" prep níž.
+            #
+            # Kolo 20 IMPORTANT (plan-consensus) - `questions=[]`
+            # (PŮVODNÍ kolo-13 verze) byla STEJNÁ třída chyby jako
+            # kolo-18's `mentions=[]`, jen JINÝ zdroj - `begin_chapter()`
+            # (na začátku funkce) UŽ smazal VŠECHNY nezodpovězené
+            # otázky týhle kapitoly; `commit_chapter_result()` je
+            # nesmaže znovu, jen upsertuje, co dostane - `[]` by tedy
+            # OBNOVU nezajistilo vůbec, ztráta by byla TRVALÁ pro
+            # `--retry-flagged` kapitolu s existujícími otázkami.
+            # `existing_questions` (snapshot z ÚVODU funkce, PŘED
+            # `begin_chapter()`) je vrátí zpátky.
             from src import findings as findings_mod
             pseudo = {"source": "pipeline", "type": "fluency", "severity": "critical",
                      "action": "note", "term_id": None, "expected": None,
@@ -945,7 +1057,7 @@ nahraď:
                 db_path, idx, translated_text=cz, revision_rounds=rounds,
                 notes_json=json.dumps(saved_findings, ensure_ascii=False),
                 status="flagged", new_candidates=[], mentions=rebuilt_mentions,
-                questions=[])
+                questions=existing_questions)
             raise
         except Exception as e:
             # Kolo 3 IMPORTANT (plan-consensus) - `revise_chapter()`
@@ -1057,6 +1169,12 @@ prazdneho seznamu - state.commit_chapter_result() vzdy smaze existujici
 term_mentions pred vlozenim, takze [] by pri --retry-flagged nenavratne
 smazal konkordancni metadata z drivejsiho uspesneho commitu (plan-
 consensus kolo 18 IMPORTANT).
+
+process_chapter() ted snapshotuje nezodpovezene otazky kapitoly PRED
+begin_chapter() (co je vzdy smaze na zacatku funkce) a fatalni-chyba
+commit je obnovi misto []  - commit_chapter_result() otazky znovu
+nemaze, jen upsertuje co dostane, takze [] by ztratu vubec nenapravilo
+(plan-consensus kolo 20 IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
