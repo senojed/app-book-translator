@@ -102,7 +102,11 @@ FS-risk varování jako `polish`).
   plan-consensus - `begin_chapter()` nezodpovězené otázky kapitoly
   UNCONDITIONALLY smaže hned na začátku funkce, `commit_chapter_
   result()` je znovu nesmaže, jen upsertuje, co dostane - `[]` by tedy
-  ztrátu vůbec nenapravilo). Jakákoli jiná výjimka smyčku přeruší a
+  ztrátu vůbec nenapravilo). Checkpoint OBALUJE CELOU iteraci (revize
+  I následující `_run_critic()` recheck VE STEJNÉM kole), NE JEN
+  `revise_chapter()` samotné (kolo 21 IMPORTANT, plan-consensus) -
+  kritikovo `FatalRunError` PO úspěšné revizi by jinak obešlo checkpoint
+  a zahodilo nově získané `cz`. Jakákoli jiná výjimka smyčku přeruší a
   kapitola jde do `flagged` s POSLEDNÍM platným překladem, ne do
   `error` se ztraceným textem.
 - `--translator codex` se ověřuje (`STYLIST_ACCEPT_FS_RISK`/`CODEX_MODEL`/
@@ -734,6 +738,41 @@ def test_revision_fatal_error_preserves_existing_open_questions(tmp_path, monkey
             "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
     open_qs = state.unanswered_questions(db)
     assert any(q["scope_key"] == "cand_x" for q in open_qs)
+
+
+def test_revision_fatal_error_from_critic_after_successful_revision_preserves_new_cz(
+        tmp_path, monkeypatch):
+    """Kolo 21 IMPORTANT (plan-consensus) - checkpoint (kolo 13) obaloval
+    jen `translator.revise_chapter()`, ne NÁSLEDUJÍCÍ `_run_critic()`
+    volání VE STEJNÉ iteraci. Když Codex ÚSPĚŠNĚ dokončí revizi (nové
+    `cz`) a HNED PO NÍ kritik (VŽDY Claude, i při `--translator codex`)
+    selže na `FatalRunError`, nové `cz` se BEZ týhle opravy nikdy
+    nedostane k commitu - kapitola zůstane `processing`, příští `run`
+    ji celou přeloží znovu od nuly, i když revize už jednou (zaplaceně)
+    uspěla."""
+    db = _db(tmp_path)
+    from src.llm.client import FatalRunError
+    monkeypatch.setattr(T, "translate_scene", lambda *a, **k: T.TranslationResult(
+        "prvotní scénový překlad", [], [], []))
+    monkeypatch.setattr(T, "revise_chapter", lambda *a, **k: T.TranslationResult(
+        "revidovaný překlad", [], [], []))
+    always_bad = [{"source": "critic", "type": "fidelity", "severity": "critical",
+                   "action": "revise", "term_id": None, "expected": None,
+                   "actual": None, "cz_excerpt": "x", "issue": "chyba", "suggestion": "y"}]
+    calls = {"n": 0}
+    def review(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:      # 1. volání = PŘED smyčkou, vyžádá revizi
+            return always_bad
+        raise FatalRunError("codex auth expired po revizi")   # 2. volání = PO úspěšné revizi
+    monkeypatch.setattr(C, "review", review)
+    ch = state.get_chapter(db, 1)
+    with __import__("pytest").raises(FatalRunError):
+        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    row = state.get_chapter(db, 1)
+    assert row["status"] == "flagged"
+    assert row["translated_text"] == "revidovaný překlad"
 ```
 
 - [ ] **Step 2: Ověř selhání**
@@ -978,7 +1017,9 @@ def process_chapter(db_path: str, chapter: dict, *, client_factory, guide: dict)
     state.begin_chapter(db_path, idx)          # transakce A
 ```
 
-V `src/pipeline.py`, `process_chapter`'s revizní smyčka - najdi:
+V `src/pipeline.py`, `process_chapter`'s revizní smyčka - najdi (CELOU,
+včetně "ocasu" za `cz = res.translation`, dnes NEobalenou - viz kolo 21
+IMPORTANT níž):
 
 ```python
     rounds = 0
@@ -988,7 +1029,41 @@ V `src/pipeline.py`, `process_chapter`'s revizní smyčka - najdi:
         res = translator.revise_chapter(en, cz, to_fix, guide_block, glossary_block,
                                         client_factory("translator"))
         cz = res.translation
+        for nt in res.new_terms:                  # nové termíny se KUMULUJÍ
+            key = (nt.get("term_en") or "").strip().casefold()
+            if key and key not in new_terms:
+                new_terms[key] = nt
+        # zbytek metadat je celokapitolový a NAHRAZUJE agregát ze scén
+        questions = list(res.questions)
+        rendered = _verified_rendered(
+            [{"term_id": rt.get("term_id"), "cz_as_used": rt.get("cz_as_used"),
+              "scene_idx": None} for rt in res.rendered_terms], cz)
+        findings = concordance.check_chapter(en, cz, glossary_rows, rendered)
+        critic_findings, critic_failed = _run_critic(en, cz, client_factory("critic"))
+        findings += critic_findings
+        rounds += 1
 ```
+
+**Kolo 21 IMPORTANT (plan-consensus) - proč checkpoint musí obalit
+CELÝ krok revize, ne jen `revise_chapter()`:** Kolo 13/18/20's oprava
+obalila JEN `translator.revise_chapter()` samotné - `_run_critic(en,
+cz, client_factory("critic"))` PO úspěšné revizi (VŽDY Claude, i při
+`--translator codex`) zůstala MIMO try/except. `_run_critic()`
+(`src/pipeline.py:52-63`) má VLASTNÍ `except FatalRunError: raise` -
+kritikovo `FatalRunError` (cost guard, auth) by tak propagovalo z
+`_run_critic()`, z CELÉ `while` smyčky, z CELÉ `process_chapter()`
+funkce - PŘESNĚ obejde checkpoint, co jsem přidal kolo 13, protože ten
+chrání jen `revise_chapter()`'s VLASTNÍ selhání, ne selhání
+NÁSLEDUJÍCÍHO kroku VE STEJNÉ iteraci. Výsledek: Codex ÚSPĚŠNĚ dokončí
+revizi (nové `cz`, zaplacené), kritik HNED PO NÍ selže na `FatalRunError`
+- nové `cz` se NIKDY nedostane k `commit_chapter_result()`, kapitola
+zůstane `processing`, příští `run` ji celou přeloží znovu od nuly.
+
+**Oprava:** Přesunout `cz = res.translation` a CELÝ zbytek smyčkového
+těla (kumulace `new_terms`, `questions`, `rendered`, `findings`,
+`_run_critic()` volání) DOVNITŘ `try` bloku - `rounds += 1` zůstává
+JEDINÉ, co se provede AŽ PO úspěšném dokončení CELÉ iterace (beze
+změny pozice, pořád mimo `try`, protože počítá jen ÚSPĚŠNÁ kola).
 
 nahraď:
 
@@ -1001,6 +1076,25 @@ nahraď:
         try:
             res = translator.revise_chapter(en, cz, to_fix, guide_block, glossary_block,
                                             client_factory("translator"))
+            cz = res.translation
+            for nt in res.new_terms:                  # nové termíny se KUMULUJÍ
+                key = (nt.get("term_en") or "").strip().casefold()
+                if key and key not in new_terms:
+                    new_terms[key] = nt
+            # zbytek metadat je celokapitolový a NAHRAZUJE agregát ze scén
+            questions = list(res.questions)
+            rendered = _verified_rendered(
+                [{"term_id": rt.get("term_id"), "cz_as_used": rt.get("cz_as_used"),
+                  "scene_idx": None} for rt in res.rendered_terms], cz)
+            findings = concordance.check_chapter(en, cz, glossary_rows, rendered)
+            # Kolo 21 IMPORTANT (plan-consensus) - `_run_critic()` je
+            # TEĎ UVNITŘ try/except - kritikovo `FatalRunError` (VŽDY
+            # Claude, i při --translator codex) se teď taky zachytí a
+            # `cz` (i kdyby ho ZROVNA TAHLE `revise_chapter()` úspěšně
+            # aktualizovala) se checkpointne stejně jako selhání
+            # samotné revize.
+            critic_findings, critic_failed = _run_critic(en, cz, client_factory("critic"))
+            findings += critic_findings
         except FatalRunError as e:
             # Kolo 13 IMPORTANT (plan-consensus) - BEZ týhle opravy `cz`
             # (scénový překlad, případně částečně revidovaný) propadne
@@ -1061,20 +1155,22 @@ nahraď:
             raise
         except Exception as e:
             # Kolo 3 IMPORTANT (plan-consensus) - `revise_chapter()`
-            # posílá CELOU kapitolu a NENÍ obalené - bez týhle záchrany
-            # by výjimka (useknutý/rozbitý výstup, ValueError z
-            # translator._parse()) propadla z process_chapter() a
-            # zahodila i JIŽ HOTOVÝ scénový překlad (commit běží až na
-            # konci funkce). Mirror `_run_critic()`'s vzoru výš - FatalRunError
-            # propaguje (run se zastaví), jinak necháváme poslední
-            # PLATNÝ `cz`, kapitola skončí flagged, ne error.
+            # posílá CELOU kapitolu, a od kola 21 je celá tahle
+            # iterace (revize + `_run_critic()` recheck) obalená
+            # JEDNÍM try/except - bez týhle záchrany by výjimka
+            # (useknutý/rozbitý výstup, ValueError z translator._
+            # parse(), i kritikova nefatální chyba) propadla z
+            # process_chapter() a zahodila i JIŽ HOTOVÝ scénový
+            # překlad (commit běží až na konci funkce). Mirror
+            # `_run_critic()`'s VLASTNÍHO vzoru (FatalRunError
+            # propaguje, run se zastaví; jinak necháváme poslední
+            # PLATNÝ `cz`, kapitola skončí flagged, ne error).
             revision_failed = type(e).__name__
             break
-        cz = res.translation
+        rounds += 1
 ```
 
-O pár řádků níž (konec smyčky, `rounds += 1`) nic se nemění. HNED ZA
-smyčkou (před `# --- příprava transakce B ---`), přidej:
+HNED ZA smyčkou (před `# --- příprava transakce B ---`), přidej:
 
 ```python
     if revision_failed:
@@ -1175,6 +1271,12 @@ begin_chapter() (co je vzdy smaze na zacatku funkce) a fatalni-chyba
 commit je obnovi misto []  - commit_chapter_result() otazky znovu
 nemaze, jen upsertuje co dostane, takze [] by ztratu vubec nenapravilo
 (plan-consensus kolo 20 IMPORTANT).
+
+Checkpoint (kolo 13) teď obaluje CELOU iteraci revizni smycky (revize
+i nasledujici _run_critic() recheck ve stejnem kole), ne jen
+revise_chapter() samotne - kritikovo FatalRunError PO uspesne revizi
+by jinak obeslo checkpoint a zahodilo nove ziskane cz (plan-consensus
+kolo 21 IMPORTANT).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```

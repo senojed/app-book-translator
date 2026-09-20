@@ -279,3 +279,15 @@ Souhlas s rizikem, nesouhlas s navrhovanym fixem (per-volani nonce,
 ~66 vyskytu k prepsani) jako proporcionalni reakci na nizko-
 pravdepodobne, bezpecne-selhavajici riziko - zdokumentovano jako
 vedome prijate omezeni v Global Constraints (stejny vzor jako kolo-2).
+
+## Round 21
+
+- Codex: [round-21-codex.md](round-21-codex.md) — CHANGES_NEEDED
+- Claude: [round-21-claude.md](round-21-claude.md) — CHANGES_NEEDED
+
+Opraveno: IMPORTANT - kolo-13's checkpoint obaloval jen revise_chapter(),
+ne nasledujici _run_critic() volani ve stejne iteraci - kritikovo
+(VZDY Claude) FatalRunError po uspesne revizi by obeslo checkpoint a
+zahodilo nove ziskane cz. Opraveno rozsirenim try/except na CELOU
+iteraci revizni smycky (revize + critic recheck), rounds += 1 zustava
+jedine mimo try. Pridan presne pozadovany regresni test.
