@@ -309,3 +309,18 @@ checkpoint's obnovene otazky slucuji stary snapshot (kolo 20) s
 otazkami z posledniho platneho cz, ne jen snapshot samotny. Ctvrte
 kolo v rade "kolo N naslo mezeru v kole M's fixu" pro checkpoint
 logiku.
+
+## Round 23
+
+- Codex: [round-23-codex.md](round-23-codex.md) — CHANGES_NEEDED
+- Claude: [round-23-claude.md](round-23-claude.md) — CHANGES_NEEDED
+
+Opraveno: IMPORTANT - scenova smycka (pred "kontrola" blokem) byla
+jedina faze process_chapter() bez checkpointu - begin_chapter() uz
+smazal existing_questions na zacatku funkce, ale selhani primo ve
+scenove smycce (rozbity Codex CLI/auth na --retry-flagged kapitole)
+propagovalo bez jakekoli obnovy. Opraveno uzkym try/except jen kolem
+scenove smycky, obnovuje stare otazky pres existujici state.
+upsert_open_question() (zadny zasah do state.py). Posledni nechranena
+faze funkce - checkpoint/otazky oblast ted pokryta v cele process_
+chapter().

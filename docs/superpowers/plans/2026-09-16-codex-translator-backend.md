@@ -128,6 +128,14 @@ FS-risk varování jako `polish`).
   `AnthropicClient()` - ta by zavedla novou závislost na klíči do
   existujících testů, co dnes mockují `pipeline.process_chapter` a klíč
   nikdy reálně nepotřebují.
+- Scénová smyčka (`pipeline.process_chapter`, PŘED "kontrola" blokem)
+  je obalená VLASTNÍM `try/except Exception`, co obnoví `existing_
+  questions` a re-raisne (kolo 23 IMPORTANT, plan-consensus) - jediná
+  fáze funkce BEZ checkpointu (kolo 13/18/20/21/22's opravy všechny
+  chrání až "kontrola" blok/revizní smyčku, tedy PO scénové smyčce).
+  Bez tohohle by `--retry-flagged` kapitola, co ZNOVU selže v týhle
+  fázi, ztratila staré otevřené otázky navěky (žádný nový `cz`
+  neexistuje, `_checkpoint_flagged()` se tu použít nedá).
 - `--translator codex` se ověřuje (`STYLIST_ACCEPT_FS_RISK`/`CODEX_MODEL`/
   CLI) HNED na začátku `_cmd_run`, ne líně až při prvním volání (kolo 3
   IMPORTANT, plan-consensus - viz Task 5) - prázdná/vyfiltrovaná fronta
@@ -794,6 +802,31 @@ def test_revision_fatal_error_from_critic_after_successful_revision_preserves_ne
     assert row["translated_text"] == "revidovaný překlad"
 
 
+def test_scene_loop_fatal_error_restores_existing_open_question(tmp_path, monkeypatch):
+    """Kolo 23 IMPORTANT (plan-consensus) - scénová smyčka (PŘED "kontrola"
+    blokem) neměla ŽÁDNÝ checkpoint (na rozdíl od kontrola bloku/revizní
+    smyčky, kolo 13/18/20/21/22) - selhání PŘÍMO v ní (např. znovu
+    rozbitý Codex CLI/auth na `--retry-flagged` kapitole) propagovalo
+    BEZ obnovy `existing_questions`, i když `begin_chapter()` (transakce
+    A) je UŽ nenávratně smazal na začátku funkce. Žádný nový `cz`
+    neexistuje (na rozdíl od kol 13/18/20/21/22's scénářů) - fix obnoví
+    JEN staré otázky, nic víc."""
+    db = _db(tmp_path)
+    from src.llm.client import FatalRunError
+    state.upsert_open_question(db, {
+        "chapter_idx": 1, "kind": "term", "scope_key": "cand_x",
+        "text": "Nový termín 'X' přeložen jako 'Y'. Sedí to?",
+        "guess_answer": "Y", "severity": "guess"})
+    def boom(*a, **k): raise FatalRunError("codex auth expired znovu")
+    monkeypatch.setattr(T, "translate_scene", boom)
+    ch = state.get_chapter(db, 1)
+    with __import__("pytest").raises(FatalRunError):
+        pipeline.process_chapter(db, ch, client_factory=_factory, guide={
+            "characters": [], "places": [], "relationships": [], "style": "", "rules": []})
+    open_qs = state.unanswered_questions(db)
+    assert any(q["scope_key"] == "cand_x" for q in open_qs)
+
+
 def test_pre_loop_critic_fatal_error_preserves_scene_translation(tmp_path, monkeypatch):
     """Kolo 22 IMPORTANT (plan-consensus) - PRVNÍ `_run_critic()` volání
     (PŘED revizní smyčkou) nebylo chráněné VŮBEC - kola 13/18/20/21's
@@ -1081,6 +1114,89 @@ def process_chapter(db_path: str, chapter: dict, *, client_factory, guide: dict)
                           if q.get("chapter_idx") == idx]
 
     state.begin_chapter(db_path, idx)          # transakce A
+```
+
+**Kolo 23 IMPORTANT (plan-consensus) - scénová smyčka je JEDINÁ fáze
+BEZ jakéhokoli checkpointu:** `_checkpoint_flagged()` (kolo 22, níž) a
+revizní smyčka (kolo 13/18/20/21) chrání jen "kontrola" blok a `while`
+smyčku - obě běží AŽ PO scénové smyčce (`for scene_idx, scene in
+enumerate(scenes): ...`, `pipeline.py:79-91`). Selhání PŘÍMO v týhle
+smyčce (`CodexTranslatorFatalError`/`InvalidTranslationOutput`/timeout
+z `translate_scene()`, i lazy `factory()` preflight - Task 4/5)
+propaguje z `process_chapter()` úplně BEZ jakéhokoli checkpointu -
+`existing_questions` (snapshot z ÚVODU funkce, kolo 20) se NIKDY
+nedostane zpátky do DB. Protože `begin_chapter()` (transakce A, výš) je
+UŽ smazal unconditionally, `--retry-flagged` kapitola, co ZNOVU selže
+v týhle FÁZI (typicky pořád rozbitý Codex CLI/auth), ztratí staré
+otevřené otázky NAVŽDY - i když se nepřeložilo vůbec nic nového (na
+rozdíl od kol 13/18/20/21/22's scénářů, tady ŽÁDNÝ nový `cz` neexistuje,
+takže `_checkpoint_flagged()`, co vyžaduje `cz_now`, se použít nedá).
+
+**Oprava:** Obal scénovou smyčku samotnou v `try/except Exception` -
+při JAKÉKOLI výjimce obnov `existing_questions` přes existující veřejné
+`state.upsert_open_question(db_path, q)` (`src/state.py:497-500`,
+idempotentní upsert - žádná nová DB logika, žádná duplicita) PŘED
+re-raise. NEmění status/text/cokoli jiného - main.py (Task 5) dál
+rozhoduje o `flagged`/`error`/fatal stejně jako dřív, tenhle fix řeší
+JEN ztrátu starých otázek.
+
+V `src/pipeline.py`, `process_chapter`'s scénová smyčka - najdi:
+
+```python
+    guide_block = _guide_block(guide)
+    glossary_block = _glossary_block(db_path)
+
+    # --- překlad po scénách ---
+    scenes = ingest.split_into_scenes(en, config.CHAPTER_SPLIT_WORD_THRESHOLD)
+    parts, rendered, questions = [], [], []
+    new_terms: dict = {}
+    for scene_idx, scene in enumerate(scenes):
+        res = translator.translate_scene(scene, guide_block, glossary_block,
+                                         client_factory("translator"))
+        parts.append(res.translation)
+        for nt in res.new_terms:
+            key = (nt.get("term_en") or "").strip().casefold()
+            if key and key not in new_terms:
+                new_terms[key] = nt
+        questions.extend(res.questions)
+        for rt in res.rendered_terms:
+            rendered.append({"term_id": rt.get("term_id"),
+                             "cz_as_used": rt.get("cz_as_used"),
+                             "scene_idx": scene_idx})
+```
+
+nahraď:
+
+```python
+    guide_block = _guide_block(guide)
+    glossary_block = _glossary_block(db_path)
+
+    # --- překlad po scénách ---
+    scenes = ingest.split_into_scenes(en, config.CHAPTER_SPLIT_WORD_THRESHOLD)
+    parts, rendered, questions = [], [], []
+    new_terms: dict = {}
+    # Kolo 23 IMPORTANT (plan-consensus) - viz vysvětlení výš - scénová
+    # smyčka je jediná fáze bez checkpointu; obnov staré otázky PŘED
+    # re-raise, ať `--retry-flagged` kapitola, co tu ZNOVU selže, o ně
+    # nenávratně nepřijde.
+    try:
+        for scene_idx, scene in enumerate(scenes):
+            res = translator.translate_scene(scene, guide_block, glossary_block,
+                                             client_factory("translator"))
+            parts.append(res.translation)
+            for nt in res.new_terms:
+                key = (nt.get("term_en") or "").strip().casefold()
+                if key and key not in new_terms:
+                    new_terms[key] = nt
+            questions.extend(res.questions)
+            for rt in res.rendered_terms:
+                rendered.append({"term_id": rt.get("term_id"),
+                                 "cz_as_used": rt.get("cz_as_used"),
+                                 "scene_idx": scene_idx})
+    except Exception:
+        for q in existing_questions:
+            state.upsert_open_question(db_path, q)
+        raise
 ```
 
 **Kolo 22 IMPORTANT (plan-consensus) - proč PRVNÍ `_run_critic()` volání
