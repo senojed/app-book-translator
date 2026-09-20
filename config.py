@@ -94,12 +94,26 @@ REFERENCE_COOCCUR_RATIO = 0.5   # podíl dílů, kde musí sedět souvýskyt
 # odmítá "gpt-5-codex" (400 invalid_request_error), viz ověření v
 # docs/superpowers/specs/2026-09-08-stylist-agent-design.md.
 CODEX_MODEL = "gpt-5.6-terra"
+# Codex běží na předplatném, ne za token - $0.0 zajistí, že
+# `PipelineLLMClient._price()` (vyžaduje ZÁZNAM pro KAŽDÝ model, žádný
+# implicitní fallback na 0) Codex-translator volání nikdy neodmítne
+# jako "nemá sazby", a cost guard u nich nikdy nezasáhne (útrata 0).
+PRICE_IN_PER_MTOK[CODEX_MODEL] = 0.0
+PRICE_OUT_PER_MTOK[CODEX_MODEL] = 0.0
 # Timeout na jedno volání `codex exec` (kolo 17 IMPORTANT). `stylist.
 # polish`'s parametr `timeout` je od kola 22 `= None` a bez explicitní
 # hodnoty spadne SEM (dřív byl natvrdo `= 180`, veřejné volání config
 # obcházelo). Dlouhá kapitola může legitimně potřebovat víc času -
 # hodnota jde upravit BEZ zásahu do kódu.
 STYLIST_TIMEOUT_SECONDS = 180
+# Spike test (2026-09-16, data/spikes/) - jednotlivá volání trvala
+# 70-120s (přímý překlad i polish), 300s je rezerva na delší scény
+# (kapitoly nad CHAPTER_SPLIT_WORD_THRESHOLD se dělí na víc scén, každá
+# JEDNO volání zvlášť). ŽÁDNÝ proaktivní znakový limit navíc (na rozdíl
+# od `polish`'s `STYLIST_MAX_CHARS`) - zvažováno a zamítnuto (kolo 2
+# IMPORTANT, plan-consensus, viz `CodexLLMClient` docstring v `src/llm/
+# client.py`) - tenhle timeout je JEDINÁ pojistka proti oversized promptu.
+CODEX_TRANSLATE_TIMEOUT_SECONDS = 300
 # Hrubý bezpečnostní strop na délku kapitoly pro stylistický průchod
 # (kolo 17 IMPORTANT) - součet znaků EN+CZ. NENÍ přesný odhad tokenového
 # limitu konkrétního modelu (ten je uživatelsky konfigurovaný přes
