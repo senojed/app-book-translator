@@ -1622,3 +1622,60 @@ def test_init_reset_seed_failure_after_reset_gives_clear_recovery_path(tmp_path,
     out = capsys.readouterr().out
     assert "init" in out.lower() and "reset" in out.lower()
     assert "polish" in main._MUTATING
+
+
+def test_client_factory_translator_backend_codex_uses_codex_client(monkeypatch):
+    from src.llm.client import CodexLLMClient
+    # Kolo 28 NIT (plan-consensus) - `factory()` teď staví `CodexLLMClient`
+    # z RAW `config.CODEX_MODEL`, NE z `_polish_preflight()`'s ořezaného
+    # návratu (viz vysvětlení u `_client_factory` výš) - mock preflightu
+    # tedy `model` element ignoruje ("ignored", nikdy nepoužit), test
+    # ověřuje proti `config.CODEX_MODEL` mocku místo toho.
+    monkeypatch.setattr("main._polish_preflight",
+                        lambda: ("ignored", ["codex", "resolved"], None))
+    monkeypatch.setattr(config, "CODEX_MODEL", "m")
+    factory = main._client_factory(1, interactive=False, translator_backend="codex")
+    client = factory("translator")
+    assert isinstance(client._inner, CodexLLMClient)
+    assert client._inner._codex_model == "m"
+    assert client._inner._codex_cmd == ["codex", "resolved"]
+    assert client._inner.billed_model == "m"
+
+
+def test_client_factory_translator_backend_codex_critic_stays_claude(monkeypatch):
+    from src.llm.client import AnthropicClient
+    monkeypatch.setattr("main._polish_preflight",
+                        lambda: ("m", ["codex"], None))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")
+    factory = main._client_factory(1, interactive=False, translator_backend="codex")
+    client = factory("critic")
+    assert isinstance(client._inner, AnthropicClient)
+
+
+def test_client_factory_default_backend_claude_translator_unaffected(monkeypatch):
+    """Beze změny chování pro VŠECHNA existující volání bez `translator_
+    backend` argumentu - default `"claude"` musí `_polish_preflight`
+    vůbec nezavolat (žádná FS-risk kontrola, když se Codex nepoužívá)."""
+    from src.llm.client import AnthropicClient
+    def boom():
+        raise AssertionError("_polish_preflight se nemá volat pro claude backend")
+    monkeypatch.setattr("main._polish_preflight", boom)
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")
+    factory = main._client_factory(1, interactive=False)
+    client = factory("translator")
+    assert isinstance(client._inner, AnthropicClient)
+
+
+def test_client_factory_translator_backend_codex_preflight_failure_raises_fatal(monkeypatch):
+    """Kolo 12 IMPORTANT (plan-consensus) - `CodexTranslatorFatalError`
+    (ne holý `FatalRunError`) - tahle LÍNÁ preflight kontrola (uvnitř
+    `factory()`) běží PO `state.begin_chapter()` (kapitola už
+    `processing`) - bez správného typu by `_cmd_run` (Task 5) tenhle
+    pád neoznačil `flagged`, kapitola by zůstala uvízlá stejně jako
+    před kolem 10/11."""
+    from src.llm.client import CodexTranslatorFatalError
+    monkeypatch.setattr("main._polish_preflight",
+                        lambda: (None, None, "Codex CLI není použitelné"))
+    factory = main._client_factory(1, interactive=False, translator_backend="codex")
+    with pytest.raises(CodexTranslatorFatalError, match="Codex CLI není použitelné"):
+        factory("translator")

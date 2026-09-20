@@ -32,8 +32,8 @@ from src import ingest, pipeline, polish_store, requeue, state
 from src import reference as reference_mod
 from src import reference_mine, textnorm
 from src.agents import scout, stylist
-from src.llm.client import (AnthropicClient, FatalRunError, LockLostError,
-                           OutputTruncated, PipelineLLMClient)
+from src.llm.client import (AnthropicClient, CodexLLMClient, CodexTranslatorFatalError,
+                           FatalRunError, LockLostError, OutputTruncated, PipelineLLMClient)
 
 _MUTATING = {"init", "scan", "run", "answer", "review", "reference", "polish",
             "polish-review"}
@@ -51,10 +51,46 @@ def _bootstrap_stdout() -> None:
             pass
 
 
-def _client_factory(run_id: int, *, interactive: bool, require_lock=None):
-    """Klienta staví až při volání - `run` s fake pipeline nikdy nesáhne na API."""
+def _client_factory(run_id: int, *, interactive: bool, require_lock=None,
+                    translator_backend: str = "claude"):
+    """Klienta staví až při volání - `run` s fake pipeline nikdy nesáhne
+    na API. `translator_backend="codex"` (main.py `_cmd_run --translator
+    codex`) přepne JEN `agent=="translator"` na `CodexLLMClient` - kritik/
+    stylist_check zůstávají VŽDY `AnthropicClient`, bez ohledu na tenhle
+    parametr (spike 2026-09-16 ukázal nespolehlivost Codex jako kritika,
+    viz docs/superpowers/specs/2026-09-16-codex-translator-backend-design.md).
+    Default `"claude"` zachovává PŘESNĚ dnešní chování pro VŠECHNA
+    existující volání (`_cmd_polish`/server), co tenhle argument nezadávají -
+    `_polish_preflight()` se pro ně vůbec nevolá."""
     def factory(agent: str):
-        return PipelineLLMClient(AnthropicClient(), run_id=run_id, agent=agent,
+        if agent == "translator" and translator_backend == "codex":
+            # Kolo 28 NIT (plan-consensus) - `_polish_preflight()` vrací
+            # OŘEZANÝ model (`(config.CODEX_MODEL or "").strip()`, main.py:
+            # 1158) - jen pro VLASTNÍ prázdný-string check, NIKDY
+            # nepoužívat pro `CodexLLMClient(codex_model=...)` níž. Task
+            # 1's `PRICE_IN_PER_MTOK[CODEX_MODEL] = 0.0` (a `billed_model`
+            # napříč Task 3) používá RAW `config.CODEX_MODEL` jako klíč -
+            # kdyby měl `CODEX_MODEL` (dnes bez mezer) NĚKDY okolní
+            # whitespace, ořezaná vs. neořezaná verze by se v `PRICE_IN_
+            # PER_MTOK` dict lookupu (`_price()`, kolo 16) rozešly a
+            # `MissingPriceError` by vyletěla i přes SPRÁVNĚ nastavenou
+            # cenu. `_` níž zahazuje ořezanou hodnotu úmyslně.
+            _, codex_cmd, preflight_err = _polish_preflight()
+            if preflight_err:
+                # Kolo 12 IMPORTANT (plan-consensus) - `CodexTranslatorFatalError`,
+                # NE holý `FatalRunError` - tahle LÍNÁ kontrola běží AŽ
+                # při prvním `factory("translator")` volání, PO `state.
+                # begin_chapter()` (kapitola už `processing`). I když
+                # eager preflight (main.py `_cmd_run`, kolo 8) tohle
+                # obvykle odchytí dřív, je to SAMOSTATNÉ volání - typ
+                # musí být stejný jako `CodexLLMClient.complete()`'s
+                # (Task 3), ať `_cmd_run` (Task 5) tenhle pád taky
+                # označí `flagged`, ne nechá kapitolu uvízlou.
+                raise CodexTranslatorFatalError(preflight_err)
+            inner = CodexLLMClient(codex_cmd, config.CODEX_MODEL)
+        else:
+            inner = AnthropicClient()
+        return PipelineLLMClient(inner, run_id=run_id, agent=agent,
                                  db_path=config.DB_PATH, config_mod=config,
                                  interactive=interactive, require_lock=require_lock)
     return factory
