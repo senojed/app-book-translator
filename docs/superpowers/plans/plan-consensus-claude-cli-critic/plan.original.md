@@ -35,17 +35,10 @@ kvůli Windows process-tree killing), `claude` CLI (`claude -p
   `apiKeyHelper` auth, OAuth/keychain se v něm NEČTE, což by celý smysl
   týhle změny popřelo). `--tools ""` vypíná VŠECHNY nástroje (žádný
   přístup k disku/Bash) - žádná FS-risk pojistka jako u Codexu potřeba.
-- **Kolo 1 BLOCKING (plan-consensus)** - `system`/`user` se NESMÍ spojit
-  do jednoho stdin blobu (`f"{system}\n\n{user}"`, CodexLLMClient's
-  vzor) - `system` (kritikovy instrukce, `critic.SYSTEM_PROMPT`, 805
-  znaků, statické) jde přes `--system-prompt` CLI flag (bezpečně pod
-  Windows argv limitem), `user` (kapitola EN+CZ, může být velké) jde
-  PŘES STDIN. Ověřeno spikem 2026-09-21 - `--system-prompt X` + stdin
-  user obsah funguje SPRÁVNĚ dohromady (systémová priorita zachovaná).
-  Spojení do jednoho stdin blobu by kritikovy instrukce degradovalo na
-  "jen další text" bez systémové priority - přesně to, co `critic.
-  SYSTEM_PROMPT`/`AnthropicClient`'s `system=` parametr zaručuje a co by
-  se týmhle plánem tiše ztratilo.
+- Prompt jde přes STDIN, NE jako pozicní argument (ověřeno spikem -
+  `claude -p` bez pozicního argumentu čte prompt ze stdin) - kapitola
+  EN+CZ text může snadno přesáhnout Windows argv limit (~8191 znaků),
+  stejný důvod jako Codexův stdin vzor v `stylist._exec_codex`.
 - `billed_model` MUSÍ být ODLIŠNÝ string od `config.MODEL_CRITIC`
   ("claude-sonnet-5") - ten string se STÁLE používá pro SKUTEČNÉ,
   placené Claude API volání (translator při `--translator claude`,
@@ -63,19 +56,10 @@ kvůli Windows process-tree killing), `claude` CLI (`claude -p
   obranné chování, i kdyby `claude.exe` sám interně spouštěl další
   procesy (MCP servery apod.), timeout na `communicate()` musí něco
   ukončit, ne nechat viset.
-- Chybové stavy (nenulový exit kód, nečitelný/špatně TVAROVANÝ JSON
-  výstup, `is_error: true` nebo `subtype != "success"` v JSON) → nová
-  `ClaudeCliFatalError(FatalRunError)` (`src/llm/client.py`, HNED ZA
-  `CodexTranslatorFatalError`) - zpráva přes `stylist._redact_detail()`
-  (existující funkce, beze změny).
-  **Kolo 1 IMPORTANT (plan-consensus) - TIMEOUT je VÝJIMKA z tohohle
-  seznamu, NE fatální:** timeout jednoho volání je PER-CALL/transientní
-  (stejné zdůvodnění jako `stylist.StylistTimeoutError` u Codexu,
-  minulý plán, kolo 9 IMPORTANT) - `_run_critic()`'s vlastní `except
-  Exception: pseudo-nález, critic_failed=True` větev ho zpracuje
-  nefatálně, kapitola pokračuje. `ClaudeCliTimeoutError` (Task 2)
-  zůstává SAMOSTATNÝ typ, co `ClaudeCliClient.complete()` NEpřebaluje
-  na `ClaudeCliFatalError`.
+- Chybové stavy (nenulový exit kód, timeout, nečitelný JSON výstup,
+  `is_error: true` v JSON) → nová `ClaudeCliFatalError(FatalRunError)`
+  (`src/llm/client.py`, HNED ZA `CodexTranslatorFatalError`) - zpráva
+  přes `stylist._redact_detail()` (existující funkce, beze změny).
   `_run_critic()` (`pipeline.py`) beze změny - `except FatalRunError:
   raise` zachytí `ClaudeCliFatalError` stejně jako dnešní
   `AnthropicClient`'s chyby, `_cmd_run`'s existující `except
@@ -85,33 +69,6 @@ kvůli Windows process-tree killing), `claude` CLI (`claude -p
 - `_cmd_run`'s eager `ANTHROPIC_API_KEY` kontrola (main.py, zavedená
   minulým plánem "kolo 22") se RUŠÍ - kritik už žádný API klíč
   nepotřebuje, kontrola by ověřovala něco, na čem nezáleží.
-- **Kolo 1 IMPORTANT (plan-consensus) - NOVÁ eager `claude` CLI
-  preflight kontrola nahrazuje tu zrušenou:** kritik je teď VŽDY
-  `ClaudeCliClient`, ale dostupnost/přihlášení `claude` CLI se dřív
-  ověřovalo jen LÍNĚ, až při prvním `client_factory("critic")` volání -
-  PO scénovém překladu první kapitoly (u `--translator codex` PO
-  ZAPLACENÉM Codex volání). `_cmd_run` teď PŘED frontou (stejné místo
-  jako Codexova eager kontrola, ALE NEZÁVISLE na `args.translator` -
-  kritik je vždy aktivní) zavolá NOVOU `_claude_cli_preflight()`
-  (Task 3) - resolvne `claude` binárku (`shutil.which`) A ověří
-  přihlášení (`claude auth status --json`, ~0.5s, žádné tokeny/API
-  volání) - `loggedIn: true` v odpovědi. Selhání = `return 1` PŘED
-  frontou, stejně jako Codexova eager kontrola.
-- **Kolo 1 IMPORTANT (plan-consensus) - `truncated` čte SKUTEČNÝ
-  `stop_reason` z JSON výstupu, ne natvrdo `False`:** `claude -p
-  --output-format json` vrací `stop_reason` pole (ověřeno spikem -
-  `"stop_reason":"end_turn"`) - STEJNÝ signál jako Anthropic API's
-  `resp.stop_reason` (`AnthropicClient.complete()` už `truncated=
-  (resp.stop_reason == "max_tokens")` čte). `ClaudeCliClient.complete()`
-  MUSÍ tenhle signál použít, ne tvrdit `truncated=False` vždy (na
-  rozdíl od `CodexLLMClient`, co `truncated=False` má jako ZDOKUMENTOVANÝ
-  limit - Codex CLI žádný ekvivalent signál nemá, `claude` CLI ANO).
-  **Známý, přijatý limit:** `max_tokens` parametr `ClaudeCliClient.
-  complete()` NEMÁ CLI ekvivalent (`claude -p` nenabízí žádný limit
-  flag) - `critic.review()`'s retry-na-truncation (`tokens = tokens *
-  2; continue`) detekci truncation SPRÁVNĚ zachytí (přes `stop_reason`),
-  ale samotný retry limit NEZVÝŠÍ (stejná třída limitu jako Codex -
-  žádný proaktivní limit navíc, jen zjištění PO faktu).
 
 ---
 
@@ -213,14 +170,11 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   list[str]` - stejný vzor jako `stylist._resolve_codex_cmd`
   (`shutil.which` pro holé jméno, `PermissionError`-styl zprávu při
   nenalezení).
-- Produces: `claude_cli._exec_claude(system: str, user: str, *,
-  claude_cmd: list[str], model: str, timeout: int) -> dict` - `system`
-  jde přes `--system-prompt` CLI flag, `user` přes STDIN (kolo 1
-  BLOCKING, plan-consensus - NIKDY nespojovat do jednoho stdin blobu,
-  viz Global Constraints). Vrací ROZPARSOVANÝ a VALIDOVANÝ JSON výstup
-  (`--output-format json`), NE surový text (na rozdíl od `_exec_codex`,
-  co vrací text - kritik potřebuje `result`/`usage`/`stop_reason` pole
-  zvlášť).
+- Produces: `claude_cli._exec_claude(prompt_text: str, *, claude_cmd:
+  list[str], model: str, timeout: int) -> dict` - vrací ROZPARSOVANÝ
+  JSON výstup (`--output-format json`), NE surový text (na rozdíl od
+  `_exec_codex`, co vrací text - kritik potřebuje `result`/`usage`/
+  `is_error` pole zvlášť).
 - Produces: `client.ClaudeCliClient(claude_cmd: list[str], model: str,
   timeout: int | None = None)` - `complete()`/`count_tokens()` stejný
   `LLMClient` protokol, `.provider == "claude-cli"`,
@@ -247,12 +201,7 @@ def test_resolve_claude_cmd_raises_clear_error_for_missing_bare_name():
         claude_cli._resolve_claude_cmd(["nope-not-a-real-binary-xyz"])
 
 
-def test_exec_claude_calls_popen_with_system_prompt_flag_and_stdin_user(monkeypatch):
-    """Kolo 1 BLOCKING (plan-consensus) - `system` MUSÍ jít přes
-    `--system-prompt` CLI flag (systémová priorita), `user` STDINEM -
-    NIKDY spojené do jednoho blobu (na rozdíl od CodexLLMClient - tam
-    `codex exec` žádný `--system-prompt` ekvivalent nemá, tady ANO,
-    ověřeno spikem)."""
+def test_exec_claude_calls_popen_with_stdin_prompt_and_expected_argv(monkeypatch):
     seen = {}
     class FakeProc:
         pid = 4242
@@ -261,17 +210,16 @@ def test_exec_claude_calls_popen_with_system_prompt_flag_and_stdin_user(monkeypa
             seen["stdin"] = input
             seen["timeout"] = timeout
             return ('{"result": "ok", "is_error": false, "subtype": "success", '
-                    '"stop_reason": "end_turn", '
                     '"usage": {"input_tokens": 10, "output_tokens": 5}}', "")
     def fake_popen(cmd, **kwargs):
         seen["cmd"] = cmd
         return FakeProc()
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    result = claude_cli._exec_claude("SYS", "USR", claude_cmd=["claude"],
+    result = claude_cli._exec_claude("SYS\n\nUSR", claude_cmd=["claude"],
                                      model="claude-sonnet-5", timeout=30)
     assert result["result"] == "ok"
     assert result["usage"]["input_tokens"] == 10
-    assert seen["stdin"] == "USR"          # JEN user, ne "SYS\n\nUSR"
+    assert seen["stdin"] == "SYS\n\nUSR"
     assert seen["timeout"] == 30
     assert "-p" in seen["cmd"] and "--safe-mode" in seen["cmd"]
     assert "--tools" in seen["cmd"]
@@ -280,9 +228,6 @@ def test_exec_claude_calls_popen_with_system_prompt_flag_and_stdin_user(monkeypa
     assert "--model" in seen["cmd"]
     model_idx = seen["cmd"].index("--model")
     assert seen["cmd"][model_idx + 1] == "claude-sonnet-5"
-    assert "--system-prompt" in seen["cmd"]
-    sp_idx = seen["cmd"].index("--system-prompt")
-    assert seen["cmd"][sp_idx + 1] == "SYS"
 
 
 def test_exec_claude_raises_on_nonzero_exit(monkeypatch):
@@ -293,7 +238,7 @@ def test_exec_claude_raises_on_nonzero_exit(monkeypatch):
             return ("", "auth expired")
     monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: FakeProc())
     with pytest.raises(claude_cli.ClaudeCliExecError, match="auth expired"):
-        claude_cli._exec_claude("s", "u", claude_cmd=["claude"], model="m", timeout=30)
+        claude_cli._exec_claude("s", claude_cmd=["claude"], model="m", timeout=30)
 
 
 def test_exec_claude_raises_on_unparseable_json(monkeypatch):
@@ -304,7 +249,7 @@ def test_exec_claude_raises_on_unparseable_json(monkeypatch):
             return ("not json at all", "")
     monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: FakeProc())
     with pytest.raises(claude_cli.ClaudeCliExecError):
-        claude_cli._exec_claude("s", "u", claude_cmd=["claude"], model="m", timeout=30)
+        claude_cli._exec_claude("s", claude_cmd=["claude"], model="m", timeout=30)
 
 
 def test_exec_claude_raises_on_is_error_true(monkeypatch):
@@ -315,50 +260,7 @@ def test_exec_claude_raises_on_is_error_true(monkeypatch):
             return ('{"result": null, "is_error": true, "subtype": "error_during_execution"}', "")
     monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: FakeProc())
     with pytest.raises(claude_cli.ClaudeCliExecError, match="error_during_execution"):
-        claude_cli._exec_claude("s", "u", claude_cmd=["claude"], model="m", timeout=30)
-
-
-def test_exec_claude_raises_on_subtype_not_success_even_if_is_error_false(monkeypatch):
-    """Kolo 1 IMPORTANT (plan-consensus) - `is_error` samo nestačí -
-    kontrolujeme i `subtype == "success"` pro případy, kdy CLI vrátí
-    neúspěšný `subtype` bez explicitního `is_error: true`."""
-    class FakeProc:
-        pid = 1
-        returncode = 0
-        def communicate(self, input, timeout):
-            return ('{"result": "castecny vysledek", "is_error": false, '
-                    '"subtype": "error_max_turns"}', "")
-    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: FakeProc())
-    with pytest.raises(claude_cli.ClaudeCliExecError, match="error_max_turns"):
-        claude_cli._exec_claude("s", "u", claude_cmd=["claude"], model="m", timeout=30)
-
-
-def test_exec_claude_raises_on_non_dict_payload(monkeypatch):
-    """Kolo 1 IMPORTANT (plan-consensus) - `extract_json()`'s vlastní
-    precedent (kolo 7 BLOCKING minulého plánu, critic.py) - validní JSON
-    může být `[]`/`null`/string na nejvyšší úrovni, ne jen objekt."""
-    class FakeProc:
-        pid = 1
-        returncode = 0
-        def communicate(self, input, timeout):
-            return ("[]", "")
-    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: FakeProc())
-    with pytest.raises(claude_cli.ClaudeCliExecError):
-        claude_cli._exec_claude("s", "u", claude_cmd=["claude"], model="m", timeout=30)
-
-
-def test_exec_claude_raises_on_non_string_result(monkeypatch):
-    """Kolo 1 IMPORTANT (plan-consensus) - `result` musí být string -
-    `ClaudeCliClient.complete()`'s `Completion.text` jde dál do
-    `critic.review()`'s `extract_json()`, co string očekává."""
-    class FakeProc:
-        pid = 1
-        returncode = 0
-        def communicate(self, input, timeout):
-            return ('{"result": 42, "is_error": false, "subtype": "success"}', "")
-    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: FakeProc())
-    with pytest.raises(claude_cli.ClaudeCliExecError):
-        claude_cli._exec_claude("s", "u", claude_cmd=["claude"], model="m", timeout=30)
+        claude_cli._exec_claude("s", claude_cmd=["claude"], model="m", timeout=30)
 
 
 def test_exec_claude_kills_process_tree_on_timeout(monkeypatch):
@@ -374,7 +276,7 @@ def test_exec_claude_kills_process_tree_on_timeout(monkeypatch):
     monkeypatch.setattr(claude_cli, "_kill_process_tree",
                         lambda proc: killed.__setitem__("n", killed["n"] + 1))
     with pytest.raises(claude_cli.ClaudeCliTimeoutError):
-        claude_cli._exec_claude("s", "u", claude_cmd=["claude"], model="m", timeout=1)
+        claude_cli._exec_claude("s", claude_cmd=["claude"], model="m", timeout=1)
     assert killed["n"] == 1
 ```
 
@@ -428,18 +330,15 @@ def _resolve_claude_cmd(claude_cmd: list) -> list:
     return [resolved] + claude_cmd[1:]
 
 
-def _exec_claude(system: str, user: str, *, claude_cmd: list, model: str,
+def _exec_claude(prompt_text: str, *, claude_cmd: list, model: str,
                  timeout: int) -> dict:
-    """Jedno volání `claude -p` - vrací rozparsovaný a VALIDOVANÝ JSON
-    výstup. Kolo 1 BLOCKING (plan-consensus) - `system` jde přes
-    `--system-prompt` CLI flag (systémová priorita zachovaná, kritikovy
-    instrukce jsou statické, 805 znaků - bezpečně pod Windows argv
-    limitem), `user` (kapitola EN+CZ, může být velké) STDINEM - NIKDY
-    spojené do jednoho blobu (ověřeno spikem 2026-09-21 - obojí
-    dohromady funguje správně)."""
+    """Jedno volání `claude -p` s daným promptem (SYSTEM+USER spojené,
+    stejně jako Codexova `_exec_codex`'s `prompt`) - vrací rozparsovaný
+    JSON výstup. Prompt jde STDINEM (ne pozicním argumentem) - kapitola
+    EN+CZ text může snadno přesáhnout Windows argv limit (~8191 znaků)."""
     cmd = _resolve_claude_cmd(claude_cmd) + [
         "-p", "--safe-mode", "--tools", "", "--output-format", "json",
-        "--model", model, "--system-prompt", system,
+        "--model", model,
     ]
     try:
         # Popen+communicate (NE subprocess.run(timeout=)) - stejný důvod
@@ -456,7 +355,7 @@ def _exec_claude(system: str, user: str, *, claude_cmd: list, model: str,
             f"({type(e).__name__}: {e}) - je Claude Code CLI nainstalované "
             "a přihlášené?")
     try:
-        stdout, stderr = proc.communicate(input=user, timeout=timeout)
+        stdout, stderr = proc.communicate(input=prompt_text, timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_process_tree(proc)
         try:
@@ -481,31 +380,10 @@ def _exec_claude(system: str, user: str, *, claude_cmd: list, model: str,
     except ValueError as e:
         raise ClaudeCliExecError(
             f"claude -p vrátilo nerozparsovatelný JSON výstup: {e}") from e
-    # Kolo 1 IMPORTANT (plan-consensus) - validace CELÉHO kontraktu
-    # payloadu, ne jen `is_error` - `extract_json()`'s vlastní precedent
-    # (critic.py, kolo 7 BLOCKING minulého plánu): validní JSON může být
-    # cokoli ([]/null/string na nejvyšší úrovni), ne jen objekt. Chybějící/
-    # neřetězcový `result` nebo nečíselné `usage` by jinak unikly jako
-    # AttributeError/TypeError MIMO `ClaudeCliExecError` kontrakt, nebo
-    # by rozbily audit log (`Completion.input_tokens`/`output_tokens`
-    # musí být čísla).
-    if not isinstance(payload, dict):
-        raise ClaudeCliExecError(
-            f"claude -p vrátilo {type(payload).__name__} na nejvyšší "
-            "úrovni, ne objekt.")
-    if payload.get("is_error") or payload.get("subtype") != "success":
+    if payload.get("is_error"):
         raise ClaudeCliExecError(
             f"claude -p vrátilo chybu ({payload.get('subtype')}): "
             f"{payload.get('result')}")
-    if not isinstance(payload.get("result"), str):
-        raise ClaudeCliExecError(
-            f"claude -p's 'result' pole musí být řetězec, ne "
-            f"{type(payload.get('result')).__name__}.")
-    usage = payload.get("usage")
-    if usage is not None and not isinstance(usage, dict):
-        raise ClaudeCliExecError(
-            f"claude -p's 'usage' pole musí být objekt, ne "
-            f"{type(usage).__name__}.")
     return payload
 ```
 
@@ -522,11 +400,9 @@ Přidej do `tests/test_pipeline_client.py`:
 def test_claude_cli_client_calls_exec_claude_and_wraps_result(monkeypatch):
     from src.llm.client import ClaudeCliClient
     seen = {}
-    def fake_exec(system, user, *, claude_cmd, model, timeout):
-        seen.update(system=system, user=user, claude_cmd=claude_cmd,
-                    model=model, timeout=timeout)
+    def fake_exec(prompt, *, claude_cmd, model, timeout):
+        seen.update(prompt=prompt, claude_cmd=claude_cmd, model=model, timeout=timeout)
         return {"result": "nálezy: []", "is_error": False, "subtype": "success",
-                "stop_reason": "end_turn",
                 "usage": {"input_tokens": 123, "output_tokens": 45}}
     monkeypatch.setattr("src.llm.claude_cli._exec_claude", fake_exec)
     c = ClaudeCliClient(["claude"], "claude-sonnet-5", timeout=42)
@@ -535,29 +411,10 @@ def test_claude_cli_client_calls_exec_claude_and_wraps_result(monkeypatch):
     assert comp.truncated is False
     assert comp.input_tokens == 123
     assert comp.output_tokens == 45
-    # Kolo 1 BLOCKING (plan-consensus) - system/user jdou ODDĚLENĚ do
-    # _exec_claude, NIKDY spojené.
-    assert seen["system"] == "SYS"
-    assert seen["user"] == "USR"
+    assert seen["prompt"] == "SYS\n\nUSR"
     assert seen["claude_cmd"] == ["claude"]
     assert seen["model"] == "claude-sonnet-5"
     assert seen["timeout"] == 42
-
-
-def test_claude_cli_client_truncated_true_when_stop_reason_is_max_tokens(monkeypatch):
-    """Kolo 1 IMPORTANT (plan-consensus) - `truncated` čte SKUTEČNÝ
-    `stop_reason` z JSON výstupu (stejný signál jako Anthropic API's
-    `resp.stop_reason`), ne natvrdo `False` (na rozdíl od `CodexLLMClient`,
-    kde `claude` CLI ekvivalent PROSTĚ EXISTUJE, na rozdíl od Codexu)."""
-    from src.llm.client import ClaudeCliClient
-    def fake_exec(system, user, *, claude_cmd, model, timeout):
-        return {"result": "usknuty text", "is_error": False, "subtype": "success",
-                "stop_reason": "max_tokens",
-                "usage": {"input_tokens": 1, "output_tokens": 1}}
-    monkeypatch.setattr("src.llm.claude_cli._exec_claude", fake_exec)
-    c = ClaudeCliClient(["claude"], "m")
-    comp = c.complete(system="s", user="u", max_tokens=10, model="m")
-    assert comp.truncated is True
 
 
 def test_claude_cli_client_default_timeout_from_config(monkeypatch):
@@ -565,11 +422,9 @@ def test_claude_cli_client_default_timeout_from_config(monkeypatch):
     import config
     monkeypatch.setattr(config, "CLAUDE_CLI_CRITIC_TIMEOUT_SECONDS", 99)
     seen = {}
-    def fake_exec(system, user, *, claude_cmd, model, timeout):
+    def fake_exec(prompt, *, claude_cmd, model, timeout):
         seen["timeout"] = timeout
-        return {"result": "ok", "is_error": False, "subtype": "success",
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 1, "output_tokens": 1}}
+        return {"result": "ok", "is_error": False, "usage": {"input_tokens": 1, "output_tokens": 1}}
     monkeypatch.setattr("src.llm.claude_cli._exec_claude", fake_exec)
     c = ClaudeCliClient(["claude"], "m")   # timeout NEZADÁN
     c.complete(system="s", user="u", max_tokens=10, model="m")
@@ -629,27 +484,6 @@ def test_claude_cli_client_does_not_wrap_timeout_as_fatal_run_error(monkeypatch)
     c = ClaudeCliClient(["claude"], "m")
     with pytest.raises(ClaudeCliTimeoutError):
         c.complete(system="s", user="u", max_tokens=10, model="m")
-
-
-def test_claude_cli_client_wraps_os_and_unicode_errors_as_fatal_run_error(monkeypatch):
-    """Kolo 1 IMPORTANT (plan-consensus) - `_exec_claude()`'s vlastní
-    `except BaseException: _kill_process_tree(proc); raise` (kill-tree
-    na Ctrl+C, ale JINAK holé re-raise) nechá `UnicodeDecodeError`
-    (poškozené kódování stdout) i `OSError` unikat NEREDIGOVANÉ z
-    `ClaudeCliClient.complete()`, protože jeho `except` klauzule dřív
-    chytala jen `(ClaudeCliUnavailable, ClaudeCliExecError)`. Rozšířeno
-    na `(ClaudeCliUnavailable, ClaudeCliExecError, OSError, UnicodeError)` -
-    stejný vzor jako `CodexLLMClient.complete()`'s `except (StylistError,
-    OSError, UnicodeError)`."""
-    from src.llm.client import ClaudeCliClient, ClaudeCliFatalError
-    for exc in (OSError("soubor je zamčený"),
-               UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")):
-        def boom(*a, _exc=exc, **k):
-            raise _exc
-        monkeypatch.setattr("src.llm.claude_cli._exec_claude", boom)
-        c = ClaudeCliClient(["claude"], "m")
-        with pytest.raises(ClaudeCliFatalError):
-            c.complete(system="s", user="u", max_tokens=10, model="m")
 ```
 
 - [ ] **Step 6: Ověř selhání (ClaudeCliClient)**
@@ -665,15 +499,12 @@ V `src/llm/client.py`, HNED ZA `class CodexTranslatorFatalError(FatalRunError): 
 ```python
 class ClaudeCliFatalError(FatalRunError):
     """Fatální chyba VZNIKLÁ PŘÍMO v `ClaudeCliClient.complete()` volání
-    (nenulový exit kód, nečitelný/špatně tvarovaný JSON výstup, `OSError`/
-    `UnicodeError` při čtení výstupu) - podtřída `FatalRunError`. NENÍ
-    translator-specifická jako `CodexTranslatorFatalError` - kritik je
-    teď VŽDY tenhle backend, nezávisle na `--translator`, takže
+    (nenulový exit kód, nečitelný JSON výstup) - podtřída `FatalRunError`.
+    NENÍ translator-specifická jako `CodexTranslatorFatalError` - kritik
+    je teď VŽDY tenhle backend, nezávisle na `--translator`, takže
     `_cmd_run` (main.py) ji NEROZLIŠUJE zvlášť, spadá do obecné `except
     FatalRunError: raise` větve stejně jako dřívější `AnthropicClient`
-    chyby (auth, rate limit atd.). Timeout NENÍ součástí týhle třídy -
-    `ClaudeCliTimeoutError` zůstává samostatná, nefatální (viz Global
-    Constraints)."""
+    chyby (auth, rate limit atd.)."""
 ```
 
 HNED ZA `class CodexLLMClient: ...` (před `class FakeLLMClient`), přidej:
@@ -702,13 +533,11 @@ class ClaudeCliClient:
     def complete(self, *, system: str, user: str, max_tokens: int, model: str) -> Completion:
         import config
         from src.llm import claude_cli
-        # Kolo 1 BLOCKING (plan-consensus) - `system`/`user` se posílají
-        # ODDĚLENĚ do `_exec_claude()` (`--system-prompt` flag +
-        # STDIN), NIKDY spojené do jednoho blobu - viz Global Constraints.
+        prompt = f"{system}\n\n{user}"
         timeout = self._timeout or config.CLAUDE_CLI_CRITIC_TIMEOUT_SECONDS
         try:
             payload = claude_cli._exec_claude(
-                system, user, claude_cmd=self._claude_cmd, model=self._model,
+                prompt, claude_cmd=self._claude_cmd, model=self._model,
                 timeout=timeout)
         except claude_cli.ClaudeCliTimeoutError:
             # Timeout NEpřebalujeme - `_run_critic()` (pipeline.py) má
@@ -718,30 +547,13 @@ class ClaudeCliClient:
             # kapitola pokračuje s pseudo-nálezem), stejně jako každá
             # jiná dnešní kritikova chyba PŘED týmhle plánem.
             raise
-        except (claude_cli.ClaudeCliUnavailable, claude_cli.ClaudeCliExecError,
-               OSError, UnicodeError) as e:
-            # Kolo 1 IMPORTANT (plan-consensus) - `_exec_claude()`'s
-            # `except BaseException: ... raise` (kill-tree na Ctrl+C)
-            # nechá `OSError`/`UnicodeDecodeError` (poškozené kódování
-            # stdout) propadnout NEZABALENÉ - stejná třída rizika jako
-            # `CodexLLMClient`'s kolo 7 IMPORTANT (minulý plán), stejná
-            # oprava (širší `except`, stejná redakce).
+        except (claude_cli.ClaudeCliUnavailable, claude_cli.ClaudeCliExecError) as e:
             from src.agents import stylist
             raise ClaudeCliFatalError(stylist._redact_detail(str(e))) from e
         usage = payload.get("usage") or {}
-        # Kolo 1 IMPORTANT (plan-consensus) - `truncated` čte SKUTEČNÝ
-        # `stop_reason` (ověřeno spikem - `claude -p --output-format
-        # json` ho vrací, stejný signál jako Anthropic API's `resp.
-        # stop_reason`), ne natvrdo `False`. NA ROZDÍL od `CodexLLMClient`
-        # (Codex CLI žádný ekvivalent nemá, `truncated=False` je tam
-        # ZDOKUMENTOVANÝ limit) - `claude` CLI signál MÁ, takže se
-        # POUŽÍVÁ. `max_tokens` parametr samotný STÁLE nemá CLI
-        # ekvivalent (žádný limit flag) - `critic.review()`'s retry na
-        # truncation detekci správně zachytí, ale limit nezvýší (stejný
-        # přijatý limit jako Codex).
         return Completion(
             text=payload.get("result") or "",
-            truncated=payload.get("stop_reason") == "max_tokens",
+            truncated=False,
             input_tokens=usage.get("input_tokens") or 1,
             output_tokens=usage.get("output_tokens") or 1,
         )
@@ -865,8 +677,7 @@ from src.llm.client import (AnthropicClient, ClaudeCliClient, CodexLLMClient,
 ```
 
 V `_cmd_run` (main.py), najdi CELÝ blok (zaveden minulým plánem, teď
-se NAHRAZUJE - kolo 1 IMPORTANT, plan-consensus, viz Global Constraints
-"NOVÁ eager `claude` CLI preflight kontrola"):
+se ruší):
 
 ```python
         # Kolo 22 IMPORTANT (plan-consensus) - eager preflight výš
@@ -892,99 +703,24 @@ se NAHRAZUJE - kolo 1 IMPORTANT, plan-consensus, viz Global Constraints
             return 1
 ```
 
-nahraď (kritik je teď VŽDY `claude` CLI, NEZÁVISLE na `args.translator` -
-kontrola tedy jde MIMO `if args.translator == "codex":` blok, běží se
-při KAŽDÉM `run`u):
+smaž CELÝ tenhle blok (nic ho nenahrazuje - kritik už API klíč
+nepotřebuje, kontrola by ověřovala něco, na čem nezáleží).
 
-```python
-    claude_cmd, preflight_err = _claude_cli_preflight()
-    if preflight_err:
-        _say(f"Kritik vyžaduje funkční claude CLI: {preflight_err}")
-        return 1
-```
-
-Přidej NOVOU `_claude_cli_preflight()` funkci do main.py (HNED PŘED
-`_cmd_run`, vedle existující `_polish_preflight()`):
-
-```python
-def _claude_cli_preflight() -> tuple:
-    """Kritik je VŽDY `claude` CLI (žádný fallback) - ověř DŘÍV, než
-    `run` začne zpracovávat frontu, ať se u `--translator codex`
-    nepřeloží (a nezaplatí) celá kapitola, než kritik zjistí chybějící/
-    nepřihlášené CLI. Vrací `(claude_cmd, None)` při úspěchu,
-    `(None, chybová_hláška)` při selhání - stejný tvar jako existující
-    `_polish_preflight()`. `claude auth status --json` (~0.5s, žádné
-    tokeny/API volání, ověřeno spikem 2026-09-21) je jediný levný
-    způsob, jak ověřit PŘIHLÁŠENÍ (na rozdíl od `_polish_preflight()`'s
-    Codex kontrol, co jsou čistě config/PATH - `claude` CLI dostupnost
-    samotná NEZARUČUJE platnou OAuth session)."""
-    from src.llm import claude_cli
-    try:
-        claude_cmd = claude_cli._resolve_claude_cmd(["claude"])
-    except claude_cli.ClaudeCliUnavailable as e:
-        return None, str(e)
-    try:
-        result = subprocess.run(claude_cmd + ["auth", "status", "--json"],
-                                capture_output=True, text=True, timeout=10)
-        status = json.loads(result.stdout)
-    except (subprocess.TimeoutExpired, OSError, ValueError) as e:
-        return None, (f"Nepodařilo se ověřit přihlášení claude CLI "
-                      f"({type(e).__name__}: {e}).")
-    if not status.get("loggedIn"):
-        return None, "claude CLI není přihlášené - spusť `claude login`."
-    return claude_cmd, None
-```
-
-Přidej `import subprocess` k existujícím importům na main.py (pokud
-tam ještě není - `json` už tam je).
-
-Existující testy, co ANTHROPIC_API_KEY blok mockovaly/ověřovaly
-(`test_run_translator_codex_missing_anthropic_key_fails_eager` a
-jakékoli `monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")`
-řádky přidané JEN kvůli týhle kontrole) - najdi je (`grep -rn
+Existující testy, co tenhle blok mockovaly/ověřovaly (`test_run_
+translator_codex_missing_anthropic_key_fails_eager` a jakékoli
+`monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")` řádky
+přidané JEN kvůli týhle kontrole) - najdi je (`grep -rn
 "ANTHROPIC_API_KEY" tests/test_cli.py`) a smaž/uprav podle toho, co
-zbylo z jejich PŮVODNÍHO účelu. `test_run_translator_codex_missing_
-anthropic_key_fails_eager` testovalo PŘESNĚ tenhle zrušený blok - smaž
-ho celý. VŠECHNY existující `_run(["run", ...])`/`_run(["run"])` testy
-(`test_cli.py`, i ty BEZ `--translator codex`) teď navíc potřebují
-mock `_claude_cli_preflight()` na úspěch (nová kontrola běží PRO
-KAŽDÝ `run`, ne jen `--translator codex`) - přidej `monkeypatch.
-setattr("main._claude_cli_preflight", lambda: (["claude"], None))`
-všude, kde dřív chyběl `ANTHROPIC_API_KEY` mock nebo kde test dřív
-spoléhal na to, že kritik se vůbec nezavolá (grep `_run\(\["run"` v
-`tests/test_cli.py` a projdi VŠECHNY výskyty).
-
-Přidej regresní test pro NOVOU preflight kontrolu:
-
-```python
-def test_run_claude_cli_preflight_failure_blocks_queue_before_translation(
-        tmp_path, monkeypatch):
-    """Kolo 1 IMPORTANT (plan-consensus) - bez eager kontroly by
-    chybějící/nepřihlášené `claude` CLI nechalo proběhnout celý
-    (u --translator codex zaplacený) překlad, než by run selhal na
-    kritikovi - stejné riziko jako `ANTHROPIC_API_KEY` (minulý plán,
-    zrušeno) i jako Codexova FS-risk eager kontrola."""
-    book = tmp_path / "k.txt"
-    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
-    _run(["init", str(book)], tmp_path, monkeypatch)
-    monkeypatch.setattr("main._claude_cli_preflight",
-                        lambda: (None, "claude CLI není přihlášené."))
-    import src.pipeline as P
-    calls = {"n": 0}
-    def boom(db_path, chapter, *, client_factory, guide):
-        calls["n"] += 1
-        return {"idx": chapter["idx"], "status": "done", "revision_rounds": 0}
-    monkeypatch.setattr(P, "process_chapter", boom)
-    assert _run(["run"], tmp_path, monkeypatch) == 1
-    assert calls["n"] == 0   # zadny preklad se vubec nespustil
-```
+zbylo z jejich PŮVODNÍHO účelu (většina mocků zůstává neškodná i po
+smazání, protože nikdo `ANTHROPIC_API_KEY` už nekontroluje - ale
+`test_run_translator_codex_missing_anthropic_key_fails_eager` samo
+testovalo PŘESNĚ tenhle zrušený blok, ten test smaž celý).
 
 - [ ] **Step 4: Ověř úspěch**
 
 Run: `pytest tests/test_cli.py -v`
-Expected: PASS (zkontroluj especially, že KAŽDÝ existující `_run(["run"...`
-test má `_claude_cli_preflight` mockovanou na úspěch, jinak selže na
-NOVÉ eager kontrole, ne na tom, co skutečně testuje)
+Expected: PASS (zkontroluj especially, že žádný zbylý test needěpendí
+na zrušené `ANTHROPIC_API_KEY` eager kontrole)
 
 - [ ] **Step 5: Commit**
 
