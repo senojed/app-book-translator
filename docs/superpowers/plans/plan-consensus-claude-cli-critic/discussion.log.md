@@ -53,3 +53,16 @@ Opraveno: 1 IMPORTANT (auth status samo neoveri, ze CLI verze podporuje
 potrebne flagy - opraveno levnou claude --help substring kontrolou pred
 auth statusem, zadne tokeny/API volani navic). Existujici 4 testy
 upraveny na dvoukrokovy subprocess.run mock (--help pak auth status).
+
+## Round 5
+
+- Codex: [round-5-codex.md](round-5-codex.md) — CHANGES_NEEDED
+- Claude: [round-5-claude.md](round-5-claude.md) — CHANGES_NEEDED
+
+Opraveno: 3 IMPORTANT (--help returncode nekontrolovan, opakovani
+stejneho vzoru jako kolo 2 - opraveno; "loggedIn": "false" (string,
+truthy) by proslo jako prihlaseny - opraveno na striktni "is not True";
+ctyri EXISTUJICI fake/spy _client_factory nahrady v realnych testech
+(test_cli.py, test_polish_server.py, z drivejsiho planu) nemaji
+claude_cmd parametr, nova keyword by je rozbila - explicitne
+vyjmenovano vsech 5 mist k oprave + novy end-to-end test).

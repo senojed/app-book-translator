@@ -915,6 +915,35 @@ co eager preflight nedělají. Volající, co `_claude_cli_preflight()`
 UŽ zavolali (`_cmd_run`/`_cmd_polish`/polish-server, viz níž), předají
 JEHO resolvnutou hodnotu - žádná duplicitní práce, žádná TOCTOU mezera.)
 
+**Kolo 5 IMPORTANT (plan-consensus) - existující fake/spy `_client_
+factory` náhrady v testech NEMAJÍ `claude_cmd` parametr:** Nová
+`claude_cmd=claude_cmd` keyword na volajících stranách (`_cmd_run`/
+`_cmd_polish`/polish-server, viz níž) rozbije KAŽDÝ existující test, co
+`main._client_factory`/`main._client_factory` monkeypatchuje na
+VLASTNÍ fake/spy funkci BEZ tohohle parametru - `TypeError:
+got an unexpected keyword argument 'claude_cmd'`. Najdi VŠECHNY (grep
+`def _fake_client_factory\|def spy_factory` napříč `tests/`) a přidej
+jim `claude_cmd=None` (nepoužitý, jen ať signatura sedí) NEBO (tam, kde
+spy PŘEDÁVÁ argumenty dál do `real_factory`, viz `spy_factory` v
+`tests/test_cli.py:1709,1728`) ho zachyť a přepošli:
+
+- `tests/test_cli.py:1048` (`_fake_client_factory` v `test_cmd_polish_
+  passes_require_lock_callback_to_client_factory`) - přidej
+  `claude_cmd=None` do signatury.
+- `tests/test_cli.py:1709,1728` (`spy_factory` ve dvou `test_run_
+  translator_flag_*` testech) - přidej `claude_cmd=None` do signatury
+  A do `real_factory(...)` předávaného volání (`real_factory(rid,
+  interactive=interactive, require_lock=require_lock, translator_
+  backend=translator_backend, claude_cmd=claude_cmd)`).
+- `tests/test_polish_server.py:914` (`_fake_client_factory` v
+  regenerate testu) - přidej `claude_cmd=None` do signatury.
+
+Žádný z těchhle čtyř testů claude_cmd HODNOTU needeleguje/needeleguje
+(jsou o JINÉM aspektu drátování) - stačí, aby signatura přijala
+argument, ať volání nespadne. Přidán SAMOSTATNÝ nový test (`tests/
+test_cli.py`, viz Step 1 výš), co claude_cmd threadování SKUTEČNĚ
+ověřuje End-to-End přes `_cmd_run`.
+
 Pak `_client_factory`'s `factory()`, najdi:
 
 ```python
@@ -1028,6 +1057,14 @@ def _claude_cli_preflight() -> tuple:
     except (subprocess.TimeoutExpired, OSError) as e:
         return None, (f"Nepodařilo se ověřit verzi claude CLI "
                       f"({type(e).__name__}: {e}).")
+    # Kolo 5 IMPORTANT (plan-consensus) - `returncode` se PŘED touhle
+    # opravou nekontroloval - neúspěšné `--help` (nenulový exit kód) se
+    # stdoutem, co náhodou/částečně obsahuje flagové názvy, by prošlo
+    # jako "úspěch" (stejná třída chyby jako `auth status`'s vlastní
+    # returncode kontrola níž).
+    if help_result.returncode != 0:
+        return None, (f"`claude --help` skončilo s kódem "
+                      f"{help_result.returncode}: {help_result.stderr.strip()}")
     missing = [f for f in _REQUIRED_FLAGS if f not in help_result.stdout]
     if missing:
         return None, (f"claude CLI nepodporuje potřebné volby "
@@ -1057,7 +1094,11 @@ def _claude_cli_preflight() -> tuple:
     if not isinstance(status, dict):
         return None, (f"`claude auth status` vrátilo neočekávaný JSON "
                       f"tvar ({type(status).__name__}, ne objekt).")
-    if not status.get("loggedIn"):
+    # Kolo 5 IMPORTANT (plan-consensus) - `not status.get("loggedIn")`
+    # by NEODMÍTLO `"loggedIn": "false"` (neprázdný STRING je v Pythonu
+    # truthy!) - striktní `is not True` kontrola vyžaduje SKUTEČNÝ
+    # bool `true` z JSON, ne cokoli truthy.
+    if status.get("loggedIn") is not True:
         return None, "claude CLI není přihlášené - spusť `claude login`."
     return claude_cmd, None
 ```
@@ -1123,6 +1164,34 @@ def test_run_claude_cli_preflight_failure_blocks_queue_before_translation(
     assert calls["n"] == 0   # zadny preklad se vubec nespustil
 
 
+def test_run_threads_preflight_resolved_claude_cmd_into_client_factory(
+        tmp_path, monkeypatch):
+    """Kolo 5 IMPORTANT (plan-consensus) - end-to-end ověření, že
+    `_cmd_run` SKUTEČNĚ předá `_claude_cli_preflight()`'s resolvnutou
+    hodnotu do `_client_factory(..., claude_cmd=...)`, ne jen že
+    `_client_factory` sama umí parametr přijmout (to ověřují Task 2/3's
+    unit testy zvlášť)."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._claude_cli_preflight",
+                        lambda: (["/resolved/claude"], None))
+    import src.pipeline as P
+    monkeypatch.setattr(P, "process_chapter",
+                        lambda db_path, chapter, *, client_factory, guide: {
+                            "idx": chapter["idx"], "status": "done", "revision_rounds": 0})
+    real_factory = main._client_factory
+    captured = {}
+    def spy_factory(rid, *, interactive, require_lock=None,
+                    translator_backend="claude", claude_cmd=None):
+        captured["claude_cmd"] = claude_cmd
+        return real_factory(rid, interactive=interactive, require_lock=require_lock,
+                            translator_backend=translator_backend, claude_cmd=claude_cmd)
+    monkeypatch.setattr(main, "_client_factory", spy_factory)
+    assert _run(["run"], tmp_path, monkeypatch) == 0
+    assert captured["claude_cmd"] == ["/resolved/claude"]
+
+
 def _fake_help_result():
     """Sdílená pomocná - `_claude_cli_preflight()` (kolo 4) volá
     `subprocess.run` DVAKRÁT (`--help` PAK `auth status --json`) - testy
@@ -1151,6 +1220,43 @@ def test_claude_cli_preflight_missing_flags_returns_error(monkeypatch):
     claude_cmd, err = main._claude_cli_preflight()
     assert claude_cmd is None
     assert "--safe-mode" in err
+
+
+def test_claude_cli_preflight_help_nonzero_exit_returns_error(monkeypatch):
+    """Kolo 5 IMPORTANT (plan-consensus) - `--help`'s VLASTNÍ returncode
+    se musí kontrolovat stejně jako `auth status`'s - neúspěšné `--help`
+    s náhodou/částečně obsaženými flagovými názvy ve stdoutu by jinak
+    prošlo jako "úspěch"."""
+    import subprocess
+    class FakeHelpResultFailed:
+        returncode = 1
+        stdout = "--safe-mode --tools --system-prompt --output-format"
+        stderr = "segfault"
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeHelpResultFailed())
+    claude_cmd, err = main._claude_cli_preflight()
+    assert claude_cmd is None
+    assert "1" in err or "segfault" in err
+
+
+def test_claude_cli_preflight_logged_in_truthy_string_is_rejected(monkeypatch):
+    """Kolo 5 IMPORTANT (plan-consensus) - `"loggedIn": "false"` (STRING,
+    ne bool) je v Pythonu TRUTHY - `not status.get("loggedIn")` by ho
+    chybně přijalo jako přihlášené. Striktní `is not True` to odmítne."""
+    import subprocess
+    class FakeResult:
+        returncode = 0
+        stdout = '{"loggedIn": "false"}'
+        stderr = ""
+    calls = {"n": 0}
+    def fake_run(*a, **k):
+        calls["n"] += 1
+        return _fake_help_result() if calls["n"] == 1 else FakeResult()
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    claude_cmd, err = main._claude_cli_preflight()
+    assert claude_cmd is None
+    assert "přihlášené" in err
 
 
 def test_claude_cli_preflight_nonzero_exit_returns_error(monkeypatch):
