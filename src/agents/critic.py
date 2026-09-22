@@ -45,6 +45,13 @@ MUSÍ být "}". Přesný tvar:
 {"verdict": "pass", "findings": []}
 nebo (pokud najdeš problém):
 {"verdict": "revise", "findings": [{"severity": "critical", "type": "fidelity", "cz_excerpt": "příklad", "issue": "popis", "suggestion": "oprava"}]}
+"severity" SMÍ být VÝHRADNĚ jedna z těchto dvou hodnot: "critical" nebo
+"minor" - ŽÁDNÁ jiná (ne "high", ne "moderate", ne nic vlastního).
+"type" SMÍ být VÝHRADNĚ jedna z těchto tří hodnot: "fidelity", "fluency"
+nebo "register" - ŽÁDNÁ jiná (NE "missing_translation", NE "clarity", NE
+žádný jiný popisný výraz, i kdyby seděl líp - vyber tu NEJBLIŽŠÍ z těch
+tří). Odpověď s jakoukoli jinou hodnotou v "severity"/"type" bude CELÁ
+zahozena jako neplatná.
 Žádná próza, žádné vysvětlování mimo JSON. Automatizovaný pipeline
 tvou odpověď parsuje jako JSON - cokoli jiného způsobí selhání."""
 
