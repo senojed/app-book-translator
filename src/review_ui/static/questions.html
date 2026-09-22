@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<title>Otevřené otázky</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 1.5rem;
+        background: #f7f7f5; color: #1a1a1a; }
+  h1 { font-size: 1.3rem; }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  td, th { padding: .5rem .6rem; border-bottom: 1px solid #eee; text-align: left;
+          vertical-align: top; }
+  .badge { display: inline-block; padding: .1rem .5rem; border-radius: 3px;
+          font-size: .75rem; font-weight: 600; margin-right: .3rem; }
+  .badge-guess { background: #eef; color: #33c; }
+  .badge-blocking { background: #fee; color: #b3261e; }
+  .scope { color: #666; font-size: .85rem; }
+  input[type=text] { width: 100%; box-sizing: border-box; padding: .3rem .4rem;
+                     font-size: .85rem; border: 1px solid #ccc; border-radius: 4px; }
+  button { cursor: pointer; border: 1px solid #ccc; background: #fff;
+          border-radius: 4px; padding: .35rem .7rem; font-size: .85rem; }
+  button.primary { background: #1a6b3c; color: #fff; border-color: #1a6b3c; }
+  .row-msg { font-size: .8rem; margin-top: .3rem; }
+  .row-msg.error { color: #b3261e; }
+  .row-msg.ok { color: #1a6b3c; }
+  .row.done { opacity: .4; }
+  #banner { font-size: .9rem; margin-bottom: 1rem; padding: .5rem .7rem;
+           border-radius: 4px; background: #eef; color: #224; display: none; }
+  #banner.show { display: block; }
+  #empty { color: #888; }
+</style>
+</head>
+<body>
+<h1>Otevřené otázky</h1>
+<div id="banner"></div>
+<p id="empty" style="display:none">Žádné otevřené otázky.</p>
+<table id="q-table">
+  <thead><tr><th>Rozsah</th><th>Otázka</th><th>Odpověď</th><th></th></tr></thead>
+  <tbody id="q-body"></tbody>
+</table>
+
+<script>
+function el(tag, opts, children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(opts || {})) {
+    if (k === 'class') e.className = v;
+    else if (k === 'text') e.textContent = v;
+    else e.setAttribute(k, v);
+  }
+  for (const c of children || []) e.appendChild(c);
+  return e;
+}
+
+function showBanner(text) {
+  const b = document.getElementById('banner');
+  b.textContent = text;
+  b.classList.add('show');
+}
+
+function renderRow(q) {
+  const scope = q.chapter_idx != null ? `kapitola ${q.chapter_idx}` : 'globální';
+  const sevBadge = el('span', {
+    class: 'badge ' + (q.severity === 'blocking' ? 'badge-blocking' : 'badge-guess'),
+    text: q.severity,
+  });
+  const scopeCell = el('td', {}, [
+    sevBadge,
+    el('div', { class: 'scope', text: `${q.kind} / ${scope}` }),
+  ]);
+  const textCell = el('td', { text: q.text });
+  const input = el('input', { type: 'text', value: q.guess_answer || '' });
+  const answerCell = el('td', {}, [input]);
+  const saveBtn = el('button', { class: 'primary', text: 'Uložit' });
+  const msg = el('div', { class: 'row-msg' });
+  const actionCell = el('td', {}, [saveBtn, msg]);
+  const row = el('tr', { class: 'row', 'data-qid': q.id }, [
+    scopeCell, textCell, answerCell, actionCell,
+  ]);
+
+  saveBtn.addEventListener('click', async () => {
+    msg.textContent = '';
+    msg.className = 'row-msg';
+    const text = input.value;
+    let r, body;
+    try {
+      r = await fetch('/api/answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ qid: q.id, text }),
+      });
+      body = await r.json();
+    } catch (e) {
+      msg.textContent = 'Chyba spojení - zkus znovu.';
+      msg.classList.add('error');
+      return;
+    }
+    if (!r.ok) {
+      msg.textContent = body.error || 'Nepodařilo se uložit.';
+      msg.classList.add('error');
+      return;
+    }
+    row.classList.add('done');
+    input.disabled = true;
+    saveBtn.disabled = true;
+    msg.textContent = 'Zapsáno.';
+    msg.classList.add('ok');
+    if (body.requeued && body.requeued.length) {
+      showBanner(`Přepočítat kapitoly: ${body.requeued.join(', ')} (spusť run).`);
+    } else if (body.chapter_status_changed) {
+      showBanner('Kapitola uvolněna k překladu (spusť run).');
+    }
+  });
+
+  return row;
+}
+
+async function load() {
+  const tbody = document.getElementById('q-body');
+  let r, rows;
+  try {
+    r = await fetch('/api/questions');
+    rows = await r.json();
+  } catch (e) {
+    tbody.innerHTML = '';
+    tbody.appendChild(el('tr', {}, [el('td', { colspan: '4', text: 'Chyba načtení.' })]));
+    return;
+  }
+  if (!rows.length) {
+    document.getElementById('empty').style.display = 'block';
+    document.getElementById('q-table').style.display = 'none';
+    return;
+  }
+  tbody.innerHTML = '';
+  for (const q of rows) tbody.appendChild(renderRow(q));
+}
+
+load();
+</script>
+</body>
+</html>

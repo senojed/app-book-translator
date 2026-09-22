@@ -39,7 +39,7 @@ from src.llm.client import (AnthropicClient, ClaudeCliClient, CodexLLMClient,
                            OutputTruncated, PipelineLLMClient)
 
 _MUTATING = {"init", "scan", "run", "answer", "review", "reference", "polish",
-            "polish-review"}
+            "polish-review", "questions-review"}
 
 _MARKERS = {"done": "OK", "pending": "..", "flagged": "!!", "needs_human": "??",
             "error": "XX", "processing": "~~"}
@@ -1040,6 +1040,12 @@ def _cmd_polish_review(args) -> int:
         return 1
 
 
+def _cmd_questions_review(args) -> int:
+    from src.review_ui import questions_server
+    return questions_server.run_questions_review_server(
+        config.DB_PATH, config.GUIDE_PATH)
+
+
 def _claude_cli_preflight() -> tuple:
     """Kritik je VŽDY `claude` CLI (žádný fallback) - ověř DŘÍV, než
     `run` začne zpracovávat frontu, ať se u `--translator codex`
@@ -1868,6 +1874,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("polish-review", help="web UI: ruční review stylistického "
                    "průchodu, apply/revert per kapitola").set_defaults(
                        func=_cmd_polish_review)
+
+    sub.add_parser("questions-review", help="web UI: odpovídání na otevřené "
+                   "otázky (nové termíny, cross-kapitolový drift)").set_defaults(
+                       func=_cmd_questions_review)
 
     sub.add_parser("status", help="přehled kapitol").set_defaults(func=_cmd_status)
     sub.add_parser("questions", help="otevřené otázky").set_defaults(func=_cmd_questions)
