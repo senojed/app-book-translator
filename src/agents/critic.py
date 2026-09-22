@@ -27,6 +27,27 @@ Vrať POUZE JSON, žádný text kolem:
 "minor" = stylistická drobnost. Když je překlad v pořádku, vrať verdict "pass"
 a prázdné findings. Nevymýšlej nálezy, abys nevypadal užitečně."""
 
+# Kritik přes `claude` CLI (`--safe-mode`, viz src/llm/claude_cli.py) - stejné
+# riziko jako translator (2026-09-22): `claude -p --safe-mode` nedodrží
+# formát ze SAMOTNÉHO system promptu spolehlivě (pozorováno 0/2 při prvním
+# manuálním ověření - CLI vrátilo volnou prózu/markdown místo JSON). STEJNÁ
+# oprava jako translator (spike 2026-09-22, viz translator.
+# CLI_FORMAT_REINFORCEMENT): reinforcement text PŘIPOJENÝ na konec USER
+# zprávy (`ClaudeCliClient.complete()`'s `reinforcement` parametr), s
+# PŘESNÝM příkladem tvaru JSON - dalo 6/6 úspěch (3× na vadných datech,
+# 3× na reálném EN/CZ páru z claude-cli translatoru).
+CLI_REINFORCEMENT = """
+
+DŮLEŽITÉ: Odpověz VÝHRADNĚ JSON objektem, ŽÁDNÝ text před ním ani po
+něm, ŽÁDNÁ markdown formátování (žádné # nadpisy, žádné **tučné**,
+žádné odrážky). PRVNÍ znak tvé odpovědi MUSÍ být "{" a POSLEDNÍ znak
+MUSÍ být "}". Přesný tvar:
+{"verdict": "pass", "findings": []}
+nebo (pokud najdeš problém):
+{"verdict": "revise", "findings": [{"severity": "critical", "type": "fidelity", "cz_excerpt": "příklad", "issue": "popis", "suggestion": "oprava"}]}
+Žádná próza, žádné vysvětlování mimo JSON. Automatizovaný pipeline
+tvou odpověď parsuje jako JSON - cokoli jiného způsobí selhání."""
+
 
 def _to_finding(raw: dict) -> dict:
     severity = raw.get("severity") or "minor"

@@ -1698,6 +1698,18 @@ def test_client_factory_critic_always_uses_claude_cli_client(monkeypatch):
     assert client._inner.billed_model == f"{config.MODEL_CRITIC}-cli"
 
 
+def test_client_factory_critic_uses_cli_reinforcement(monkeypatch):
+    """`claude -p --safe-mode` nedodrží kritikův JSON formát spolehlivě
+    bez reinforcementu (pozorováno manuálně, opraveno stejnou technikou
+    jako translator - viz `critic.CLI_REINFORCEMENT`, spike 2026-09-22,
+    6/6 úspěch)."""
+    from src.agents import critic as critic_mod
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    factory = main._client_factory(1, interactive=False)
+    client = factory("critic")
+    assert client._inner._reinforcement == critic_mod.CLI_REINFORCEMENT
+
+
 def test_client_factory_critic_uses_preflight_resolved_claude_cmd(monkeypatch):
     """Kolo 3 IMPORTANT (plan-consensus) - `_claude_cli_preflight()`
     (Task 3) resolvne `claude` na ABSOLUTNÍ cestu A ověří přihlášení
@@ -1742,7 +1754,12 @@ def test_client_factory_translator_backend_claude_cli_uses_claude_cli_client(mon
     assert t_client._inner._fatal_error_cls is ClaudeCliTranslatorFatalError
     c_client = factory("critic")
     assert c_client._inner._fatal_error_cls is ClaudeCliFatalError
-    assert c_client._inner._reinforcement is None
+    # Kritik má SVOJI reinforcement (critic.CLI_REINFORCEMENT, přidáno
+    # 2026-09-22) - jinou než translator, ne None - ověřuje se u ní jen,
+    # že translator/critic reinforcement NEJSOU stejný text (žádná
+    # křížová kontaminace), přesný obsah kritikovy varianty testuje
+    # test_client_factory_critic_uses_cli_reinforcement zvlášť.
+    assert c_client._inner._reinforcement != t_client._inner._reinforcement
 
 
 def test_client_factory_translator_default_claude_unaffected_by_critic_change(

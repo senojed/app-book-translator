@@ -33,7 +33,7 @@ from src import findings as findings_mod
 from src import ingest, pipeline, polish_store, requeue, state
 from src import reference as reference_mod
 from src import reference_mine, textnorm
-from src.agents import scout, stylist, translator
+from src.agents import critic, scout, stylist, translator
 from src.llm.client import (AnthropicClient, ClaudeCliClient, ClaudeCliTranslatorFatalError,
                            CodexLLMClient, CodexTranslatorFatalError, FatalRunError,
                            LockLostError, OutputTruncated, PipelineLLMClient)
@@ -129,7 +129,8 @@ def _client_factory(run_id: int, *, interactive: bool, require_lock=None,
             # `_resolve_claude_cmd`) - vyhodí `ClaudeCliUnavailable` →
             # `ClaudeCliFatalError`, pokud přestala existovat MEZI
             # preflightem a skutečným voláním.
-            inner = ClaudeCliClient(claude_cmd or ["claude"], config.MODEL_CRITIC)
+            inner = ClaudeCliClient(claude_cmd or ["claude"], config.MODEL_CRITIC,
+                                    reinforcement=critic.CLI_REINFORCEMENT)
         else:
             inner = AnthropicClient()
         return PipelineLLMClient(inner, run_id=run_id, agent=agent,
