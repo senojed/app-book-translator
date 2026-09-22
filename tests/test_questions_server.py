@@ -94,3 +94,41 @@ def test_index_serves_html(tmp_path):
     r = client.get("/")
     assert r.status_code == 200
     assert "text/html" in r.headers["content-type"]
+
+
+def test_post_dismiss_marks_resolved_without_glossary_write(tmp_path):
+    app, db = _app(tmp_path, questions=[
+        {"kind": "term", "text": "Termín se překládá různě: pružná, prdele "
+         "(kapitoly 5). Který tvar je správný?", "scope_key": "pružná"},
+    ])
+    with state.connect(db) as conn:
+        qid = conn.execute("SELECT id FROM questions").fetchone()["id"]
+    client = TestClient(app)
+    r = client.post("/api/dismiss", json={"qid": qid, "note": "stemmer sum"})
+    assert r.status_code == 200
+    q = state.get_question(db, qid)
+    assert q["answer"] is not None
+    assert "zamítnuto" in q["answer"]
+    assert "stemmer sum" in q["answer"]
+    # NEobjeví se v nezodpovězených
+    assert q["id"] not in [r["id"] for r in state.unanswered_questions(db)]
+
+
+def test_post_dismiss_already_answered_returns_400(tmp_path):
+    app, db = _app(tmp_path, questions=[
+        {"kind": "term", "text": "Sedí to?", "scope_key": "x", "guess_answer": "x"},
+    ])
+    with state.connect(db) as conn:
+        qid = conn.execute("SELECT id FROM questions").fetchone()["id"]
+    client = TestClient(app)
+    r1 = client.post("/api/dismiss", json={"qid": qid})
+    assert r1.status_code == 200
+    r2 = client.post("/api/dismiss", json={"qid": qid})
+    assert r2.status_code == 400
+
+
+def test_post_dismiss_unknown_qid_returns_400(tmp_path):
+    app, db = _app(tmp_path, questions=[])
+    client = TestClient(app)
+    r = client.post("/api/dismiss", json={"qid": 999})
+    assert r.status_code == 400

@@ -16,14 +16,26 @@
   .badge-blocking { background: #fee; color: #b3261e; }
   .scope { color: #666; font-size: .85rem; }
   input[type=text] { width: 100%; box-sizing: border-box; padding: .3rem .4rem;
-                     font-size: .85rem; border: 1px solid #ccc; border-radius: 4px; }
+                     font-size: .85rem; border: 1px solid #ccc; border-radius: 4px;
+                     margin-bottom: .35rem; }
   button { cursor: pointer; border: 1px solid #ccc; background: #fff;
-          border-radius: 4px; padding: .35rem .7rem; font-size: .85rem; }
+          border-radius: 4px; padding: .35rem .7rem; font-size: .85rem;
+          margin-right: .3rem; margin-bottom: .3rem; }
   button.primary { background: #1a6b3c; color: #fff; border-color: #1a6b3c; }
+  button.ghost { background: #fff; color: #555; }
+  button.danger-ghost { background: #fff; color: #b3261e; border-color: #f3c; }
+  button.small { padding: .15rem .5rem; font-size: .75rem; }
+  button.chip { background: #f0f0ee; border-color: #ddd; font-size: .8rem;
+               padding: .15rem .55rem; }
+  button.chip.active { background: #1a6b3c; color: #fff; border-color: #1a6b3c; }
   .row-msg { font-size: .8rem; margin-top: .3rem; }
   .row-msg.error { color: #b3261e; }
   .row-msg.ok { color: #1a6b3c; }
   .row.done { opacity: .4; }
+  .row.discuss { background: #fff8e1; }
+  .row.discuss .scope::after { content: " · k diskuzi"; color: #a66; }
+  .chips { margin-bottom: .35rem; }
+  .action-row { display: flex; flex-wrap: wrap; align-items: center; }
   #banner { font-size: .9rem; margin-bottom: 1rem; padding: .5rem .7rem;
            border-radius: 4px; background: #eef; color: #224; display: none; }
   #banner.show { display: block; }
@@ -57,6 +69,36 @@ function showBanner(text) {
   b.classList.add('show');
 }
 
+// Per-viewer "k diskuzi" flag - NENÍ perzistováno na serveru (žádná DB
+// změna, žádný sdílený stav), jen připomínka pro tenhle prohlížeč mezi
+// reloady. Obalené try/catch - private mode / zablokované úložiště nesmí
+// stránku shodit.
+const DISCUSS_KEY = 'bt-questions-discuss';
+function loadDiscussSet() {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(DISCUSS_KEY) || '[]'));
+  } catch (e) { return new Set(); }
+}
+function saveDiscussSet(set) {
+  try { localStorage.setItem(DISCUSS_KEY, JSON.stringify([...set])); } catch (e) {}
+}
+const discussSet = loadDiscussSet();
+
+// "Sedí to?" otázky nemají co přepisovat - guess_answer je hotová odpověď,
+// stačí potvrdit/odmítnout jedním klikem.
+function isConfirmQuestion(text) {
+  return /sedí to\?\s*$/i.test(text.trim());
+}
+
+// Drift otázky ("Termín se překládá různě: A, B, C (kapitoly ...)") mají
+// v textu vypsané POZOROVANÉ tvary - vytáhneme je jako klikací chips
+// místo prázdného pole, kam by se muselo hádat nazpaměť.
+function parseDriftForms(text) {
+  const m = text.match(/různě:\s*(.+?)\s*\(kapitoly/i);
+  if (!m) return null;
+  return m[1].split(',').map(s => s.trim()).filter(Boolean);
+}
+
 function renderRow(q) {
   const scope = q.chapter_idx != null ? `kapitola ${q.chapter_idx}` : 'globální';
   const sevBadge = el('span', {
@@ -68,19 +110,47 @@ function renderRow(q) {
     el('div', { class: 'scope', text: `${q.kind} / ${scope}` }),
   ]);
   const textCell = el('td', { text: q.text });
+
   const input = el('input', { type: 'text', value: q.guess_answer || '' });
-  const answerCell = el('td', {}, [input]);
-  const saveBtn = el('button', { class: 'primary', text: 'Uložit' });
+  const answerCell = el('td');
+  const driftForms = parseDriftForms(q.text);
+  if (driftForms && driftForms.length > 1) {
+    const chipsWrap = el('div', { class: 'chips' });
+    for (const form of driftForms) {
+      const chip = el('button', { class: 'chip', text: form });
+      chip.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        input.value = form;
+        chipsWrap.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+        chip.classList.add('active');
+      });
+      chipsWrap.appendChild(chip);
+    }
+    answerCell.appendChild(chipsWrap);
+  }
+  answerCell.appendChild(input);
+
   const msg = el('div', { class: 'row-msg' });
-  const actionCell = el('td', {}, [saveBtn, msg]);
+  const actionRow = el('div', { class: 'action-row' });
+  const actionCell = el('td', {}, [actionRow, msg]);
+
   const row = el('tr', { class: 'row', 'data-qid': q.id }, [
     scopeCell, textCell, answerCell, actionCell,
   ]);
+  if (discussSet.has(q.id)) row.classList.add('discuss');
 
-  saveBtn.addEventListener('click', async () => {
+  function markDone(label) {
+    row.classList.add('done');
+    row.classList.remove('discuss');
+    input.disabled = true;
+    actionRow.querySelectorAll('button').forEach(b => b.disabled = true);
+    msg.textContent = label;
+    msg.classList.add('ok');
+  }
+
+  async function submitAnswer(text) {
     msg.textContent = '';
     msg.className = 'row-msg';
-    const text = input.value;
     let r, body;
     try {
       r = await fetch('/api/answer', {
@@ -99,17 +169,70 @@ function renderRow(q) {
       msg.classList.add('error');
       return;
     }
-    row.classList.add('done');
-    input.disabled = true;
-    saveBtn.disabled = true;
-    msg.textContent = 'Zapsáno.';
-    msg.classList.add('ok');
+    markDone('Zapsáno.');
     if (body.requeued && body.requeued.length) {
       showBanner(`Přepočítat kapitoly: ${body.requeued.join(', ')} (spusť run).`);
     } else if (body.chapter_status_changed) {
       showBanner('Kapitola uvolněna k překladu (spusť run).');
     }
+  }
+
+  if (isConfirmQuestion(q.text) && q.guess_answer) {
+    const yesBtn = el('button', { class: 'primary', text: '✓ Ano' });
+    const noBtn = el('button', { class: 'ghost', text: '✗ Ne, jinak' });
+    yesBtn.addEventListener('click', () => submitAnswer(q.guess_answer));
+    noBtn.addEventListener('click', () => {
+      noBtn.style.display = 'none';
+      yesBtn.style.display = 'none';
+      saveBtn.style.display = '';
+    });
+    actionRow.appendChild(yesBtn);
+    actionRow.appendChild(noBtn);
+  }
+
+  const saveBtn = el('button', { class: 'primary', text: 'Uložit' });
+  if (isConfirmQuestion(q.text) && q.guess_answer) saveBtn.style.display = 'none';
+  saveBtn.addEventListener('click', () => submitAnswer(input.value));
+  actionRow.appendChild(saveBtn);
+
+  const dismissBtn = el('button', { class: 'danger-ghost small', text: 'Zahodit (šum)' });
+  dismissBtn.addEventListener('click', async () => {
+    msg.textContent = '';
+    msg.className = 'row-msg';
+    let r, body;
+    try {
+      r = await fetch('/api/dismiss', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ qid: q.id, note: 'ruční zahození z UI' }),
+      });
+      body = await r.json();
+    } catch (e) {
+      msg.textContent = 'Chyba spojení - zkus znovu.';
+      msg.classList.add('error');
+      return;
+    }
+    if (!r.ok) {
+      msg.textContent = body.error || 'Nepodařilo se zahodit.';
+      msg.classList.add('error');
+      return;
+    }
+    markDone('Zahozeno.');
   });
+  actionRow.appendChild(dismissBtn);
+
+  const discussBtn = el('button', { class: 'ghost small', text: 'K diskuzi' });
+  discussBtn.addEventListener('click', () => {
+    if (discussSet.has(q.id)) {
+      discussSet.delete(q.id);
+      row.classList.remove('discuss');
+    } else {
+      discussSet.add(q.id);
+      row.classList.add('discuss');
+    }
+    saveDiscussSet(discussSet);
+  });
+  actionRow.appendChild(discussBtn);
 
   return row;
 }

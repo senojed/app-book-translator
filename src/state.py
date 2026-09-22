@@ -528,6 +528,23 @@ def answer_question(db_path: str, qid: int, answer_text: str):
     return dict(r) if r else None
 
 
+def dismiss_question(db_path: str, qid: int, note: str = "") -> None:
+    """Zavře otázku jako šum (stemmer false-positive, irelevantní nález) -
+    NA ROZDÍL od `requeue.apply_answer` NEPÍŠE do glosáře ani nepřepočítává
+    kapitoly. `answer` dostane sentinel prefix `(zamítnuto)` - vizuálně a
+    programově odlišitelné od skutečné odpovědi (questions_review UI ho
+    zobrazuje jinak), otázka ale zmizí z `unanswered_questions` stejně."""
+    with connect(db_path) as conn:
+        q = conn.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
+        if q is None:
+            raise ValueError(f"Otázka {qid} neexistuje.")
+        if q["answer"] is not None:
+            raise ValueError(f"Otázka {qid} už je zodpovězená/zamítnutá.")
+        text = "(zamítnuto)" + (f": {note.strip()}" if note.strip() else "")
+        conn.execute("UPDATE questions SET answer=?, resolved_at=CURRENT_TIMESTAMP "
+                     "WHERE id=?", (text, qid))
+
+
 def chapter_has_open_blocking(db_path: str, chapter_idx: int) -> bool:
     with connect(db_path) as conn:
         r = conn.execute(

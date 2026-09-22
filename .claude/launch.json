@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "polish-review",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["main.py", "polish-review"],
+      "port": 8766
+    },
+    {
+      "name": "questions-review",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["main.py", "questions-review"],
+      "port": 8767
+    }
+  ]
+}

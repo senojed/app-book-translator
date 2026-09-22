@@ -43,6 +43,16 @@ def build_app(db_path: str, guide_path: str) -> FastAPI:
             return JSONResponse({"error": str(e)}, status_code=400)
         return out
 
+    @app.post("/api/dismiss")
+    def post_dismiss(payload: dict):
+        qid = payload.get("qid")
+        note = payload.get("note") or ""
+        try:
+            state.dismiss_question(db_path, qid, note)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        return {"ok": True}
+
     return app
 
 
