@@ -519,3 +519,156 @@ def test_pipeline_client_codex_normal_cost_guard_stop_stays_plain_fatal_run_erro
     with pytest.raises(FatalRunError) as exc_info:
         c.complete(system="s", user="u", max_tokens=100000, model="claude-sonnet-5")
     assert not isinstance(exc_info.value, CodexTranslatorFatalError)
+
+
+def test_claude_cli_client_calls_exec_claude_and_wraps_result(monkeypatch):
+    from src.llm.client import ClaudeCliClient
+    seen = {}
+    def fake_exec(system, user, *, claude_cmd, model, timeout):
+        seen.update(system=system, user=user, claude_cmd=claude_cmd,
+                    model=model, timeout=timeout)
+        return {"result": "nálezy: []", "is_error": False, "subtype": "success",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 123, "output_tokens": 45}}
+    monkeypatch.setattr("src.llm.claude_cli._exec_claude", fake_exec)
+    c = ClaudeCliClient(["claude"], "claude-sonnet-5", timeout=42)
+    comp = c.complete(system="SYS", user="USR", max_tokens=1000, model="claude-sonnet-5")
+    assert comp.text == "nálezy: []"
+    assert comp.truncated is False
+    assert comp.input_tokens == 123
+    assert comp.output_tokens == 45
+    # Kolo 1 BLOCKING (plan-consensus) - system/user jdou ODDĚLENĚ do
+    # _exec_claude, NIKDY spojené.
+    assert seen["system"] == "SYS"
+    assert seen["user"] == "USR"
+    assert seen["claude_cmd"] == ["claude"]
+    assert seen["model"] == "claude-sonnet-5"
+    assert seen["timeout"] == 42
+
+
+def test_claude_cli_client_truncated_true_when_stop_reason_is_max_tokens(monkeypatch):
+    """Kolo 1 IMPORTANT (plan-consensus) - `truncated` čte SKUTEČNÝ
+    `stop_reason` z JSON výstupu (stejný signál jako Anthropic API's
+    `resp.stop_reason`), ne natvrdo `False` (na rozdíl od `CodexLLMClient`,
+    kde `claude` CLI ekvivalent PROSTĚ EXISTUJE, na rozdíl od Codexu)."""
+    from src.llm.client import ClaudeCliClient
+    def fake_exec(system, user, *, claude_cmd, model, timeout):
+        return {"result": "usknuty text", "is_error": False, "subtype": "success",
+                "stop_reason": "max_tokens",
+                "usage": {"input_tokens": 1, "output_tokens": 1}}
+    monkeypatch.setattr("src.llm.claude_cli._exec_claude", fake_exec)
+    c = ClaudeCliClient(["claude"], "m")
+    comp = c.complete(system="s", user="u", max_tokens=10, model="m")
+    assert comp.truncated is True
+
+
+def test_claude_cli_client_complete_preserves_zero_usage(monkeypatch):
+    """Kolo 10 IMPORTANT (plan-consensus) - validní `input_tokens: 0`
+    (např. triviální/cachovaný prompt) se NESMÍ přepsat na `1` -
+    dřívější `usage.get("input_tokens") or 1` by nulu (falsy v
+    Pythonu) tiše nahradilo jedničkou, znehodnocující audit
+    `llm_calls`."""
+    from src.llm.client import ClaudeCliClient
+    def fake_exec(system, user, *, claude_cmd, model, timeout):
+        return {"result": "ok", "is_error": False, "subtype": "success",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 0, "output_tokens": 3}}
+    monkeypatch.setattr("src.llm.claude_cli._exec_claude", fake_exec)
+    c = ClaudeCliClient(["claude"], "claude-sonnet-5")
+    comp = c.complete(system="s", user="u", max_tokens=100, model="claude-sonnet-5")
+    assert comp.input_tokens == 0
+    assert comp.output_tokens == 3
+
+
+def test_claude_cli_client_default_timeout_from_config(monkeypatch):
+    from src.llm.client import ClaudeCliClient
+    import config
+    monkeypatch.setattr(config, "CLAUDE_CLI_CRITIC_TIMEOUT_SECONDS", 99)
+    seen = {}
+    def fake_exec(system, user, *, claude_cmd, model, timeout):
+        seen["timeout"] = timeout
+        return {"result": "ok", "is_error": False, "subtype": "success",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}}
+    monkeypatch.setattr("src.llm.claude_cli._exec_claude", fake_exec)
+    c = ClaudeCliClient(["claude"], "m")   # timeout NEZADÁN
+    c.complete(system="s", user="u", max_tokens=10, model="m")
+    assert seen["timeout"] == 99
+
+
+def test_claude_cli_client_billed_model_has_cli_suffix():
+    from src.llm.client import ClaudeCliClient
+    c = ClaudeCliClient(["claude"], "claude-sonnet-5")
+    assert c.billed_model == "claude-sonnet-5-cli"
+
+
+def test_claude_cli_client_count_tokens_is_conservative_estimate():
+    """Kolo 2 BLOCKING (plan-consensus) - `//4` (implementace), ne
+    `//2` (CodexLLMClient's jiná aproximace) - `(4+4)//4 == 2`."""
+    from src.llm.client import ClaudeCliClient
+    c = ClaudeCliClient(["claude"], "m")
+    assert c.count_tokens(system="abcd", user="efgh", model="m") == 2   # (4+4)//4
+
+
+def test_claude_cli_client_wraps_exec_errors_as_fatal_run_error(monkeypatch):
+    from src.llm.client import ClaudeCliClient, ClaudeCliFatalError
+    from src.llm.claude_cli import ClaudeCliExecError
+    def boom(*a, **k):
+        raise ClaudeCliExecError("claude -p skončilo s kódem 1: auth expired")
+    monkeypatch.setattr("src.llm.claude_cli._exec_claude", boom)
+    c = ClaudeCliClient(["claude"], "m")
+    with pytest.raises(ClaudeCliFatalError) as exc_info:
+        c.complete(system="s", user="u", max_tokens=10, model="m")
+    assert "auth expired" not in str(exc_info.value)   # redigováno
+    assert "potlačeny" in str(exc_info.value)
+
+
+def test_claude_cli_client_fatal_error_shows_detail_when_report_rejected_text_true(
+        monkeypatch):
+    from src.llm.client import ClaudeCliClient, ClaudeCliFatalError
+    from src.llm.claude_cli import ClaudeCliExecError
+    monkeypatch.setattr(config, "STYLIST_REPORT_REJECTED_TEXT", True)
+    def boom(*a, **k):
+        raise ClaudeCliExecError("claude -p skončilo s kódem 1: auth expired")
+    monkeypatch.setattr("src.llm.claude_cli._exec_claude", boom)
+    c = ClaudeCliClient(["claude"], "m")
+    with pytest.raises(ClaudeCliFatalError, match="auth expired"):
+        c.complete(system="s", user="u", max_tokens=10, model="m")
+
+
+def test_claude_cli_client_does_not_wrap_timeout_as_fatal_run_error(monkeypatch):
+    """Timeout jednoho volání je per-call/transientní - kritik selže na
+    `_run_critic()`'s existující `except Exception` větev (pseudo-nález,
+    critic_failed=True), NE zastaví celý run. NEmá stejný `except
+    (FatalRunError, KeyboardInterrupt)` checkpoint-rozsah jako Codex
+    translator (Task 2 minulého plánu), protože `_run_critic()` už
+    tohle rozlišení SAMO dělá - viz `pipeline.py:52-63`."""
+    from src.llm.client import ClaudeCliClient
+    from src.llm.claude_cli import ClaudeCliTimeoutError
+    def boom(*a, **k):
+        raise ClaudeCliTimeoutError("claude -p překročilo timeout 180s.")
+    monkeypatch.setattr("src.llm.claude_cli._exec_claude", boom)
+    c = ClaudeCliClient(["claude"], "m")
+    with pytest.raises(ClaudeCliTimeoutError):
+        c.complete(system="s", user="u", max_tokens=10, model="m")
+
+
+def test_claude_cli_client_wraps_os_and_unicode_errors_as_fatal_run_error(monkeypatch):
+    """Kolo 1 IMPORTANT (plan-consensus) - `_exec_claude()`'s vlastní
+    `except BaseException: _kill_process_tree(proc); raise` (kill-tree
+    na Ctrl+C, ale JINAK holé re-raise) nechá `UnicodeDecodeError`
+    (poškozené kódování stdout) i `OSError` unikat NEREDIGOVANÉ z
+    `ClaudeCliClient.complete()`, protože jeho `except` klauzule dřív
+    chytala jen `(ClaudeCliUnavailable, ClaudeCliExecError)`. Rozšířeno
+    na `(ClaudeCliUnavailable, ClaudeCliExecError, OSError, UnicodeError)` -
+    stejný vzor jako `CodexLLMClient.complete()`'s `except (StylistError,
+    OSError, UnicodeError)`."""
+    from src.llm.client import ClaudeCliClient, ClaudeCliFatalError
+    for exc in (OSError("soubor je zamčený"),
+               UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")):
+        def boom(*a, _exc=exc, **k):
+            raise _exc
+        monkeypatch.setattr("src.llm.claude_cli._exec_claude", boom)
+        c = ClaudeCliClient(["claude"], "m")
+        with pytest.raises(ClaudeCliFatalError):
+            c.complete(system="s", user="u", max_tokens=10, model="m")

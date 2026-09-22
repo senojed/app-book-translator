@@ -46,6 +46,19 @@ class MissingPriceError(FatalRunError):
     stop NENÍ Codex-specifická chyba, i pro `--translator codex`."""
 
 
+class ClaudeCliFatalError(FatalRunError):
+    """Fatální chyba VZNIKLÁ PŘÍMO v `ClaudeCliClient.complete()` volání
+    (nenulový exit kód, nečitelný/špatně tvarovaný JSON výstup, `OSError`/
+    `UnicodeError` při čtení výstupu) - podtřída `FatalRunError`. NENÍ
+    translator-specifická jako `CodexTranslatorFatalError` - kritik je
+    teď VŽDY tenhle backend, nezávisle na `--translator`, takže
+    `_cmd_run` (main.py) ji NEROZLIŠUJE zvlášť, spadá do obecné `except
+    FatalRunError: raise` větve stejně jako dřívější `AnthropicClient`
+    chyby (auth, rate limit atd.). Timeout NENÍ součástí týhle třídy -
+    `ClaudeCliTimeoutError` zůstává samostatná, nefatální (viz Global
+    Constraints)."""
+
+
 @dataclass
 class Completion:
     text: str
@@ -272,6 +285,83 @@ class CodexLLMClient:
         # //2`) - Codex nemá API pro přesné počítání tokenů.
         # Kolo 27 NIT (plan-consensus) - `max(1, ...)` viz `complete()` výš.
         return max(1, (len(system) + len(user)) // 2)
+
+
+class ClaudeCliClient:
+    """`LLMClient` obal nad `claude -p` subprocess voláním
+    (`src.llm.claude_cli._exec_claude`) - kritik jede přes uživatelovo
+    předplatné (OAuth session), ne přes placené Anthropic API. Používá
+    se VŽDY pro `agent="critic"` (main.py `_client_factory`), nezávisle
+    na `--translator` - viz docs/superpowers/specs/2026-09-21-claude-cli-
+    critic-design.md."""
+    provider = "claude-cli"
+
+    def __init__(self, claude_cmd: list[str], model: str,
+                 timeout: int | None = None):
+        self._claude_cmd = claude_cmd
+        self._model = model
+        self._timeout = timeout
+        # `-cli` suffix - viz Global Constraints v plánu - NESMÍ
+        # kolidovat s `config.MODEL_CRITIC`'s SKUTEČNÝM API cenovým
+        # záznamem (translator při --translator claude volá STEJNÝ
+        # model string se SKUTEČNOU cenou).
+        self.billed_model = f"{model}-cli"
+
+    def complete(self, *, system: str, user: str, max_tokens: int, model: str) -> Completion:
+        import config
+        from src.llm import claude_cli
+        # Kolo 1 BLOCKING (plan-consensus) - `system`/`user` se posílají
+        # ODDĚLENĚ do `_exec_claude()` (`--system-prompt` flag +
+        # STDIN), NIKDY spojené do jednoho blobu - viz Global Constraints.
+        timeout = self._timeout or config.CLAUDE_CLI_CRITIC_TIMEOUT_SECONDS
+        try:
+            payload = claude_cli._exec_claude(
+                system, user, claude_cmd=self._claude_cmd, model=self._model,
+                timeout=timeout)
+        except claude_cli.ClaudeCliTimeoutError:
+            # Timeout NEpřebalujeme - `_run_critic()` (pipeline.py) má
+            # VLASTNÍ `except FatalRunError: raise` / `except Exception:
+            # pseudo-nález, critic_failed=True` rozlišení; timeout jako
+            # obyčejná výjimka spadne do TÉ druhé větve (nefatální,
+            # kapitola pokračuje s pseudo-nálezem), stejně jako každá
+            # jiná dnešní kritikova chyba PŘED týmhle plánem.
+            raise
+        except (claude_cli.ClaudeCliUnavailable, claude_cli.ClaudeCliExecError,
+               OSError, UnicodeError) as e:
+            # Kolo 1 IMPORTANT (plan-consensus) - `_exec_claude()`'s
+            # `except BaseException: ... raise` (kill-tree na Ctrl+C)
+            # nechá `OSError`/`UnicodeDecodeError` (poškozené kódování
+            # stdout) propadnout NEZABALENÉ - stejná třída rizika jako
+            # `CodexLLMClient`'s kolo 7 IMPORTANT (minulý plán), stejná
+            # oprava (širší `except`, stejná redakce).
+            from src.agents import stylist
+            raise ClaudeCliFatalError(stylist._redact_detail(str(e))) from e
+        # Kolo 10 IMPORTANT (plan-consensus) - `_exec_claude()` (Task 2,
+        # kolo-10 fix) teď GARANTUJE `usage` jako dict s VALIDOVANÝMI
+        # `input_tokens`/`output_tokens` (nezáporná int) na ÚSPĚŠNÉ
+        # cestě - `usage.get(...) or 1` by tichem přepsalo SKUTEČNOU
+        # nulu (validní `input_tokens: 0`) na `1`, znehodnocující audit
+        # `llm_calls`. Hodnoty se teď přenášejí PŘÍMO, bez `or`.
+        usage = payload["usage"]
+        # Kolo 1 IMPORTANT (plan-consensus) - `truncated` čte SKUTEČNÝ
+        # `stop_reason` (ověřeno spikem - `claude -p --output-format
+        # json` ho vrací, stejný signál jako Anthropic API's `resp.
+        # stop_reason`), ne natvrdo `False`. NA ROZDÍL od `CodexLLMClient`
+        # (Codex CLI žádný ekvivalent nemá, `truncated=False` je tam
+        # ZDOKUMENTOVANÝ limit) - `claude` CLI signál MÁ, takže se
+        # POUŽÍVÁ. `max_tokens` parametr samotný STÁLE nemá CLI
+        # ekvivalent (žádný limit flag) - `critic.review()`'s retry na
+        # truncation detekci správně zachytí, ale limit nezvýší (stejný
+        # přijatý limit jako Codex).
+        return Completion(
+            text=payload.get("result") or "",
+            truncated=payload.get("stop_reason") == "max_tokens",
+            input_tokens=usage["input_tokens"],
+            output_tokens=usage["output_tokens"],
+        )
+
+    def count_tokens(self, *, system: str, user: str, model: str) -> int:
+        return max(1, (len(system) + len(user)) // 4)
 
 
 class FakeLLMClient:
