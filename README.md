@@ -1,5 +1,9 @@
 # Book Translator
 
+> ⚠️ **Work in progress** — osobní projekt, není produkční kvalita. API se může měnit bez ohlášení.
+
+*[English version](README.en.md)*
+
 Multiagentní CLI překladač knih EN→CZ. Pipeline scout → translator → kritik →
 revizor, orchestrace v kódu. Stav v SQLite, takže běh jde kdykoli přerušit
 a navázat.
