@@ -125,10 +125,15 @@ CODEX_TRANSLATE_TIMEOUT_SECONDS = 300
 # i translatorovu SKUTEČNOU cenu. `-cli` suffix drží oddělený klíč.
 PRICE_IN_PER_MTOK[f"{MODEL_CRITIC}-cli"] = 0.0
 PRICE_OUT_PER_MTOK[f"{MODEL_CRITIC}-cli"] = 0.0
-# Kratší než CODEX_TRANSLATE_TIMEOUT_SECONDS - kritický průchod
-# (posouzení už přeložené kapitoly) je kratší úkol než generování
-# celé kapitoly (spike 2026-09-21).
-CLAUDE_CLI_CRITIC_TIMEOUT_SECONDS = 180
+# PŮVODNĚ 180s (spike 2026-09-21 na krátkém úryvku) - dodatečné ověření
+# na REÁLNÉ délce kapitoly (2026-09-22, spike_critic_cli.py) ukázalo, že
+# tenhle předpoklad neplatí: kritik čte NAVÍC EN originál i CZ překlad
+# (zhruba 2x vstup oproti jedné translator scéně), reálné běhy trvaly
+# 94-183s - při 180s limitu 2 z 5 pokusů VYPRŠELY (TimeoutExpired), i
+# když formát odpovědi byl VŽDY v pořádku, když čas stačil. Zvýšeno na
+# 300s (stejně jako CLAUDE_CLI_TRANSLATOR_TIMEOUT_SECONDS) - bezpečná
+# rezerva nad pozorovaným maximem (183s).
+CLAUDE_CLI_CRITIC_TIMEOUT_SECONDS = 300
 # Hrubý bezpečnostní strop na délku kapitoly pro stylistický průchod
 # (kolo 17 IMPORTANT) - součet znaků EN+CZ. NENÍ přesný odhad tokenového
 # limitu konkrétního modelu (ten je uživatelsky konfigurovaný přes
@@ -180,7 +185,8 @@ STYLIST_REPORT_REJECTED_TEXT = False
 # `claude` CLI jako backend i pro TRANSLATOR (--translator claude-cli),
 # ne jen kritika - ověřeno spikem 2026-09-22 (5/5 úspěšné, i na reálné
 # délce scény ~8000 znaků/142s), s reinforcement textem v uživatelské
-# zprávě (translator.CLI_FORMAT_REINFORCEMENT). Delší timeout než kritik
-# (CLAUDE_CLI_CRITIC_TIMEOUT_SECONDS=180) - překlad celé scény trvá déle
-# než jedno review, stejná úvaha jako CODEX_TRANSLATE_TIMEOUT_SECONDS.
+# zprávě (translator.CLI_FORMAT_REINFORCEMENT). Stejná hodnota jako
+# CLAUDE_CLI_CRITIC_TIMEOUT_SECONDS (oba pozorovány v podobném rozsahu
+# 94-183s na reálné délce kapitoly) - stejná úvaha jako
+# CODEX_TRANSLATE_TIMEOUT_SECONDS.
 CLAUDE_CLI_TRANSLATOR_TIMEOUT_SECONDS = 300
