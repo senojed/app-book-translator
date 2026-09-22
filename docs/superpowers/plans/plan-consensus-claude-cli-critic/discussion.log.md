@@ -91,3 +91,14 @@ pridano encoding + UnicodeError do obou volani preflightu, novy test).
   (proporcionalita — reálný zkušební `claude -p` v preflightu by stál
   usage při každém spuštění kvůli vzácnému, bezpečně-selhávajícímu
   riziku; `_checkpoint_flagged()` už chrání data).
+
+## Round 8 — 2026-09-22T07:42:54+0200
+
+- Codex: [round-8-codex.md](round-8-codex.md) — VERDICT: CHANGES_NEEDED
+- Claude: [round-8-claude.md](round-8-claude.md) — VERDICT: CHANGES_NEEDED
+- Summary: Codexův IMPORTANT (spec vs. plán - timeout mechanismus:
+  `subprocess.run` vs. `Popen`+kill-tree, fatálnost `TimeoutExpired`)
+  potvrzen a opraven ve specu. Claude pak preventivně prošel celý spec
+  proti plánu a našel další nesoulad sám (`ClaudeCliClient.__init__`/
+  `_client_factory` skeleton chybí `claude_cmd` z kolo-3 fixu) -
+  opraveno. Plán samotný beze změny oba nálezy - jen spec dohnán.

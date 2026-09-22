@@ -61,7 +61,8 @@ brainstorming session). Stejný `LLMClient` protokol jako
 class ClaudeCliClient:
     provider = "claude-cli"
 
-    def __init__(self, model: str, timeout: int | None = None): ...
+    def __init__(self, claude_cmd: list[str], model: str,
+                 timeout: int | None = None): ...
     def complete(self, *, system, user, max_tokens, model) -> Completion: ...
     def count_tokens(self, *, system, user, model) -> int: ...
 ```
@@ -97,9 +98,14 @@ argv = [claude_bin, "-p", "--safe-mode", "--tools", "", "--output-format",
   na CLI straně.
 - Timeout: NOVÝ `config.CLAUDE_CLI_CRITIC_TIMEOUT_SECONDS = 180`
   (kratší než translatorových 300s - kritický průchod je kratší úkol).
-- `subprocess.run(..., timeout=timeout, capture_output=True, text=True,
-  encoding="utf-8")` - Windows-primární projekt, `encoding="utf-8"`
-  explicitně (stejný důvod jako `translator._parse()`'s CRLF
+- `subprocess.Popen(argv, stdin=PIPE, stdout=PIPE, stderr=PIPE,
+  text=True, encoding="utf-8")` + `.communicate(input=user,
+  timeout=timeout)` - NE `subprocess.run(timeout=...)` (implementační
+  plán, `_exec_claude()`) - `Popen` umožňuje na Windows spolehlivě
+  zabít celý proces-strom při timeoutu/přerušení (`stylist.
+  _kill_process_tree`, reuse ze stylist.py), `run(timeout=)` by po
+  timeoutu nechal osiřelý `claude`/dítě proces běžet dál. `encoding=
+  "utf-8"` explicitně (stejný důvod jako `translator._parse()`'s CRLF
   normalizace, viz předchozí plán).
 
 ### Parsování výstupu
@@ -122,9 +128,16 @@ argv = [claude_bin, "-p", "--safe-mode", "--tools", "", "--output-format",
 Nová `ClaudeCliFatalError(FatalRunError)` (`src/llm/client.py`, HNED
 ZA `CodexTranslatorFatalError` - stejný vzor):
 - nenulový exit kód subprocessu,
-- `subprocess.TimeoutExpired`,
 - nečitelný/nerozparsovatelný JSON výstup,
 - `is_error: true` v JSON výstupu.
+
+**Timeout NENÍ fatální** - `subprocess.TimeoutExpired` (přes
+`Popen.communicate(timeout=)`) se hlásí SAMOSTATNOU
+`ClaudeCliTimeoutError` (implementační plán), NE jako
+`ClaudeCliFatalError` - `_run_critic()`'s existující `except
+Exception: pseudo-finding, critic_failed=True` větev tohle zachytí
+stejně jako dnešní transientní kritikovy chyby (síť atd.), místo
+zastavení celého runu jako u fatální auth chyby.
 
 Zpráva jde přes `stylist._redact_detail()` (existující funkce, beze
 změny - `ClaudeCliClient` si ji naimportuje stejně jako `CodexLLMClient`
@@ -147,14 +160,21 @@ flagged/redakci zacházení (to je pořád jen pro TRANSLATOR selhání).
 ## Změny v `_client_factory` (main.py)
 
 ```python
-def factory(agent: str):
-    if agent == "translator" and translator_backend == "codex":
-        ...  # beze změny
-    elif agent == "critic":
-        inner = ClaudeCliClient(config.MODEL_CRITIC)  # NOVĚ, MÍSTO AnthropicClient()
-    else:
-        inner = AnthropicClient()  # translator při --translator claude
-    ...
+def _client_factory(run_id, *, interactive, require_lock=None,
+                    translator_backend="claude", claude_cmd=None):
+    def factory(agent: str):
+        if agent == "translator" and translator_backend == "codex":
+            ...  # beze změny
+        elif agent == "critic":
+            # NOVĚ, MÍSTO AnthropicClient() - `claude_cmd` je preflightem
+            # PŘEDEM resolvnutá binárka (main.py `_claude_cli_preflight()`),
+            # NE bare "claude" - viz implementační plán, kolo 3.
+            inner = ClaudeCliClient(claude_cmd or ["claude"],
+                                    config.MODEL_CRITIC)
+        else:
+            inner = AnthropicClient()  # translator při --translator claude
+        ...
+    return factory
 ```
 
 **Ruší se:** `_cmd_run`'s eager `ANTHROPIC_API_KEY` kontrola (main.py,
