@@ -834,6 +834,46 @@ def test_regenerate_503_on_preflight_failure(tmp_path, monkeypatch):
     assert r.status_code == 503
 
 
+def test_regenerate_503_on_claude_cli_preflight_failure(tmp_path, monkeypatch):
+    """Kolo 2 IMPORTANT (plan-consensus) - stejný důvod jako `_cmd_run`/
+    `_cmd_polish` (main.py) - regenerate taky volá kritika PO drahé
+    Codex stylizaci - bez eager kontroly by chybějící/nepřihlášené
+    `claude` CLI nechalo proběhnout Codex stylizaci, než by selhalo na
+    kritikovi."""
+    app, db, history_path, lock_path = _app(tmp_path, chapters=1)
+    monkeypatch.setattr("main._polish_preflight",
+                        lambda: ("m", ["codex"], None))
+    monkeypatch.setattr("main._claude_cli_preflight",
+                        lambda: (None, "claude CLI není přihlášené."))
+    calls = {"n": 0}
+    monkeypatch.setattr("main._polish_one_chapter",
+                        lambda *a, **k: calls.__setitem__("n", calls["n"] + 1))
+    client = TestClient(app)
+    r = client.post("/api/polish/regenerate", json={"idx": 1})
+    assert r.status_code == 503
+    assert calls["n"] == 0   # Codex stylizace se VŮBEC nespustila
+
+
+def test_regenerate_503_on_missing_anthropic_key(tmp_path, monkeypatch):
+    """Kolo 3 BLOCKING (plan-consensus) - `stylist_check` (main.py:698)
+    zůstává MIMO rozsah tohohle plánu, pořád `AnthropicClient`/
+    `ANTHROPIC_API_KEY` - bez týhle kontroly by chybějící klíč nechal
+    proběhnout DRAHOU Codex stylizaci, než by selhalo na PRVNÍM
+    `stylist_check` volání, i když `claude` CLI preflight uspěje."""
+    app, db, history_path, lock_path = _app(tmp_path, chapters=1)
+    monkeypatch.setattr("main._polish_preflight",
+                        lambda: ("m", ["codex"], None))
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", None)
+    calls = {"n": 0}
+    monkeypatch.setattr("main._polish_one_chapter",
+                        lambda *a, **k: calls.__setitem__("n", calls["n"] + 1))
+    client = TestClient(app)
+    r = client.post("/api/polish/regenerate", json={"idx": 1})
+    assert r.status_code == 503
+    assert calls["n"] == 0   # Codex stylizace se VŮBEC nespustila
+
+
 def test_regenerate_503_when_lock_lost_inside_polish_one_chapter(tmp_path, monkeypatch):
     """Kolo 16 IMPORTANT (test OPRAVEN kolo 17 BLOCKING - dřív mockoval
     `_polish_one_chapter` tak, aby `LockLostError` vyhodilo PŘÍMO, což
@@ -910,8 +950,10 @@ def test_regenerate_uses_client_factory_with_require_lock_callback(tmp_path, mon
     app, db, history_path, lock_path = _app(tmp_path, chapters=1)
     monkeypatch.setattr(config, "DB_PATH", db)
     monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")
     seen = {}
-    def _fake_client_factory(rid, *, interactive, require_lock=None):
+    def _fake_client_factory(rid, *, interactive, require_lock=None, claude_cmd=None):
         seen["require_lock"] = require_lock
         return lambda agent: None   # nepoužije se, _polish_one_chapter se mockuje níž
     monkeypatch.setattr("main._client_factory", _fake_client_factory)

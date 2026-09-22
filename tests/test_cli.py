@@ -1,5 +1,5 @@
 import argparse
-import os, json, sys
+import os, json, shutil, sys
 import pytest
 import config
 import main
@@ -101,6 +101,7 @@ def test_run_processes_queue_with_monkeypatched_pipeline(tmp_path, monkeypatch):
     book = tmp_path / "k.txt"
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
     import src.pipeline as P
     def fake_process(db_path, chapter, *, client_factory, guide):
         state.update_chapter(db_path, chapter["idx"], status="done",
@@ -119,6 +120,7 @@ def test_run_fatal_error_closes_run_and_exits_nonzero(tmp_path, monkeypatch):
     book = tmp_path / "k.txt"
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
     import src.pipeline as P
     from src.llm.client import FatalRunError
     def boom(*a, **k): raise FatalRunError("bad key")
@@ -133,6 +135,7 @@ def test_run_fatal_error_closes_run_and_exits_nonzero(tmp_path, monkeypatch):
 def test_run_without_guide_json_still_works(tmp_path, monkeypatch):
     book = tmp_path / "k.txt"; book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
     import src.pipeline as P
     def fake(db_path, chapter, *, client_factory, guide):
         assert isinstance(guide, dict) and "characters" in guide  # prázdný shape OK
@@ -208,6 +211,7 @@ def _init_4ch_pending(tmp_path, monkeypatch):
 
 def test_run_only_processes_selected_chapters(tmp_path, monkeypatch):
     db = _init_4ch_pending(tmp_path, monkeypatch)
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
     import src.pipeline as P
     seen = []
     def fake(db_path, chapter, *, client_factory, guide):
@@ -223,6 +227,7 @@ def test_run_only_processes_selected_chapters(tmp_path, monkeypatch):
 
 def test_run_without_only_still_takes_whole_queue(tmp_path, monkeypatch):
     db = _init_4ch_pending(tmp_path, monkeypatch)
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
     import src.pipeline as P
     seen = []
     def fake(db_path, chapter, *, client_factory, guide):
@@ -996,8 +1001,12 @@ def _polish_env(tmp_path, monkeypatch, n_done=1):
     monkeypatch.setattr(main.concordance, "build_mentions", lambda *a, **k: [])
     monkeypatch.setattr(main.pipeline, "_run_critic", lambda *a, **k: ([], False))
     monkeypatch.setattr(main.stylist, "check_meaning_preserved", lambda *a, **k: [])
+    monkeypatch.setattr(main, "_claude_cli_preflight", lambda: (["claude"], None))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")
     monkeypatch.setattr(main, "_client_factory",
-                        lambda rid, *, interactive, require_lock=None: (lambda a: object()))
+                        lambda rid, *, interactive, require_lock=None,
+                              translator_backend="claude", claude_cmd=None:
+                            (lambda a: object()))
     return config.DB_PATH
 
 
@@ -1045,7 +1054,8 @@ def test_cmd_polish_passes_require_lock_callback_to_client_factory(tmp_path, mon
     db = _polish_env(tmp_path, monkeypatch, n_done=1)
     monkeypatch.setattr(main.stylist, "polish", lambda en, cz, **k: "Jiná věta.")
     seen = {}
-    def _fake_client_factory(rid, *, interactive, require_lock=None):
+    def _fake_client_factory(rid, *, interactive, require_lock=None,
+                             translator_backend="claude", claude_cmd=None):
         seen["require_lock"] = require_lock
         return lambda a: object()
     monkeypatch.setattr(main, "_client_factory", _fake_client_factory)
@@ -1196,6 +1206,43 @@ def test_cmd_polish_commit_failure_still_recorded_in_report(tmp_path, monkeypatc
     assert r["run_status"] == "fatal"
     assert r["attempted_count"] == 1
     assert r["chapters"][0]["outcome"] == "fatal"
+
+
+def test_cmd_polish_claude_cli_preflight_failure_blocks_batch_before_stylize(
+        tmp_path, monkeypatch):
+    """Kolo 2 IMPORTANT (plan-consensus) - `_cmd_polish` volá kritika
+    (`claude` CLI) PO drahé Codex stylizaci (`_polish_one_chapter`), ne
+    před ní - bez eager kontroly by chybějící/nepřihlášené `claude` CLI
+    nechalo proběhnout CELOU (draze zaplacenou) dávkovou stylizaci, než
+    by selhalo na PRVNÍM kritikově volání."""
+    db = _polish_env(tmp_path, monkeypatch, n_done=1)
+    monkeypatch.setattr("main._claude_cli_preflight",
+                        lambda: (None, "claude CLI není přihlášené."))
+    calls = {"n": 0}
+    def boom(en, cz, **k):
+        calls["n"] += 1
+        return cz
+    monkeypatch.setattr(main.stylist, "polish", boom)
+    assert main._cmd_polish(_Args()) == 1
+    assert calls["n"] == 0   # Codex stylizace se VŮBEC nespustila
+
+
+def test_cmd_polish_missing_anthropic_key_blocks_batch_before_stylize(
+        tmp_path, monkeypatch):
+    """Kolo 3 BLOCKING (plan-consensus) - `stylist_check` (main.py:698)
+    zůstává MIMO rozsah tohohle plánu, pořád `AnthropicClient`/
+    `ANTHROPIC_API_KEY` - bez týhle kontroly by chybějící klíč nechal
+    proběhnout DRAHOU Codex stylizaci CELÉ dávky, než by selhalo na
+    PRVNÍM `stylist_check` volání."""
+    db = _polish_env(tmp_path, monkeypatch, n_done=1)
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", None)
+    calls = {"n": 0}
+    def boom(en, cz, **k):
+        calls["n"] += 1
+        return cz
+    monkeypatch.setattr(main.stylist, "polish", boom)
+    assert main._cmd_polish(_Args()) == 1
+    assert calls["n"] == 0   # Codex stylizace se VŮBEC nespustila (i když claude CLI uspěje)
 
 
 def test_cmd_polish_happy_path_writes_db_and_reports(tmp_path, monkeypatch):
@@ -1642,13 +1689,50 @@ def test_client_factory_translator_backend_codex_uses_codex_client(monkeypatch):
     assert client._inner.billed_model == "m"
 
 
-def test_client_factory_translator_backend_codex_critic_stays_claude(monkeypatch):
-    from src.llm.client import AnthropicClient
+def test_client_factory_critic_always_uses_claude_cli_client(monkeypatch):
+    from src.llm.client import ClaudeCliClient
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    factory = main._client_factory(1, interactive=False)
+    client = factory("critic")
+    assert isinstance(client._inner, ClaudeCliClient)
+    assert client._inner.billed_model == f"{config.MODEL_CRITIC}-cli"
+
+
+def test_client_factory_critic_uses_preflight_resolved_claude_cmd(monkeypatch):
+    """Kolo 3 IMPORTANT (plan-consensus) - `_claude_cli_preflight()`
+    (Task 3) resolvne `claude` na ABSOLUTNÍ cestu A ověří přihlášení
+    PRO TENHLE KONKRÉTNÍ binární soubor. Bez threadování téhle hodnoty
+    do `_client_factory`/`ClaudeCliClient` by se PATH lookup provedl
+    ZNOVU, líně, uvnitř `_exec_claude()` - TOCTOU mezera (PATH se mezi
+    preflightem a prvním skutečným voláním teoreticky může změnit) a
+    zbytečná duplicitní práce."""
+    from src.llm.client import ClaudeCliClient
+    factory = main._client_factory(1, interactive=False,
+                                   claude_cmd=["/resolved/path/claude"])
+    client = factory("critic")
+    assert client._inner._claude_cmd == ["/resolved/path/claude"]
+
+
+def test_client_factory_critic_uses_claude_cli_even_with_codex_translator(monkeypatch):
+    """Kritik zůstává na `claude` CLI NEZÁVISLE na `translator_backend` -
+    žádný fallback, žádná podmínka na `--translator`."""
+    from src.llm.client import ClaudeCliClient
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr("main._polish_preflight",
                         lambda: ("m", ["codex"], None))
-    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")
     factory = main._client_factory(1, interactive=False, translator_backend="codex")
     client = factory("critic")
+    assert isinstance(client._inner, ClaudeCliClient)
+
+
+def test_client_factory_translator_default_claude_unaffected_by_critic_change(
+        monkeypatch):
+    """Translator (--translator claude, default) zůstává na AnthropicClient -
+    tenhle plán mění JEN kritika."""
+    from src.llm.client import AnthropicClient
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")
+    factory = main._client_factory(1, interactive=False)
+    client = factory("translator")
     assert isinstance(client._inner, AnthropicClient)
 
 
@@ -1696,6 +1780,7 @@ def test_run_translator_flag_passed_to_client_factory(tmp_path, monkeypatch):
     # nemusí mít, bez mocku by test spadl na "== 0" dřív, než se spy
     # factory vůbec zavolá.
     monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
     import src.pipeline as P
     seen = {}
     def fake_process(db_path, chapter, *, client_factory, guide):
@@ -1706,10 +1791,11 @@ def test_run_translator_flag_passed_to_client_factory(tmp_path, monkeypatch):
     monkeypatch.setattr(P, "process_chapter", fake_process)
     real_factory = main._client_factory
     captured = {}
-    def spy_factory(rid, *, interactive, require_lock=None, translator_backend="claude"):
+    def spy_factory(rid, *, interactive, require_lock=None,
+                    translator_backend="claude", claude_cmd=None):
         captured["translator_backend"] = translator_backend
         return real_factory(rid, interactive=interactive, require_lock=require_lock,
-                            translator_backend=translator_backend)
+                            translator_backend=translator_backend, claude_cmd=claude_cmd)
     monkeypatch.setattr(main, "_client_factory", spy_factory)
     assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 0
     assert captured["translator_backend"] == "codex"
@@ -1719,16 +1805,18 @@ def test_run_translator_flag_defaults_to_claude(tmp_path, monkeypatch):
     book = tmp_path / "k.txt"
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
     import src.pipeline as P
     monkeypatch.setattr(P, "process_chapter",
                         lambda db_path, chapter, *, client_factory, guide: {
                             "idx": chapter["idx"], "status": "done", "revision_rounds": 0})
     real_factory = main._client_factory
     captured = {}
-    def spy_factory(rid, *, interactive, require_lock=None, translator_backend="claude"):
+    def spy_factory(rid, *, interactive, require_lock=None,
+                    translator_backend="claude", claude_cmd=None):
         captured["translator_backend"] = translator_backend
         return real_factory(rid, interactive=interactive, require_lock=require_lock,
-                            translator_backend=translator_backend)
+                            translator_backend=translator_backend, claude_cmd=claude_cmd)
     monkeypatch.setattr(main, "_client_factory", spy_factory)
     assert _run(["run"], tmp_path, monkeypatch) == 0   # BEZ --translator
     assert captured["translator_backend"] == "claude"
@@ -1778,28 +1866,54 @@ def test_run_translator_codex_fs_risk_checked_even_with_empty_queue(tmp_path, mo
     assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
 
 
-def test_run_translator_codex_missing_anthropic_key_fails_eager(tmp_path, monkeypatch, capsys):
-    """Kolo 22 IMPORTANT (plan-consensus) - eager preflight výš (kolo 3/8)
-    ověří JEN Codex stranu; kritik zůstává VŽDY `AnthropicClient`, i při
-    `--translator codex`, a konstruuje se LÍNĚ (`client_factory("critic")`)
-    až PO dokončení scénového překladu. Bez týhle kontroly by chybějící
-    `ANTHROPIC_API_KEY` nechal proběhnout celý (zaplacený) Codex překlad,
-    než by run selhal na kritikovi."""
+def test_run_claude_cli_preflight_failure_blocks_queue_before_translation(
+        tmp_path, monkeypatch):
+    """Kolo 1 IMPORTANT (plan-consensus) - bez eager kontroly by
+    chybějící/nepřihlášené `claude` CLI nechalo proběhnout celý
+    (u --translator codex zaplacený) překlad, než by run selhal na
+    kritikovi - stejné riziko jako `ANTHROPIC_API_KEY` (minulý plán,
+    zrušeno) i jako Codexova FS-risk eager kontrola."""
     book = tmp_path / "k.txt"
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
-    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
-    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", None)
+    monkeypatch.setattr("main._claude_cli_preflight",
+                        lambda: (None, "claude CLI není přihlášené."))
     import src.pipeline as P
     calls = {"n": 0}
     def boom(db_path, chapter, *, client_factory, guide):
         calls["n"] += 1
         return {"idx": chapter["idx"], "status": "done", "revision_rounds": 0}
     monkeypatch.setattr(P, "process_chapter", boom)
-    assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
-    assert calls["n"] == 0   # zaplacený Codex překlad se VŮBEC nespustí
-    out = capsys.readouterr().out
-    assert "ANTHROPIC_API_KEY" in out
+    assert _run(["run"], tmp_path, monkeypatch) == 1
+    assert calls["n"] == 0   # zadny preklad se vubec nespustil
+
+
+def test_run_threads_preflight_resolved_claude_cmd_into_client_factory(
+        tmp_path, monkeypatch):
+    """Kolo 5 IMPORTANT (plan-consensus) - end-to-end ověření, že
+    `_cmd_run` SKUTEČNĚ předá `_claude_cli_preflight()`'s resolvnutou
+    hodnotu do `_client_factory(..., claude_cmd=...)`, ne jen že
+    `_client_factory` sama umí parametr přijmout (to ověřují Task 2/3's
+    unit testy zvlášť)."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._claude_cli_preflight",
+                        lambda: (["/resolved/claude"], None))
+    import src.pipeline as P
+    monkeypatch.setattr(P, "process_chapter",
+                        lambda db_path, chapter, *, client_factory, guide: {
+                            "idx": chapter["idx"], "status": "done", "revision_rounds": 0})
+    real_factory = main._client_factory
+    captured = {}
+    def spy_factory(rid, *, interactive, require_lock=None,
+                    translator_backend="claude", claude_cmd=None):
+        captured["claude_cmd"] = claude_cmd
+        return real_factory(rid, interactive=interactive, require_lock=require_lock,
+                            translator_backend=translator_backend, claude_cmd=claude_cmd)
+    monkeypatch.setattr(main, "_client_factory", spy_factory)
+    assert _run(["run"], tmp_path, monkeypatch) == 0
+    assert captured["claude_cmd"] == ["/resolved/claude"]
 
 
 def test_run_translator_codex_error_notes_are_redacted(tmp_path, monkeypatch):
@@ -1812,7 +1926,7 @@ def test_run_translator_codex_error_notes_are_redacted(tmp_path, monkeypatch):
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
     monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
-    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
     import src.pipeline as P
     def boom(db_path, chapter, *, client_factory, guide):
         raise ValueError("Nevalidní JSON. Raw:\ntajny-obsah-z-codexu")
@@ -1829,6 +1943,7 @@ def test_run_translator_claude_error_notes_not_redacted(tmp_path, monkeypatch):
     book = tmp_path / "k.txt"
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
     import src.pipeline as P
     def boom(db_path, chapter, *, client_factory, guide):
         raise ValueError("nejaka claude chyba")
@@ -1853,7 +1968,7 @@ def test_run_translator_codex_invalid_translation_output_is_fatal(tmp_path, monk
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
     monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
-    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
     import src.pipeline as P
     from src.agents.translator import InvalidTranslationOutput
     def boom(db_path, chapter, *, client_factory, guide):
@@ -1879,7 +1994,7 @@ def test_run_translator_codex_fatal_error_flags_chapter_not_silently_retried(
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
     monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
-    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
     import src.pipeline as P
     calls = {"n": 0}
     def boom(db_path, chapter, *, client_factory, guide):
@@ -1904,7 +2019,7 @@ def test_run_translator_codex_fatal_error_console_output_is_redacted(
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
     monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
-    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
     import src.pipeline as P
     def boom(db_path, chapter, *, client_factory, guide):
         raise CodexTranslatorFatalError("tajny-obsah-z-codexu")
@@ -1926,7 +2041,7 @@ def test_run_translator_codex_generic_fatal_run_error_from_critic_not_flagged(
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
     monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
-    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
     import src.pipeline as P
     def boom(db_path, chapter, *, client_factory, guide):
         raise FatalRunError("Cost guard: strop $5.00 překročen")
@@ -1955,7 +2070,7 @@ def test_run_translator_codex_lazy_preflight_failure_flags_chapter(tmp_path, mon
             return ("m", ["codex"], None)   # eager (main._cmd_run) uspěje
         return (None, None, "Codex CLI mezitím přestalo fungovat")   # línÁ (factory) selže
     monkeypatch.setattr("main._polish_preflight", preflight)
-    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-test")  # kolo 22
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
     assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
     assert state.get_chapter("data/state.sqlite3", 1)["status"] == "flagged"
 
@@ -1968,6 +2083,7 @@ def test_run_translator_claude_invalid_translation_output_stays_per_chapter_erro
     book = tmp_path / "k.txt"
     book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
     _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
     import src.pipeline as P
     from src.agents.translator import InvalidTranslationOutput
     def boom(db_path, chapter, *, client_factory, guide):

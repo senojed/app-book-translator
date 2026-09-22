@@ -352,6 +352,21 @@ def build_app(db_path: str, history_path: str, lock_path: str) -> FastAPI:
         model, codex_cmd, preflight_err = main._polish_preflight()
         if preflight_err:
             return JSONResponse({"error": preflight_err}, status_code=503)
+        # Kolo 2 IMPORTANT (plan-consensus) - stejný důvod jako `_cmd_
+        # run`/`_cmd_polish` (main.py) - regenerate taky volá kritika
+        # PO drahé Codex stylizaci.
+        claude_cmd, claude_preflight_err = main._claude_cli_preflight()
+        if claude_preflight_err:
+            return JSONResponse({"error": claude_preflight_err}, status_code=503)
+        # Kolo 3 BLOCKING (plan-consensus) - `stylist_check` (main.py's
+        # `_polish_one_chapter`) zůstává MIMO rozsah (pořád `Anthropic
+        # Client`/`ANTHROPIC_API_KEY`) - stejný důvod jako `_cmd_polish`
+        # (main.py) výš.
+        if not main.config.ANTHROPIC_API_KEY:
+            return JSONResponse(
+                {"error": "polish vyžaduje funkční Claude API pro "
+                          "stylist_check: Chybí ANTHROPIC_API_KEY "
+                          "v prostředí."}, status_code=503)
         # Kolo 13 IMPORTANT - `glossary.all_terms` (čtení, žádný zápis)
         # PŘESUNUTO PŘED kontrolu zámku, ne po ní - kontrola má být
         # POSLEDNÍ věc před PRVNÍM zápisem (`create_run` níž), ne mít
@@ -377,7 +392,8 @@ def build_app(db_path: str, history_path: str, lock_path: str) -> FastAPI:
             # uvnitř `_polish_one_chapter`), ne jen jednou na začátku
             # handleru.
             cf = main._client_factory(rid, interactive=False,
-                                      require_lock=app.state.require_lock)
+                                      require_lock=app.state.require_lock,
+                                      claude_cmd=claude_cmd)
             c = {"idx": row["idx"], "title": row["title"], "raw_text": row["raw_text"],
                 "translated_text": row["translated_text"],
                 "revision_rounds": row["revision_rounds"]}

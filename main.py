@@ -17,7 +17,9 @@ import datetime as _dt
 import hashlib
 import json
 import os
+import re
 import sqlite3
+import subprocess
 import sys
 import time
 import uuid
@@ -32,8 +34,9 @@ from src import ingest, pipeline, polish_store, requeue, state
 from src import reference as reference_mod
 from src import reference_mine, textnorm
 from src.agents import scout, stylist, translator
-from src.llm.client import (AnthropicClient, CodexLLMClient, CodexTranslatorFatalError,
-                           FatalRunError, LockLostError, OutputTruncated, PipelineLLMClient)
+from src.llm.client import (AnthropicClient, ClaudeCliClient, CodexLLMClient,
+                           CodexTranslatorFatalError, FatalRunError, LockLostError,
+                           OutputTruncated, PipelineLLMClient)
 
 _MUTATING = {"init", "scan", "run", "answer", "review", "reference", "polish",
             "polish-review"}
@@ -52,7 +55,7 @@ def _bootstrap_stdout() -> None:
 
 
 def _client_factory(run_id: int, *, interactive: bool, require_lock=None,
-                    translator_backend: str = "claude"):
+                    translator_backend: str = "claude", claude_cmd=None):
     """Klienta staví až při volání - `run` s fake pipeline nikdy nesáhne
     na API. `translator_backend="codex"` (main.py `_cmd_run --translator
     codex`) přepne JEN `agent=="translator"` na `CodexLLMClient` - kritik/
@@ -88,6 +91,20 @@ def _client_factory(run_id: int, *, interactive: bool, require_lock=None,
                 # označí `flagged`, ne nechá kapitolu uvízlou.
                 raise CodexTranslatorFatalError(preflight_err)
             inner = CodexLLMClient(codex_cmd, config.CODEX_MODEL)
+        elif agent == "critic":
+            # Kritik VŽDY `claude` CLI (předplatné) - žádný fallback na
+            # AnthropicClient/API klíč, nezávisle na `translator_backend`
+            # (viz docs/superpowers/specs/2026-09-21-claude-cli-critic-
+            # design.md). Kolo 3 IMPORTANT (plan-consensus) - `claude_cmd`
+            # PŘEDANÝ volajícím (resolvnutý `_claude_cli_preflight()`
+            # UŽ jednou, viz `_cmd_run`/`_cmd_polish`/polish-server níž) -
+            # `or ["claude"]` fallback JEN pro volající bez eager
+            # preflightu. `ClaudeCliClient.complete()` (Task 2) si i tak
+            # binárku ZNOVU resolvne PŘI KAŽDÉM volání (`_exec_claude`'s
+            # `_resolve_claude_cmd`) - vyhodí `ClaudeCliUnavailable` →
+            # `ClaudeCliFatalError`, pokud přestala existovat MEZI
+            # preflightem a skutečným voláním.
+            inner = ClaudeCliClient(claude_cmd or ["claude"], config.MODEL_CRITIC)
         else:
             inner = AnthropicClient()
         return PipelineLLMClient(inner, run_id=run_id, agent=agent,
@@ -1023,6 +1040,133 @@ def _cmd_polish_review(args) -> int:
         return 1
 
 
+def _claude_cli_preflight() -> tuple:
+    """Kritik je VŽDY `claude` CLI (žádný fallback) - ověř DŘÍV, než
+    `run` začne zpracovávat frontu, ať se u `--translator codex`
+    nepřeloží (a nezaplatí) celá kapitola, než kritik zjistí chybějící/
+    nepřihlášené CLI. Vrací `(claude_cmd, None)` při úspěchu,
+    `(None, chybová_hláška)` při selhání - stejný tvar jako existující
+    `_polish_preflight()`. `claude auth status --json` (~0.5s, žádné
+    tokeny/API volání, ověřeno spikem 2026-09-21) je jediný levný
+    způsob, jak ověřit PŘIHLÁŠENÍ (na rozdíl od `_polish_preflight()`'s
+    Codex kontrol, co jsou čistě config/PATH - `claude` CLI dostupnost
+    samotná NEZARUČUJE platnou OAuth session).
+
+    Kolo 7 - VĚDOMĚ PŘIJATÝ LIMIT (plan-consensus): `auth status` ověří
+    JEN přihlášení, ne oprávnění použít KONKRÉTNÍ `config.MODEL_CRITIC`
+    přes tohle předplatné (subscription tier nemusí model odemykat,
+    nebo model string může být zastaralý/překlepnutý) - projeví se AŽ
+    na prvním skutečném `.complete()` volání. Zvažoval jsem skutečné
+    zkušební `claude -p` volání se stejnými flagy/modelem v preflightu,
+    ALE: (1) stálo by reálné předplatné-usage při KAŽDÉM run/polish
+    spuštění kvůli ochraně před úzkým, vzácným selháním; (2) selhání
+    NENÍ tiché - `_run_critic()` ho zachytí jako `ClaudeCliFatalError`,
+    `_checkpoint_flagged()` uloží poslední platný `cz` jako `flagged`,
+    nic se nepřepíše/neztratí, run se jen zastaví o pár sekund později.
+    Náklad opravy neúměrný riziku - PONECHÁNO jako známé omezení, ne
+    bug."""
+    from src.llm import claude_cli
+    try:
+        claude_cmd = claude_cli._resolve_claude_cmd(["claude"])
+    except claude_cli.ClaudeCliUnavailable as e:
+        return None, str(e)
+    # Kolo 4 IMPORTANT (plan-consensus) - `auth status` samo neověří,
+    # že nainstalovaná verze podporuje flagy, co `_exec_claude()`
+    # SKUTEČNĚ používá (`--safe-mode`/`--tools`/`--system-prompt`/
+    # `--output-format`) - starší/nekompatibilní CLI MŮŽE být přihlášené
+    # (auth je nezávislá na verzi), ale selhat AŽ na PRVNÍM `.complete()`
+    # volání (PO zaplaceném Codex překladu). `claude --help` (žádné
+    # tokeny/API volání, stejně levné jako `auth status`) obsahuje
+    # NÁZVY VŠECH podporovaných flagů - ověřeno spikem 2026-09-21 -
+    # substring kontrola je jednoduchá a nevyžaduje hádat verzní čísla.
+    # Kolo 6 IMPORTANT (plan-consensus) - `-p`/`--model` DOPLNĚNY - i
+    # ty `_exec_claude()` VŽDY používá, přehlédl jsem je (validoval jen
+    # ty "novější"/méně jisté flagy).
+    # Kolo 7 IMPORTANT (plan-consensus) - prostý `"-p" in help_result.stdout`
+    # je chybný: `"-p"` je i SUBSTRING `"--print"` (Claude CLI dlouhý
+    # alias), takže by CLI, co "-p" zrušilo a mělo JEN "--print", prošlo
+    # kontrolou falešně.
+    # Kolo 9 IMPORTANT (plan-consensus) - STEJNÁ třída bugu platí i pro
+    # DLOUHÉ flagy: `claude --help` samo obsahuje `--system-prompt-snapshot`
+    # (ověřeno přímo - reálný, existující flag), takže substring
+    # `"--system-prompt" in stdout` by prošel i na hypotetické CLI, co
+    # by mělo JEN `--system-prompt-snapshot`/`--system-prompt-file`
+    # variantu a ZRUŠILO holé `--system-prompt`. Kolo-7 fix (regex jen
+    # pro `-p`) byl neúplný - hraniční kontrola potřebná pro VŠECHNY
+    # flagy, ne jen krátký alias. `_flag_present()` používá stejnou
+    # "žádné písmeno/číslice/pomlčka hned před ani po" hranici pro
+    # krátký i dlouhé flagy jednotně.
+    _REQUIRED_FLAGS = ("-p", "--model", "--safe-mode",
+                      "--no-session-persistence", "--tools",
+                      "--system-prompt", "--output-format")
+
+    def _flag_present(flag: str, text: str) -> bool:
+        pattern = r"(?<![A-Za-z0-9-])" + re.escape(flag) + r"(?![A-Za-z0-9-])"
+        return re.search(pattern, text) is not None
+    try:
+        # Kolo 6 IMPORTANT (plan-consensus) - `encoding="utf-8"`
+        # EXPLICITNĚ (stejný důvod jako `_exec_claude()`'s vlastní
+        # `Popen` volání) - bez něj `text=True` použije lokální kódování
+        # OS (Windows cp1252), co by na netriviálním výstupu (i když
+        # `--help`/`auth status` jsou typicky ASCII) mohlo spadnout na
+        # `UnicodeDecodeError` MIMO zdokumentovaný `(None, chyba)`
+        # kontrakt.
+        help_result = subprocess.run(claude_cmd + ["--help"],
+                                     capture_output=True, text=True,
+                                     encoding="utf-8", timeout=10)
+    except (subprocess.TimeoutExpired, OSError, UnicodeError) as e:
+        return None, (f"Nepodařilo se ověřit verzi claude CLI "
+                      f"({type(e).__name__}: {e}).")
+    # Kolo 5 IMPORTANT (plan-consensus) - `returncode` se PŘED touhle
+    # opravou nekontroloval - neúspěšné `--help` (nenulový exit kód) se
+    # stdoutem, co náhodou/částečně obsahuje flagové názvy, by prošlo
+    # jako "úspěch" (stejná třída chyby jako `auth status`'s vlastní
+    # returncode kontrola níž).
+    if help_result.returncode != 0:
+        return None, (f"`claude --help` skončilo s kódem "
+                      f"{help_result.returncode}: {help_result.stderr.strip()}")
+    missing = [f for f in _REQUIRED_FLAGS
+              if not _flag_present(f, help_result.stdout)]
+    if missing:
+        return None, (f"claude CLI nepodporuje potřebné volby "
+                      f"({', '.join(missing)}) - aktualizuj Claude Code "
+                      "na novější verzi.")
+    try:
+        # Kolo 6 IMPORTANT (plan-consensus) - `encoding="utf-8"`
+        # EXPLICITNĚ, stejný důvod jako `--help` volání výš.
+        result = subprocess.run(claude_cmd + ["auth", "status", "--json"],
+                                capture_output=True, text=True,
+                                encoding="utf-8", timeout=10)
+        # Kolo 2 IMPORTANT (plan-consensus) - `returncode` se PŘED touhle
+        # opravou vůbec nekontroloval - nenulový exit kód (např. `claude`
+        # binárka existuje, ale je rozbitá/nekompatibilní verze) by
+        # nechal `json.loads` selhat na PRÁZDNÉM/nesmyslném stdoutu
+        # matoucím způsobem, MÍSTO jasné "returncode != 0" hlášky.
+        if result.returncode != 0:
+            return None, (f"`claude auth status` skončilo s kódem "
+                          f"{result.returncode}: {result.stderr.strip()}")
+        status = json.loads(result.stdout)
+    except (subprocess.TimeoutExpired, OSError, UnicodeError, ValueError) as e:
+        return None, (f"Nepodařilo se ověřit přihlášení claude CLI "
+                      f"({type(e).__name__}: {e}).")
+    # Kolo 2 IMPORTANT (plan-consensus) - STEJNÁ třída chyby jako
+    # `_exec_claude()`'s kolo-1 payload validace (viz Task 2) - validní
+    # JSON může být `[]`/`null`/string na nejvyšší úrovni, ne jen objekt.
+    # `status.get(...)` na non-dict by spadlo na neklasifikovaný
+    # `AttributeError`, MIMO tenhle funkce zdokumentovaný `(None,
+    # chyba)` kontrakt.
+    if not isinstance(status, dict):
+        return None, (f"`claude auth status` vrátilo neočekávaný JSON "
+                      f"tvar ({type(status).__name__}, ne objekt).")
+    # Kolo 5 IMPORTANT (plan-consensus) - `not status.get("loggedIn")`
+    # by NEODMÍTLO `"loggedIn": "false"` (neprázdný STRING je v Pythonu
+    # truthy!) - striktní `is not True` kontrola vyžaduje SKUTEČNÝ
+    # bool `true` z JSON, ne cokoli truthy.
+    if status.get("loggedIn") is not True:
+        return None, "claude CLI není přihlášené - spusť `claude login`."
+    return claude_cmd, None
+
+
 def _cmd_run(args) -> int:
     db = config.DB_PATH
     # Kolo 8 IMPORTANT (plan-consensus) - `recover_processing` MUSÍ
@@ -1053,27 +1197,10 @@ def _cmd_run(args) -> int:
             _say(f"--translator codex sdílí stejnou FS-risk bránu jako "
                 f"polish:\n{preflight_err}")
             return 1
-        # Kolo 22 IMPORTANT (plan-consensus) - eager preflight výš
-        # ověří JEN Codex stranu - kritik zůstává VŽDY `AnthropicClient`
-        # (Global Constraints), i při `--translator codex`, a ten se
-        # konstruuje LÍNĚ (`_client_factory`'s `factory("critic")`) až
-        # při PRVNÍM volání - PO dokončení scénového překladu první
-        # kapitoly. Bez týhle kontroly by chybějící `ANTHROPIC_API_KEY`
-        # nechal proběhnout celý (zaplacený) Codex překlad, než by run
-        # selhal na kritikovi.
-        # Kolo 22 (plan-consensus, self-review): PŘÍMÁ kontrola `config.
-        # ANTHROPIC_API_KEY` (stejná podmínka jako `AnthropicClient.
-        # __init__`, src/llm/client.py:51-58), NE konstrukce skutečného
-        # `AnthropicClient()` - ta by nově vyžadovala `ANTHROPIC_API_KEY`
-        # mock v ~6 existujících testech (Task 5), co dnes mockují
-        # `_polish_preflight` na úspěch a `pipeline.process_chapter`
-        # samotné (takže se `client_factory("critic")` nikdy reálně
-        # nezavolá) - bez závislosti na klíči. Přímá kontrola stejnou
-        # podmínku ověří bez týhle vedlejší závislosti.
-        if not config.ANTHROPIC_API_KEY:
-            _say("--translator codex stále vyžaduje funkční Claude API "
-                "pro kritika: Chybí ANTHROPIC_API_KEY v prostředí.")
-            return 1
+    claude_cmd, preflight_err = _claude_cli_preflight()
+    if preflight_err:
+        _say(f"Kritik vyžaduje funkční claude CLI: {preflight_err}")
+        return 1
     if args.retry_flagged is not None:
         n = state.retry_flagged(db, args.retry_flagged or None)
         print(f"Vráceno do fronty (flagged → pending): {n}")
@@ -1082,7 +1209,8 @@ def _cmd_run(args) -> int:
     try:
         g = guide_mod.load_guide(config.GUIDE_PATH)
         cf = _client_factory(rid, interactive=True,
-                             translator_backend=args.translator)
+                             translator_backend=args.translator,
+                             claude_cmd=claude_cmd)
         queue = state.queue_for_run(db)
         if args.only:
             # Pilot: přelož jen vyjmenované kapitoly, zbytek nech ve frontě.
@@ -1421,6 +1549,25 @@ def _cmd_polish(args) -> int:
     if preflight_err:
         _say(preflight_err)
         return 1
+    # Kolo 2 IMPORTANT (plan-consensus) - stejný důvod jako `_cmd_run`'s
+    # kontrola (viz Global Constraints/Task 3 výš) - `_polish_one_
+    # chapter` volá kritika PO drahé Codex stylizaci, ne před ní.
+    claude_cmd, claude_preflight_err = _claude_cli_preflight()
+    if claude_preflight_err:
+        _say(f"Kritik vyžaduje funkční claude CLI: {claude_preflight_err}")
+        return 1
+    # Kolo 3 BLOCKING (plan-consensus) - `_polish_one_chapter()` volá
+    # NAVÍC `cf("stylist_check")` (`stylist.check_meaning_preserved()`,
+    # main.py:698) - TENHLE agent zůstává MIMO rozsah tohohle plánu
+    # (jen kritik přechází na `claude` CLI, viz spec "Rozsah") - pořád
+    # `AnthropicClient`/`ANTHROPIC_API_KEY`. Bez týhle kontroly by
+    # chybějící klíč nechal proběhnout DRAHOU Codex stylizaci CELÉ
+    # dávky, než by selhalo na PRVNÍM `stylist_check` volání - STEJNÉ
+    # riziko jako `claude` CLI výš, jen pro JINOU, MIMO-ROZSAH závislost.
+    if not config.ANTHROPIC_API_KEY:
+        _say("polish vyžaduje funkční Claude API pro stylist_check: "
+            "Chybí ANTHROPIC_API_KEY v prostředí.")
+        return 1
 
     rid = None
     status = "fatal"
@@ -1475,7 +1622,8 @@ def _cmd_polish(args) -> int:
         glossary_rows = glossary.all_terms(db)
         rid = state.create_run(db, "polish")
         cf = _client_factory(rid, interactive=True,
-                             require_lock=lambda: _lock_still_owned(config.LOCK_PATH))
+                             require_lock=lambda: _lock_still_owned(config.LOCK_PATH),
+                             claude_cmd=claude_cmd)
         for c in chapters:
             rec = None
             try:
