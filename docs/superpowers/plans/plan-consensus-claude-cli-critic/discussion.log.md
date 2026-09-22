@@ -66,3 +66,14 @@ ctyri EXISTUJICI fake/spy _client_factory nahrady v realnych testech
 (test_cli.py, test_polish_server.py, z drivejsiho planu) nemaji
 claude_cmd parametr, nova keyword by je rozbila - explicitne
 vyjmenovano vsech 5 mist k oprave + novy end-to-end test).
+
+## Round 6
+
+- Codex: [round-6-codex.md](round-6-codex.md) — CHANGES_NEEDED
+- Claude: [round-6-claude.md](round-6-claude.md) — CHANGES_NEEDED
+
+Opraveno: 2 IMPORTANT (_REQUIRED_FLAGS vynechavalo -p/--model, i kdyz
+_exec_claude() je vzdy pouziva - rozsireno, opraveny 2 testovaci
+fixtures; subprocess.run() bez encoding="utf-8", nezachytavalo
+UnicodeError na rozdil od _exec_claude()'s vlastniho Popen volani -
+pridano encoding + UnicodeError do obou volani preflightu, novy test).

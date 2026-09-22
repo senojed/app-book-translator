@@ -1050,11 +1050,23 @@ def _claude_cli_preflight() -> tuple:
     # tokeny/API volání, stejně levné jako `auth status`) obsahuje
     # NÁZVY VŠECH podporovaných flagů - ověřeno spikem 2026-09-21 -
     # substring kontrola je jednoduchá a nevyžaduje hádat verzní čísla.
-    _REQUIRED_FLAGS = ("--safe-mode", "--tools", "--system-prompt", "--output-format")
+    # Kolo 6 IMPORTANT (plan-consensus) - `-p`/`--model` DOPLNĚNY - i
+    # ty `_exec_claude()` VŽDY používá, přehlédl jsem je (validoval jen
+    # ty "novější"/méně jisté flagy).
+    _REQUIRED_FLAGS = ("-p", "--model", "--safe-mode", "--tools",
+                      "--system-prompt", "--output-format")
     try:
+        # Kolo 6 IMPORTANT (plan-consensus) - `encoding="utf-8"`
+        # EXPLICITNĚ (stejný důvod jako `_exec_claude()`'s vlastní
+        # `Popen` volání) - bez něj `text=True` použije lokální kódování
+        # OS (Windows cp1252), co by na netriviálním výstupu (i když
+        # `--help`/`auth status` jsou typicky ASCII) mohlo spadnout na
+        # `UnicodeDecodeError` MIMO zdokumentovaný `(None, chyba)`
+        # kontrakt.
         help_result = subprocess.run(claude_cmd + ["--help"],
-                                     capture_output=True, text=True, timeout=10)
-    except (subprocess.TimeoutExpired, OSError) as e:
+                                     capture_output=True, text=True,
+                                     encoding="utf-8", timeout=10)
+    except (subprocess.TimeoutExpired, OSError, UnicodeError) as e:
         return None, (f"Nepodařilo se ověřit verzi claude CLI "
                       f"({type(e).__name__}: {e}).")
     # Kolo 5 IMPORTANT (plan-consensus) - `returncode` se PŘED touhle
@@ -1071,8 +1083,11 @@ def _claude_cli_preflight() -> tuple:
                       f"({', '.join(missing)}) - aktualizuj Claude Code "
                       "na novější verzi.")
     try:
+        # Kolo 6 IMPORTANT (plan-consensus) - `encoding="utf-8"`
+        # EXPLICITNĚ, stejný důvod jako `--help` volání výš.
         result = subprocess.run(claude_cmd + ["auth", "status", "--json"],
-                                capture_output=True, text=True, timeout=10)
+                                capture_output=True, text=True,
+                                encoding="utf-8", timeout=10)
         # Kolo 2 IMPORTANT (plan-consensus) - `returncode` se PŘED touhle
         # opravou vůbec nekontroloval - nenulový exit kód (např. `claude`
         # binárka existuje, ale je rozbitá/nekompatibilní verze) by
@@ -1082,7 +1097,7 @@ def _claude_cli_preflight() -> tuple:
             return None, (f"`claude auth status` skončilo s kódem "
                           f"{result.returncode}: {result.stderr.strip()}")
         status = json.loads(result.stdout)
-    except (subprocess.TimeoutExpired, OSError, ValueError) as e:
+    except (subprocess.TimeoutExpired, OSError, UnicodeError, ValueError) as e:
         return None, (f"Nepodařilo se ověřit přihlášení claude CLI "
                       f"({type(e).__name__}: {e}).")
     # Kolo 2 IMPORTANT (plan-consensus) - STEJNÁ třída chyby jako
@@ -1200,7 +1215,7 @@ def _fake_help_result():
     volání."""
     class FakeHelpResult:
         returncode = 0
-        stdout = "--safe-mode --tools --system-prompt --output-format"
+        stdout = "-p --model --safe-mode --tools --system-prompt --output-format"
         stderr = ""
     return FakeHelpResult()
 
@@ -1222,6 +1237,22 @@ def test_claude_cli_preflight_missing_flags_returns_error(monkeypatch):
     assert "--safe-mode" in err
 
 
+def test_claude_cli_preflight_unicode_decode_error_returns_error(monkeypatch):
+    """Kolo 6 IMPORTANT (plan-consensus) - `subprocess.run(...,
+    text=True)` BEZ `encoding="utf-8"` by na Windows použilo lokální
+    kódování (cp1252) - netriviální výstup by mohl spadnout na
+    `UnicodeDecodeError` MIMO zdokumentovaný `(None, chyba)` kontrakt
+    (traceback místo čisté chybové hlášky)."""
+    import subprocess
+    def boom(*a, **k):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(subprocess, "run", boom)
+    claude_cmd, err = main._claude_cli_preflight()
+    assert claude_cmd is None
+    assert err is not None
+
+
 def test_claude_cli_preflight_help_nonzero_exit_returns_error(monkeypatch):
     """Kolo 5 IMPORTANT (plan-consensus) - `--help`'s VLASTNÍ returncode
     se musí kontrolovat stejně jako `auth status`'s - neúspěšné `--help`
@@ -1230,7 +1261,7 @@ def test_claude_cli_preflight_help_nonzero_exit_returns_error(monkeypatch):
     import subprocess
     class FakeHelpResultFailed:
         returncode = 1
-        stdout = "--safe-mode --tools --system-prompt --output-format"
+        stdout = "-p --model --safe-mode --tools --system-prompt --output-format"
         stderr = "segfault"
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeHelpResultFailed())
