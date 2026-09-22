@@ -39,7 +39,17 @@ from src.llm.client import (AnthropicClient, ClaudeCliClient, CodexLLMClient,
                            OutputTruncated, PipelineLLMClient)
 
 _MUTATING = {"init", "scan", "run", "answer", "review", "reference", "polish",
-            "polish-review", "questions-review"}
+            "polish-review"}
+# `questions-review` VĚDOMĚ NENÍ v `_MUTATING` (na žádost uživatele) -
+# jinak by exkluzivní zámek (`state.run_lock`, sdílený se `run`/`polish`/
+# `polish-review`) znemožnil běžet současně s `polish-review` (běžný
+# workflow: odpovídat na otázky a upravovat kapitoly v jednom sezení).
+# Riziko: souběžný zápis do `questions`/`glossary` (odsud) a `chapters`
+# (odtud) BEZ app-úrovňové serializace - SQLite sám zápisy nezkorumpuje
+# (vlastní file-level zamykání), ale logická kolize (requeue kapitoly,
+# co právě někdo edituje v polish-review) teoreticky možná. Přijatelné
+# pro lidmi-řízené, nízkofrekvenční kliknutí - ne pro `run`/`polish`
+# (ty zůstávají v `_MUTATING`, automatizované, vysokofrekvenční zápisy).
 
 _MARKERS = {"done": "OK", "pending": "..", "flagged": "!!", "needs_human": "??",
             "error": "XX", "processing": "~~"}
