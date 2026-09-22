@@ -114,6 +114,21 @@ STYLIST_TIMEOUT_SECONDS = 180
 # IMPORTANT, plan-consensus, viz `CodexLLMClient` docstring v `src/llm/
 # client.py`) - tenhle timeout je JEDINÁ pojistka proti oversized promptu.
 CODEX_TRANSLATE_TIMEOUT_SECONDS = 300
+# `claude` CLI (Claude Code) jako backend pro kritika - běží na
+# uživatelově předplatném (OAuth session), ne za token přes API (viz
+# docs/superpowers/specs/2026-09-21-claude-cli-critic-design.md).
+# `MODEL_CRITIC` samotné ("claude-sonnet-5") si NECHÁVÁME nedotčené v
+# cenové tabulce - translator (--translator claude, default) volá
+# SKUTEČNÉ, placené Claude API se STEJNÝM model stringem
+# (MODEL_TRANSLATOR má taky "claude-sonnet-5") - kdyby `billed_model`
+# kritika byl STEJNÝ string s nulovou cenou, vynulovalo by to omylem
+# i translatorovu SKUTEČNOU cenu. `-cli` suffix drží oddělený klíč.
+PRICE_IN_PER_MTOK[f"{MODEL_CRITIC}-cli"] = 0.0
+PRICE_OUT_PER_MTOK[f"{MODEL_CRITIC}-cli"] = 0.0
+# Kratší než CODEX_TRANSLATE_TIMEOUT_SECONDS - kritický průchod
+# (posouzení už přeložené kapitoly) je kratší úkol než generování
+# celé kapitoly (spike 2026-09-21).
+CLAUDE_CLI_CRITIC_TIMEOUT_SECONDS = 180
 # Hrubý bezpečnostní strop na délku kapitoly pro stylistický průchod
 # (kolo 17 IMPORTANT) - součet znaků EN+CZ. NENÍ přesný odhad tokenového
 # limitu konkrétního modelu (ten je uživatelsky konfigurovaný přes

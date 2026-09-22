@@ -42,3 +42,14 @@ def test_codex_model_has_zero_price_entries():
 def test_codex_translate_timeout_seconds_is_positive_int():
     assert isinstance(config_module.CODEX_TRANSLATE_TIMEOUT_SECONDS, int)
     assert config_module.CODEX_TRANSLATE_TIMEOUT_SECONDS > 0
+
+
+def test_claude_cli_critic_model_has_zero_price_entries():
+    key = f"{config_module.MODEL_CRITIC}-cli"
+    assert config_module.PRICE_IN_PER_MTOK[key] == 0.0
+    assert config_module.PRICE_OUT_PER_MTOK[key] == 0.0
+
+
+def test_claude_cli_critic_timeout_seconds_is_positive_int():
+    assert isinstance(config_module.CLAUDE_CLI_CRITIC_TIMEOUT_SECONDS, int)
+    assert config_module.CLAUDE_CLI_CRITIC_TIMEOUT_SECONDS > 0
