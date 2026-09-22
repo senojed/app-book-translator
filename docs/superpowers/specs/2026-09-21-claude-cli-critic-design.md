@@ -122,7 +122,12 @@ argv = [claude_bin, "-p", "--safe-mode", "--no-session-persistence",
   parsuje jako JSON nálezy - beze změny, `ClaudeCliClient.complete()`
   vrátí `result` jako `Completion.text`).
 - `usage.input_tokens`/`usage.output_tokens` → `Completion.input_tokens`/
-  `output_tokens` (reálná čísla z CLI, ne aproximace).
+  `output_tokens` (reálná čísla z CLI, ne aproximace). **DOPLŇUJÍCÍ
+  ověření (plan-consensus kolo 10, implementační plán):** `usage` je
+  na ÚSPĚŠNÉ cestě POVINNÝ dict s oběma poli jako nezáporná celá čísla
+  - CHYBĚJÍCÍ `usage`/pole je CHYBA (`ClaudeCliExecError`), ne tichý
+  fallback. Hodnoty se do `Completion` přenášejí PŘÍMO (žádné `or 1`) -
+  validní `input_tokens: 0` se nesmí přepsat na `1`.
 - `is_error`/`subtype` - pokud `is_error` je `True` nebo `subtype !=
   "success"`, jde o chybu (viz níž).
 - `total_cost_usd` se ČTE, ale NEPOUŽÍVÁ pro `record_llm_call` -

@@ -115,3 +115,14 @@ pridano encoding + UnicodeError do obou volani preflightu, novy test).
   (`--system-prompt-snapshot` je reálný flag obsahující substring
   `--system-prompt`) - zobecněno na jednotnou `_flag_present()`
   hraniční kontrolu pro všechny flagy, přidán regresní test.
+
+## Round 10 — 2026-09-22T07:51:52+0200
+
+- Codex: [round-10-codex.md](round-10-codex.md) — VERDICT: CHANGES_NEEDED
+- Claude: [round-10-claude.md](round-10-claude.md) — VERDICT: CHANGES_NEEDED
+- Summary: jeden IMPORTANT - `usage` bylo volitelné a `or 1` fallback
+  v `ClaudeCliClient.complete()` tiše přepisoval i validní nulu na
+  jedničku, znehodnocující audit `llm_calls`. Opraveno: `usage` je
+  teď povinný dict s validovanými poli na úspěšné cestě
+  (`_exec_claude()`), hodnoty se přenášejí přímo bez `or`. 3 nové
+  testy (chybí usage, chybí jedno pole, nula se zachová).

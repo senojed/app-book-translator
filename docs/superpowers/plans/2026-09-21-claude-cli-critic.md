@@ -400,6 +400,37 @@ def test_exec_claude_raises_on_non_numeric_usage_fields(monkeypatch):
             claude_cli._exec_claude("s", "u", claude_cmd=["claude"], model="m", timeout=30)
 
 
+def test_exec_claude_raises_on_missing_usage(monkeypatch):
+    """Kolo 10 IMPORTANT (plan-consensus) - `usage` NENÍ volitelné na
+    ÚSPĚŠNÉ cestě (spec/spike potvrzují, že `--output-format json` ho
+    vrací VŽDY) - CHYBĚJÍCÍ `usage` u JINAK úspěšného payloadu musí
+    selhat hlasitě, ne tiše dopadnout na `ClaudeCliClient.complete()`'s
+    dřívější `or 1` fallback."""
+    class FakeProc:
+        pid = 1
+        returncode = 0
+        def communicate(self, input, timeout):
+            return ('{"result": "ok", "is_error": false, "subtype": "success"}', "")
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: FakeProc())
+    with pytest.raises(claude_cli.ClaudeCliExecError):
+        claude_cli._exec_claude("s", "u", claude_cmd=["claude"], model="m", timeout=30)
+
+
+def test_exec_claude_raises_on_usage_missing_one_field(monkeypatch):
+    """Kolo 10 IMPORTANT (plan-consensus) - `usage` dict PŘÍTOMNÝ, ale
+    chybí JEN `output_tokens` - musí selhat stejně jako úplně chybějící
+    `usage` (ne tiše dopadnout na `or 1`)."""
+    class FakeProc:
+        pid = 1
+        returncode = 0
+        def communicate(self, input, timeout):
+            return ('{"result": "ok", "is_error": false, "subtype": "success", '
+                    '"usage": {"input_tokens": 7}}', "")
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: FakeProc())
+    with pytest.raises(claude_cli.ClaudeCliExecError):
+        claude_cli._exec_claude("s", "u", claude_cmd=["claude"], model="m", timeout=30)
+
+
 def test_exec_claude_kills_process_tree_on_timeout(monkeypatch):
     killed = {"n": 0}
     class FakeProc:
@@ -548,12 +579,22 @@ def _exec_claude(system: str, user: str, *, claude_cmd: list, model: str,
         raise ClaudeCliExecError(
             f"claude -p's 'result' pole musí být řetězec, ne "
             f"{type(payload.get('result')).__name__}.")
+    # Kolo 10 IMPORTANT (plan-consensus) - `usage` NENÍ volitelné pro
+    # ÚSPĚŠNÝ výstup (spec i spike 2026-09-21 potvrzují, že
+    # `--output-format json` vrací `usage` VŽDY) - dřívější "if usage is
+    # not None" nechávalo CHYBĚJÍCÍ `usage`/pole TICHE projít, a
+    # `ClaudeCliClient.complete()`'s `usage.get(...) or 1` pak
+    # PŘEPISOVALA i SKUTEČNOU nulu (validní `input_tokens: 0`) na `1` -
+    # zaznamenaný audit cost by neodpovídal realitě. Teď je `usage`
+    # dict s oběma poli POVINNÝ požadavek stejné síly jako `result`.
     usage = payload.get("usage")
-    if usage is not None:
-        if not isinstance(usage, dict):
-            raise ClaudeCliExecError(
-                f"claude -p's 'usage' pole musí být objekt, ne "
-                f"{type(usage).__name__}.")
+    if not isinstance(usage, dict):
+        raise ClaudeCliExecError(
+            f"claude -p's 'usage' pole musí být objekt, ne "
+            f"{type(usage).__name__ if usage is not None else 'None'} "
+            "(chybí nebo má špatný typ).")
+    for field in ("input_tokens", "output_tokens"):
+        value = usage.get(field)
         # Kolo 2 IMPORTANT (plan-consensus) - `isinstance(usage, dict)`
         # samo nestačí - `input_tokens`/`output_tokens` mohou být
         # string/bool/float/záporné číslo. `PipelineLLMClient.complete()`
@@ -562,14 +603,10 @@ def _exec_claude(system: str, user: str, *, claude_cmd: list, model: str,
         # (maskuje původní výjimku), `bool` projde tiše (Python `bool`
         # je `int` podtřída, ale sémanticky nesmyslné), záporné číslo
         # by zapsalo nesmyslný audit řádek (záporná cena/tokeny).
-        for field in ("input_tokens", "output_tokens"):
-            value = usage.get(field)
-            if value is not None and (isinstance(value, bool)
-                                      or not isinstance(value, int)
-                                      or value < 0):
-                raise ClaudeCliExecError(
-                    f"claude -p's usage.{field} musí být nezáporné "
-                    f"celé číslo, ne {value!r}.")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ClaudeCliExecError(
+                f"claude -p's usage.{field} musí být nezáporné celé "
+                f"číslo, ne {value!r}.")
     return payload
 ```
 
@@ -622,6 +659,24 @@ def test_claude_cli_client_truncated_true_when_stop_reason_is_max_tokens(monkeyp
     c = ClaudeCliClient(["claude"], "m")
     comp = c.complete(system="s", user="u", max_tokens=10, model="m")
     assert comp.truncated is True
+
+
+def test_claude_cli_client_complete_preserves_zero_usage(monkeypatch):
+    """Kolo 10 IMPORTANT (plan-consensus) - validní `input_tokens: 0`
+    (např. triviální/cachovaný prompt) se NESMÍ přepsat na `1` -
+    dřívější `usage.get("input_tokens") or 1` by nulu (falsy v
+    Pythonu) tiše nahradilo jedničkou, znehodnocující audit
+    `llm_calls`."""
+    from src.llm.client import ClaudeCliClient
+    def fake_exec(system, user, *, claude_cmd, model, timeout):
+        return {"result": "ok", "is_error": False, "subtype": "success",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 0, "output_tokens": 3}}
+    monkeypatch.setattr("src.llm.claude_cli._exec_claude", fake_exec)
+    c = ClaudeCliClient(["claude"], "claude-sonnet-5")
+    comp = c.complete(system="s", user="u", max_tokens=100, model="claude-sonnet-5")
+    assert comp.input_tokens == 0
+    assert comp.output_tokens == 3
 
 
 def test_claude_cli_client_default_timeout_from_config(monkeypatch):
@@ -794,7 +849,13 @@ class ClaudeCliClient:
             # oprava (širší `except`, stejná redakce).
             from src.agents import stylist
             raise ClaudeCliFatalError(stylist._redact_detail(str(e))) from e
-        usage = payload.get("usage") or {}
+        # Kolo 10 IMPORTANT (plan-consensus) - `_exec_claude()` (Task 2,
+        # kolo-10 fix) teď GARANTUJE `usage` jako dict s VALIDOVANÝMI
+        # `input_tokens`/`output_tokens` (nezáporná int) na ÚSPĚŠNÉ
+        # cestě - `usage.get(...) or 1` by tichem přepsalo SKUTEČNOU
+        # nulu (validní `input_tokens: 0`) na `1`, znehodnocující audit
+        # `llm_calls`. Hodnoty se teď přenášejí PŘÍMO, bez `or`.
+        usage = payload["usage"]
         # Kolo 1 IMPORTANT (plan-consensus) - `truncated` čte SKUTEČNÝ
         # `stop_reason` (ověřeno spikem - `claude -p --output-format
         # json` ho vrací, stejný signál jako Anthropic API's `resp.
@@ -808,8 +869,8 @@ class ClaudeCliClient:
         return Completion(
             text=payload.get("result") or "",
             truncated=payload.get("stop_reason") == "max_tokens",
-            input_tokens=usage.get("input_tokens") or 1,
-            output_tokens=usage.get("output_tokens") or 1,
+            input_tokens=usage["input_tokens"],
+            output_tokens=usage["output_tokens"],
         )
 
     def count_tokens(self, *, system: str, user: str, model: str) -> int:
