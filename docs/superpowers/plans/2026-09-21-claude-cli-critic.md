@@ -123,6 +123,15 @@ kvůli Windows process-tree killing), `claude` CLI (`claude -p
   2; continue`) detekci truncation SPRÁVNĚ zachytí (přes `stop_reason`),
   ale samotný retry limit NEZVÝŠÍ (stejná třída limitu jako Codex -
   žádný proaktivní limit navíc, jen zjištění PO faktu).
+- **Kolo 7 IMPORTANT (plan-consensus) - vědomě přijatý limit:**
+  `_claude_cli_preflight()` ověří přihlášení, NE oprávnění použít
+  konkrétní `config.MODEL_CRITIC` přes předplatné - takové selhání se
+  projeví až na prvním `.complete()` volání, PO zaplaceném Codex
+  překladu. Bezpečně zachyceno (`ClaudeCliFatalError` +
+  `_checkpoint_flagged()` uloží poslední platný `cz`) - skutečný
+  zkušební `claude -p` v preflightu by stál reálné usage při KAŽDÉM
+  spuštění kvůli vzácnému okrajovému případu, neúměrné. Viz
+  `_claude_cli_preflight()`'s docstring (Task 3).
 
 ---
 
@@ -1035,7 +1044,21 @@ def _claude_cli_preflight() -> tuple:
     tokeny/API volání, ověřeno spikem 2026-09-21) je jediný levný
     způsob, jak ověřit PŘIHLÁŠENÍ (na rozdíl od `_polish_preflight()`'s
     Codex kontrol, co jsou čistě config/PATH - `claude` CLI dostupnost
-    samotná NEZARUČUJE platnou OAuth session)."""
+    samotná NEZARUČUJE platnou OAuth session).
+
+    Kolo 7 - VĚDOMĚ PŘIJATÝ LIMIT (plan-consensus): `auth status` ověří
+    JEN přihlášení, ne oprávnění použít KONKRÉTNÍ `config.MODEL_CRITIC`
+    přes tohle předplatné (subscription tier nemusí model odemykat,
+    nebo model string může být zastaralý/překlepnutý) - projeví se AŽ
+    na prvním skutečném `.complete()` volání. Zvažoval jsem skutečné
+    zkušební `claude -p` volání se stejnými flagy/modelem v preflightu,
+    ALE: (1) stálo by reálné předplatné-usage při KAŽDÉM run/polish
+    spuštění kvůli ochraně před úzkým, vzácným selháním; (2) selhání
+    NENÍ tiché - `_run_critic()` ho zachytí jako `ClaudeCliFatalError`,
+    `_checkpoint_flagged()` uloží poslední platný `cz` jako `flagged`,
+    nic se nepřepíše/neztratí, run se jen zastaví o pár sekund později.
+    Náklad opravy neúměrný riziku - PONECHÁNO jako známé omezení, ne
+    bug."""
     from src.llm import claude_cli
     try:
         claude_cmd = claude_cli._resolve_claude_cmd(["claude"])
@@ -1053,8 +1076,16 @@ def _claude_cli_preflight() -> tuple:
     # Kolo 6 IMPORTANT (plan-consensus) - `-p`/`--model` DOPLNĚNY - i
     # ty `_exec_claude()` VŽDY používá, přehlédl jsem je (validoval jen
     # ty "novější"/méně jisté flagy).
-    _REQUIRED_FLAGS = ("-p", "--model", "--safe-mode", "--tools",
-                      "--system-prompt", "--output-format")
+    # Kolo 7 IMPORTANT (plan-consensus) - prostý `"-p" in help_result.stdout`
+    # je chybný: `"-p"` je i SUBSTRING `"--print"` (Claude CLI dlouhý
+    # alias), takže by CLI, co "-p" zrušilo a mělo JEN "--print", prošlo
+    # kontrolou falešně. Ostatních 5 flagů jsou dlouhé/unikátní řetězce
+    # bez podobné kolize - jen `-p` potřebuje přesnější kontrolu:
+    # hraniční regex (mezera/čárka/konec řádku po `-p`, ne další
+    # písmeno), NE substring.
+    _REQUIRED_LONG_FLAGS = ("--model", "--safe-mode", "--tools",
+                           "--system-prompt", "--output-format")
+    _SHORT_FLAG_RE = re.compile(r"(?<![A-Za-z-])-p(?![A-Za-z-])")
     try:
         # Kolo 6 IMPORTANT (plan-consensus) - `encoding="utf-8"`
         # EXPLICITNĚ (stejný důvod jako `_exec_claude()`'s vlastní
@@ -1077,7 +1108,9 @@ def _claude_cli_preflight() -> tuple:
     if help_result.returncode != 0:
         return None, (f"`claude --help` skončilo s kódem "
                       f"{help_result.returncode}: {help_result.stderr.strip()}")
-    missing = [f for f in _REQUIRED_FLAGS if f not in help_result.stdout]
+    missing = [f for f in _REQUIRED_LONG_FLAGS if f not in help_result.stdout]
+    if not _SHORT_FLAG_RE.search(help_result.stdout):
+        missing.append("-p")
     if missing:
         return None, (f"claude CLI nepodporuje potřebné volby "
                       f"({', '.join(missing)}) - aktualizuj Claude Code "
@@ -1118,8 +1151,8 @@ def _claude_cli_preflight() -> tuple:
     return claude_cmd, None
 ```
 
-Přidej `import subprocess` k existujícím importům na main.py (pokud
-tam ještě není - `json` už tam je).
+Přidej `import subprocess` a `import re` k existujícím importům na
+main.py (pokud tam ještě nejsou - `json` už tam je).
 
 **Kolo 3 IMPORTANT (plan-consensus) - provlékni preflightem resolvnutý
 `claude_cmd` do `_client_factory()`, nezahazuj ho:** V `_cmd_run`
@@ -1235,6 +1268,26 @@ def test_claude_cli_preflight_missing_flags_returns_error(monkeypatch):
     claude_cmd, err = main._claude_cli_preflight()
     assert claude_cmd is None
     assert "--safe-mode" in err
+
+
+def test_claude_cli_preflight_print_alias_does_not_satisfy_dash_p(monkeypatch):
+    """Kolo 7 IMPORTANT (plan-consensus) - `"-p" in stdout` substring
+    kontrola je chybná: `"-p"` je i SUBSTRING `"--print"`. CLI, co by
+    zrušilo krátký alias `-p` a mělo JEN dlouhý `--print`, by falešně
+    prošlo. `--print` se zde objevuje MÍSTO `-p` - očekáváme, že
+    preflight `-p` i tak nahlásí jako chybějící (přesná hranice
+    slova/flagu, ne substring)."""
+    import subprocess
+    class FakeHelpResultPrintOnly:
+        returncode = 0
+        stdout = ("--print --model --safe-mode --tools --system-prompt "
+                  "--output-format")
+        stderr = ""
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeHelpResultPrintOnly())
+    claude_cmd, err = main._claude_cli_preflight()
+    assert claude_cmd is None
+    assert "-p" in err
 
 
 def test_claude_cli_preflight_unicode_decode_error_returns_error(monkeypatch):

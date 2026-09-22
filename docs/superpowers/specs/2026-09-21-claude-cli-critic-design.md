@@ -16,8 +16,14 @@ vůbec nepotřebuje.
 ## Ověřeno spikem (2026-09-21, tahle konverzace)
 
 - `claude` CLI je nainstalované, verze 2.1.257.
-- `claude -p --safe-mode --tools "" --system-prompt "<S>" "<U>"` funguje:
-  exit 0, čistý stdout (jen odpověď), žádný stderr šum.
+- `claude -p --safe-mode --tools "" --system-prompt "<S>" "<U>"` (S/U
+  jako pozicní argumenty) funguje: exit 0, čistý stdout (jen odpověď),
+  žádný stderr šum. **DOPLŇUJÍCÍ ověření (plan-consensus kolo 1, viz
+  implementační plán):** `<U>` MUSÍ jít STDINEM, ne pozicním argumentem
+  (kapitola EN+CZ text může snadno přesáhnout Windows argv limit
+  ~8191 znaků) - `echo "<U>" | claude -p --safe-mode --tools ""
+  --system-prompt "<S>"` ověřeno FUNGUJE STEJNĚ (systémová priorita
+  zachovaná). Finální architektura (níž) používá TENHLE tvar.
 - **Bez `--safe-mode`**: holé `claude -p` natáhne uživatelovo globální
   `~/.claude/CLAUDE.md` (v testu prosáklo do odpovědi, i s explicitním
   `--system-prompt`) - kritik by dědil uživatelovy osobní instrukce
@@ -69,8 +75,17 @@ zvládne BEZE ZMĚNY - `ClaudeCliClient` je jen DALŠÍ klient s
 ### Subprocess volání
 
 ```python
-[claude_bin, "-p", "--safe-mode", "--tools", "", "--output-format", "json",
- "--system-prompt", system, "--model", model, user]
+argv = [claude_bin, "-p", "--safe-mode", "--tools", "", "--output-format",
+       "json", "--model", model, "--system-prompt", system]
+# `user` NENÍ v argv - jde STDINEM (`subprocess.Popen(argv, stdin=PIPE,
+# ...).communicate(input=user, ...)`) - plan-consensus kolo 1 IMPORTANT
+# (implementační plán) - kapitola EN+CZ text může snadno přesáhnout
+# Windows argv limit (~8191 znaků), stejný důvod jako Codexův stdin
+# vzor v `stylist._exec_codex`. `system` (kritikovy instrukce, 805
+# znaků, statické) zůstává v argv přes `--system-prompt` - bezpečně
+# pod limitem, a systémová priorita se zachovává jen takhle (spojení
+# system+user do jednoho stdin blobu by ji degradovalo na "jen další
+# text").
 ```
 
 - `system`/`user` odpovídají PŘESNĚ `critic.review()`'s existujícím

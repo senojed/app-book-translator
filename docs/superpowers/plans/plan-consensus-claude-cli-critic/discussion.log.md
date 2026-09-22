@@ -77,3 +77,17 @@ _exec_claude() je vzdy pouziva - rozsireno, opraveny 2 testovaci
 fixtures; subprocess.run() bez encoding="utf-8", nezachytavalo
 UnicodeError na rozdil od _exec_claude()'s vlastniho Popen volani -
 pridano encoding + UnicodeError do obou volani preflightu, novy test).
+
+## Round 7 — 2026-09-22T07:39:38+0200
+
+- Codex: [round-7-codex.md](round-7-codex.md) — VERDICT: CHANGES_NEEDED
+- Claude: [round-7-claude.md](round-7-claude.md) — VERDICT: CHANGES_NEEDED
+- Summary: tři IMPORTANT nálezy, všechny reálné. Dva opraveny: `-p`
+  substring bug (kolize s `--print`) opraven regexem +
+  `_REQUIRED_LONG_FLAGS`/`_SHORT_FLAG_RE` split, přidán regresní test;
+  design spec sesynchronizován s plánem na stdin-based `user`
+  (dřív ukazoval poziční argv). Třetí (model-autorizace přes
+  `auth status` neověřená) zdokumentován jako vědomě přijatý limit
+  (proporcionalita — reálný zkušební `claude -p` v preflightu by stál
+  usage při každém spuštění kvůli vzácnému, bezpečně-selhávajícímu
+  riziku; `_checkpoint_flagged()` už chrání data).
