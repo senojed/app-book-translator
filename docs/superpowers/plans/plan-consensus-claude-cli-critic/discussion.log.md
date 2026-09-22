@@ -29,3 +29,17 @@ v _cmd_polish/polish_server.py regenerate, oboje taky volaji kritika
 PO drahem Codex volani - pridana; preflight funkce sama nevalidovala
 returncode/dict JSON tvar - opraveno; usage poli input_tokens/
 output_tokens nevalidovana jako nezaporna cela cisla - opraveno).
+
+## Round 3
+
+- Codex: [round-3-codex.md](round-3-codex.md) — CHANGES_NEEDED
+- Claude: [round-3-claude.md](round-3-claude.md) — CHANGES_NEEDED
+
+Opraveno: 1 BLOCKING (stylist_check, treti agent typ v _polish_one_
+chapter, zustava MIMO rozsah planu - Anthropic API - ale kolo-2's
+preflight kontroly vytvarely mylny dojem uplne ochrany; doplnena
+samostatna eager ANTHROPIC_API_KEY kontrola pro _cmd_polish/regenerate
++ explicitni dokumentace rozsahu v Global Constraints a Task 4) + 1
+IMPORTANT (preflightem resolvnuty claude_cmd se zahazoval, factory
+resolvoval znovu, TOCTOU mezera - threadovano pres novy volitelny
+_client_factory parametr).

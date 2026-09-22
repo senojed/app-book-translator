@@ -30,6 +30,17 @@ kvůli Windows process-tree killing), `claude` CLI (`claude -p
   `AnthropicClient`/API klíč. `config.ANTHROPIC_API_KEY`/`AnthropicClient`
   zůstávají v kódu (translator může být `--translator claude`), jen
   kritik je přestává používat.
+- **Kolo 3 BLOCKING (plan-consensus) - `stylist_check` NENÍ v rozsahu:**
+  `_polish_one_chapter()` (`main.py:698`, `_cmd_polish`/polish-server)
+  volá NAVÍC `cf("stylist_check")` - TŘETÍ agent typ (ne "translator",
+  ne "critic"), používaný `stylist.check_meaning_preserved()`. Rozsah
+  tohohle plánu (brainstorming 2026-09-21 - "Jen kritik") ho NEMĚNÍ -
+  zůstává `AnthropicClient`/`ANTHROPIC_API_KEY`. `run` (translator +
+  kritik) po tomhle plánu API klíč VŮBEC nepotřebuje; `polish`
+  (translator/kritik JE v dávce, PLUS `stylist_check`) klíč STÁLE
+  potřebuje - eager kontrola pro `stylist_check`'s `ANTHROPIC_API_KEY`
+  se PŘIDÁVÁ (Task 3) vedle nové `claude` CLI kontroly, ať `polish`
+  taky neplatí za Codex stylizaci zbytečně, než zjistí chybějící klíč.
 - `claude -p --safe-mode --tools ""` - `--safe-mode` (NE `--bare`,
   ověřeno spikem 2026-09-21 - `--bare` vynucuje `ANTHROPIC_API_KEY`/
   `apiKeyHelper` auth, OAuth/keychain se v něm NEČTE, což by celý smysl
@@ -835,6 +846,21 @@ def test_client_factory_critic_always_uses_claude_cli_client(monkeypatch):
     assert client._inner.billed_model == f"{config.MODEL_CRITIC}-cli"
 
 
+def test_client_factory_critic_uses_preflight_resolved_claude_cmd(monkeypatch):
+    """Kolo 3 IMPORTANT (plan-consensus) - `_claude_cli_preflight()`
+    (Task 3) resolvne `claude` na ABSOLUTNÍ cestu A ověří přihlášení
+    PRO TENHLE KONKRÉTNÍ binární soubor. Bez threadování téhle hodnoty
+    do `_client_factory`/`ClaudeCliClient` by se PATH lookup provedl
+    ZNOVU, líně, uvnitř `_exec_claude()` - TOCTOU mezera (PATH se mezi
+    preflightem a prvním skutečným voláním teoreticky může změnit) a
+    zbytečná duplicitní práce."""
+    from src.llm.client import ClaudeCliClient
+    factory = main._client_factory(1, interactive=False,
+                                   claude_cmd=["/resolved/path/claude"])
+    client = factory("critic")
+    assert client._inner._claude_cmd == ["/resolved/path/claude"]
+
+
 def test_client_factory_critic_uses_claude_cli_even_with_codex_translator(monkeypatch):
     """Kritik zůstává na `claude` CLI NEZÁVISLE na `translator_backend` -
     žádný fallback, žádná podmínka na `--translator`."""
@@ -868,7 +894,28 @@ Expected: FAIL - `AssertionError` (`client._inner` je pořád `AnthropicClient`)
 
 - [ ] **Step 3: Implementuj**
 
-V `main.py`, `_client_factory`'s `factory()`, najdi:
+Nejdřív `_client_factory`'s SIGNATURU - najdi:
+
+```python
+def _client_factory(run_id: int, *, interactive: bool, require_lock=None,
+                    translator_backend: str = "claude"):
+```
+
+nahraď:
+
+```python
+def _client_factory(run_id: int, *, interactive: bool, require_lock=None,
+                    translator_backend: str = "claude", claude_cmd=None):
+```
+
+(Kolo 3 IMPORTANT, plan-consensus - `claude_cmd` volitelný parametr,
+default `None` → `factory()` spadne na `["claude"]` a `ClaudeCliClient`
+si binárku resolvne LÍNĚ sám - stejné chování jako dřív pro volající,
+co eager preflight nedělají. Volající, co `_claude_cli_preflight()`
+UŽ zavolali (`_cmd_run`/`_cmd_polish`/polish-server, viz níž), předají
+JEHO resolvnutou hodnotu - žádná duplicitní práce, žádná TOCTOU mezera.)
+
+Pak `_client_factory`'s `factory()`, najdi:
 
 ```python
             inner = CodexLLMClient(codex_cmd, config.CODEX_MODEL)
@@ -884,11 +931,16 @@ nahraď:
             # Kritik VŽDY `claude` CLI (předplatné) - žádný fallback na
             # AnthropicClient/API klíč, nezávisle na `translator_backend`
             # (viz docs/superpowers/specs/2026-09-21-claude-cli-critic-
-            # design.md). `_resolve_claude_cmd` (uvnitř `ClaudeCliClient.
-            # complete()`, líně - stejný lazy vzor jako Codex) vyhodí
-            # `ClaudeCliUnavailable` → `ClaudeCliFatalError`, pokud
-            # `claude` CLI není nainstalované/na PATH.
-            inner = ClaudeCliClient(["claude"], config.MODEL_CRITIC)
+            # design.md). Kolo 3 IMPORTANT (plan-consensus) - `claude_cmd`
+            # PŘEDANÝ volajícím (resolvnutý `_claude_cli_preflight()`
+            # UŽ jednou, viz `_cmd_run`/`_cmd_polish`/polish-server níž) -
+            # `or ["claude"]` fallback JEN pro volající bez eager
+            # preflightu. `ClaudeCliClient.complete()` (Task 2) si i tak
+            # binárku ZNOVU resolvne PŘI KAŽDÉM volání (`_exec_claude`'s
+            # `_resolve_claude_cmd`) - vyhodí `ClaudeCliUnavailable` →
+            # `ClaudeCliFatalError`, pokud přestala existovat MEZI
+            # preflightem a skutečným voláním.
+            inner = ClaudeCliClient(claude_cmd or ["claude"], config.MODEL_CRITIC)
         else:
             inner = AnthropicClient()
 ```
@@ -991,6 +1043,23 @@ def _claude_cli_preflight() -> tuple:
 
 Přidej `import subprocess` k existujícím importům na main.py (pokud
 tam ještě není - `json` už tam je).
+
+**Kolo 3 IMPORTANT (plan-consensus) - provlékni preflightem resolvnutý
+`claude_cmd` do `_client_factory()`, nezahazuj ho:** V `_cmd_run`
+(main.py), najdi:
+
+```python
+        cf = _client_factory(rid, interactive=True,
+                             translator_backend=args.translator)
+```
+
+nahraď:
+
+```python
+        cf = _client_factory(rid, interactive=True,
+                             translator_backend=args.translator,
+                             claude_cmd=claude_cmd)
+```
 
 Existující testy, co ANTHROPIC_API_KEY blok mockovaly/ověřovaly
 (`test_run_translator_codex_missing_anthropic_key_fails_eager` a
@@ -1130,10 +1199,37 @@ def _cmd_polish(args) -> int:
     # Kolo 2 IMPORTANT (plan-consensus) - stejný důvod jako `_cmd_run`'s
     # kontrola (viz Global Constraints/Task 3 výš) - `_polish_one_
     # chapter` volá kritika PO drahé Codex stylizaci, ne před ní.
-    _, claude_preflight_err = _claude_cli_preflight()
+    claude_cmd, claude_preflight_err = _claude_cli_preflight()
     if claude_preflight_err:
         _say(f"Kritik vyžaduje funkční claude CLI: {claude_preflight_err}")
         return 1
+    # Kolo 3 BLOCKING (plan-consensus) - `_polish_one_chapter()` volá
+    # NAVÍC `cf("stylist_check")` (`stylist.check_meaning_preserved()`,
+    # main.py:698) - TENHLE agent zůstává MIMO rozsah tohohle plánu
+    # (jen kritik přechází na `claude` CLI, viz spec "Rozsah") - pořád
+    # `AnthropicClient`/`ANTHROPIC_API_KEY`. Bez týhle kontroly by
+    # chybějící klíč nechal proběhnout DRAHOU Codex stylizaci CELÉ
+    # dávky, než by selhalo na PRVNÍM `stylist_check` volání - STEJNÉ
+    # riziko jako `claude` CLI výš, jen pro JINOU, MIMO-ROZSAH závislost.
+    if not config.ANTHROPIC_API_KEY:
+        _say("polish vyžaduje funkční Claude API pro stylist_check: "
+            "Chybí ANTHROPIC_API_KEY v prostředí.")
+        return 1
+```
+
+V `_cmd_polish`, najdi:
+
+```python
+        cf = _client_factory(rid, interactive=True,
+                             require_lock=lambda: _lock_still_owned(config.LOCK_PATH))
+```
+
+nahraď:
+
+```python
+        cf = _client_factory(rid, interactive=True,
+                             require_lock=lambda: _lock_still_owned(config.LOCK_PATH),
+                             claude_cmd=claude_cmd)
 ```
 
 V `src/review_ui/polish_server.py`, regenerate handler, najdi:
@@ -1153,16 +1249,43 @@ nahraď:
         # Kolo 2 IMPORTANT (plan-consensus) - stejný důvod jako `_cmd_
         # run`/`_cmd_polish` (main.py) - regenerate taky volá kritika
         # PO drahé Codex stylizaci.
-        _, claude_preflight_err = main._claude_cli_preflight()
+        claude_cmd, claude_preflight_err = main._claude_cli_preflight()
         if claude_preflight_err:
             return JSONResponse({"error": claude_preflight_err}, status_code=503)
+        # Kolo 3 BLOCKING (plan-consensus) - `stylist_check` (main.py's
+        # `_polish_one_chapter`) zůstává MIMO rozsah (pořád `Anthropic
+        # Client`/`ANTHROPIC_API_KEY`) - stejný důvod jako `_cmd_polish`
+        # (main.py) výš.
+        if not main.config.ANTHROPIC_API_KEY:
+            return JSONResponse(
+                {"error": "polish vyžaduje funkční Claude API pro "
+                          "stylist_check: Chybí ANTHROPIC_API_KEY "
+                          "v prostředí."}, status_code=503)
+```
+
+V `src/review_ui/polish_server.py`, regenerate handler, najdi:
+
+```python
+            cf = main._client_factory(rid, interactive=False,
+                                      require_lock=app.state.require_lock)
+```
+
+nahraď:
+
+```python
+            cf = main._client_factory(rid, interactive=False,
+                                      require_lock=app.state.require_lock,
+                                      claude_cmd=claude_cmd)
 ```
 
 Přidej regresní testy (`tests/test_cli.py` pro `_cmd_polish`,
 `tests/test_polish_server.py` pro regenerate) analogické `test_run_
 claude_cli_preflight_failure_blocks_queue_before_translation` výš -
 mockni `_claude_cli_preflight` na selhání, ověř že se `stylist.polish`/
-Codex volání VŮBEC nespustí.
+Codex volání VŮBEC nespustí. Přidej i test pro chybějící
+`ANTHROPIC_API_KEY` (`stylist_check`, kolo 3 BLOCKING) na OBOU místech -
+ověř, že se `stylist.polish` (Codex) VŮBEC nespustí, i když `claude`
+CLI preflight uspěje.
 
 - [ ] **Step 4: Ověř úspěch**
 
@@ -1179,12 +1302,16 @@ git add main.py src/review_ui/polish_server.py tests/test_cli.py tests/test_poli
 git commit -m "feat: kritik natvrdo pres claude CLI, zrusena ANTHROPIC_API_KEY eager kontrola
 
 _client_factory's agent==critic vetev staví ClaudeCliClient MISTO
-AnthropicClient, nezavisle na translator_backend. _cmd_run's eager
-ANTHROPIC_API_KEY kontrola (zavedena minulym planem pro kritika) se
-rusi, nahrazena novou _claude_cli_preflight() (resolvne binarku +
-overi claude auth status --json) - volana v _cmd_run, _cmd_polish I
-polish_server.py's regenerate handleru (kritik se pouziva ze VSECH
-tri mist, po draze zaplacenem Codex volani).
+AnthropicClient, nezavisle na translator_backend - pouziva preflightem
+resolvnuty claude_cmd (novy volitelny _client_factory parametr), ne
+duplicitni lazy resolve. _cmd_run's eager ANTHROPIC_API_KEY kontrola
+(zavedena minulym planem pro kritika) se rusi, nahrazena novou
+_claude_cli_preflight() (resolvne binarku + overi claude auth status
+--json) - volana v _cmd_run, _cmd_polish I polish_server.py's
+regenerate handleru. _cmd_polish/regenerate dostaly i eager kontrolu
+ANTHROPIC_API_KEY pro stylist_check (treti agent typ, MIMO rozsah
+tohohle planu, stale Anthropic API) - jinak by draha Codex stylizace
+probehla zbytecne pred zjistenim chybejiciho klice.
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
@@ -1216,6 +1343,18 @@ kapitole, zkontroluj:
 - Žádný `ANTHROPIC_API_KEY` v prostředí (`unset ANTHROPIC_API_KEY` /
   `Remove-Item Env:ANTHROPIC_API_KEY`) - `run` musí projít i BEZ něj
   (to je celý smysl týhle změny).
+
+**Kolo 3 BLOCKING (plan-consensus) - `polish` NENÍ součástí týhle
+záruky:** `python main.py polish` (a polish-server regenerate) VOLÁ
+`stylist_check` (`main.py:698`), co zůstává MIMO rozsah tohohle plánu -
+STÁLE vyžaduje `ANTHROPIC_API_KEY`. Ověř SAMOSTATNĚ (s `ANTHROPIC_
+API_KEY` NASTAVENÝM): `python main.py polish --only <idx>` na kapitole,
+co `run` výš dokončil - kritik uvnitř (pokud `_polish_one_chapter`
+kritika volá) běží přes `claude` CLI (`llm_calls` `agent='critic'`
+řádek `provider='claude-cli'`), `stylist_check` běží přes
+`AnthropicClient` (`agent='stylist_check'` řádek `provider='anthropic'`,
+NENULOVÁ cena) - OBOJÍ ve STEJNÉM `polish` běhu, různé backends, přesně
+podle plánu.
 
 - [ ] **Step 3: Invoke `superpowers:finishing-a-development-branch`**
 
