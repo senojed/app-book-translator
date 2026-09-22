@@ -1012,6 +1012,27 @@ def _claude_cli_preflight() -> tuple:
         claude_cmd = claude_cli._resolve_claude_cmd(["claude"])
     except claude_cli.ClaudeCliUnavailable as e:
         return None, str(e)
+    # Kolo 4 IMPORTANT (plan-consensus) - `auth status` samo neověří,
+    # že nainstalovaná verze podporuje flagy, co `_exec_claude()`
+    # SKUTEČNĚ používá (`--safe-mode`/`--tools`/`--system-prompt`/
+    # `--output-format`) - starší/nekompatibilní CLI MŮŽE být přihlášené
+    # (auth je nezávislá na verzi), ale selhat AŽ na PRVNÍM `.complete()`
+    # volání (PO zaplaceném Codex překladu). `claude --help` (žádné
+    # tokeny/API volání, stejně levné jako `auth status`) obsahuje
+    # NÁZVY VŠECH podporovaných flagů - ověřeno spikem 2026-09-21 -
+    # substring kontrola je jednoduchá a nevyžaduje hádat verzní čísla.
+    _REQUIRED_FLAGS = ("--safe-mode", "--tools", "--system-prompt", "--output-format")
+    try:
+        help_result = subprocess.run(claude_cmd + ["--help"],
+                                     capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return None, (f"Nepodařilo se ověřit verzi claude CLI "
+                      f"({type(e).__name__}: {e}).")
+    missing = [f for f in _REQUIRED_FLAGS if f not in help_result.stdout]
+    if missing:
+        return None, (f"claude CLI nepodporuje potřebné volby "
+                      f"({', '.join(missing)}) - aktualizuj Claude Code "
+                      "na novější verzi.")
     try:
         result = subprocess.run(claude_cmd + ["auth", "status", "--json"],
                                 capture_output=True, text=True, timeout=10)
@@ -1102,6 +1123,36 @@ def test_run_claude_cli_preflight_failure_blocks_queue_before_translation(
     assert calls["n"] == 0   # zadny preklad se vubec nespustil
 
 
+def _fake_help_result():
+    """Sdílená pomocná - `_claude_cli_preflight()` (kolo 4) volá
+    `subprocess.run` DVAKRÁT (`--help` PAK `auth status --json`) - testy
+    níž potřebují ÚSPĚŠNOU `--help` odpověď (obsahující VŠECHNY
+    požadované flagy), aby se vůbec dostaly k testovanému DRUHÉMU
+    volání."""
+    class FakeHelpResult:
+        returncode = 0
+        stdout = "--safe-mode --tools --system-prompt --output-format"
+        stderr = ""
+    return FakeHelpResult()
+
+
+def test_claude_cli_preflight_missing_flags_returns_error(monkeypatch):
+    """Kolo 4 IMPORTANT (plan-consensus) - `auth status` samo neověří,
+    že CLI podporuje flagy, co `_exec_claude()` skutečně používá -
+    starší/nekompatibilní verze MŮŽE být přihlášená, ale selže AŽ na
+    prvním `.complete()` volání, PO zaplaceném Codex překladu."""
+    import subprocess
+    class FakeHelpResultMissingFlags:
+        returncode = 0
+        stdout = "-p --model"   # chybí --safe-mode/--tools/--system-prompt/--output-format
+        stderr = ""
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeHelpResultMissingFlags())
+    claude_cmd, err = main._claude_cli_preflight()
+    assert claude_cmd is None
+    assert "--safe-mode" in err
+
+
 def test_claude_cli_preflight_nonzero_exit_returns_error(monkeypatch):
     """Kolo 2 IMPORTANT (plan-consensus) - `claude auth status` může
     selhat (rozbitá instalace, nekompatibilní verze) s nenulovým exit
@@ -1111,8 +1162,12 @@ def test_claude_cli_preflight_nonzero_exit_returns_error(monkeypatch):
         returncode = 1
         stdout = ""
         stderr = "unknown command"
+    calls = {"n": 0}
+    def fake_run(*a, **k):
+        calls["n"] += 1
+        return _fake_help_result() if calls["n"] == 1 else FakeResult()
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeResult())
+    monkeypatch.setattr(subprocess, "run", fake_run)
     claude_cmd, err = main._claude_cli_preflight()
     assert claude_cmd is None
     assert "1" in err or "unknown command" in err
@@ -1127,8 +1182,12 @@ def test_claude_cli_preflight_non_dict_json_returns_error(monkeypatch):
         returncode = 0
         stdout = "[]"
         stderr = ""
+    calls = {"n": 0}
+    def fake_run(*a, **k):
+        calls["n"] += 1
+        return _fake_help_result() if calls["n"] == 1 else FakeResult()
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeResult())
+    monkeypatch.setattr(subprocess, "run", fake_run)
     claude_cmd, err = main._claude_cli_preflight()
     assert claude_cmd is None
     assert err is not None
@@ -1140,8 +1199,12 @@ def test_claude_cli_preflight_malformed_json_returns_error(monkeypatch):
         returncode = 0
         stdout = "not json"
         stderr = ""
+    calls = {"n": 0}
+    def fake_run(*a, **k):
+        calls["n"] += 1
+        return _fake_help_result() if calls["n"] == 1 else FakeResult()
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeResult())
+    monkeypatch.setattr(subprocess, "run", fake_run)
     claude_cmd, err = main._claude_cli_preflight()
     assert claude_cmd is None
     assert err is not None
@@ -1153,8 +1216,12 @@ def test_claude_cli_preflight_not_logged_in_returns_error(monkeypatch):
         returncode = 0
         stdout = '{"loggedIn": false}'
         stderr = ""
+    calls = {"n": 0}
+    def fake_run(*a, **k):
+        calls["n"] += 1
+        return _fake_help_result() if calls["n"] == 1 else FakeResult()
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeResult())
+    monkeypatch.setattr(subprocess, "run", fake_run)
     claude_cmd, err = main._claude_cli_preflight()
     assert claude_cmd is None
     assert "přihlášené" in err

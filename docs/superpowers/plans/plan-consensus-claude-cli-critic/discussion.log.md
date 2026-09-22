@@ -43,3 +43,13 @@ samostatna eager ANTHROPIC_API_KEY kontrola pro _cmd_polish/regenerate
 IMPORTANT (preflightem resolvnuty claude_cmd se zahazoval, factory
 resolvoval znovu, TOCTOU mezera - threadovano pres novy volitelny
 _client_factory parametr).
+
+## Round 4
+
+- Codex: [round-4-codex.md](round-4-codex.md) — CHANGES_NEEDED
+- Claude: [round-4-claude.md](round-4-claude.md) — CHANGES_NEEDED
+
+Opraveno: 1 IMPORTANT (auth status samo neoveri, ze CLI verze podporuje
+potrebne flagy - opraveno levnou claude --help substring kontrolou pred
+auth statusem, zadne tokeny/API volani navic). Existujici 4 testy
+upraveny na dvoukrokovy subprocess.run mock (--help pak auth status).
