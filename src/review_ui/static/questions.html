@@ -115,17 +115,34 @@ function renderRow(q) {
   const answerCell = el('td');
   const driftForms = parseDriftForms(q.text);
   if (driftForms && driftForms.length > 1) {
+    // Multi-select - drift otázky mívají VÍC platných tvarů zároveň
+    // (skloňování), ne jen jeden správný. Vybrané se skládají do
+    // pole ve stejném pořadí, jak je nabídl nástroj (první = kanonický).
+    const selected = new Set();
     const chipsWrap = el('div', { class: 'chips' });
+    const chipEls = [];
+    function syncInput() {
+      input.value = driftForms.filter(f => selected.has(f)).join(' | ');
+    }
     for (const form of driftForms) {
       const chip = el('button', { class: 'chip', text: form });
       chip.addEventListener('click', (ev) => {
         ev.preventDefault();
-        input.value = form;
-        chipsWrap.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
-        chip.classList.add('active');
+        if (selected.has(form)) { selected.delete(form); chip.classList.remove('active'); }
+        else { selected.add(form); chip.classList.add('active'); }
+        syncInput();
       });
+      chipEls.push(chip);
       chipsWrap.appendChild(chip);
     }
+    const allBtn = el('button', { class: 'chip', text: 'Vše správně' });
+    allBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      driftForms.forEach(f => selected.add(f));
+      chipEls.forEach(c => c.classList.add('active'));
+      syncInput();
+    });
+    chipsWrap.appendChild(allBtn);
     answerCell.appendChild(chipsWrap);
   }
   answerCell.appendChild(input);
@@ -177,21 +194,14 @@ function renderRow(q) {
     }
   }
 
-  if (isConfirmQuestion(q.text) && q.guess_answer) {
+  const hasConfirmShortcut = isConfirmQuestion(q.text) && !!q.guess_answer;
+  if (hasConfirmShortcut) {
     const yesBtn = el('button', { class: 'primary', text: '✓ Ano' });
-    const noBtn = el('button', { class: 'ghost', text: '✗ Ne, jinak' });
     yesBtn.addEventListener('click', () => submitAnswer(q.guess_answer));
-    noBtn.addEventListener('click', () => {
-      noBtn.style.display = 'none';
-      yesBtn.style.display = 'none';
-      saveBtn.style.display = '';
-    });
     actionRow.appendChild(yesBtn);
-    actionRow.appendChild(noBtn);
   }
 
-  const saveBtn = el('button', { class: 'primary', text: 'Uložit' });
-  if (isConfirmQuestion(q.text) && q.guess_answer) saveBtn.style.display = 'none';
+  const saveBtn = el('button', { class: hasConfirmShortcut ? 'ghost' : 'primary', text: 'Uložit' });
   saveBtn.addEventListener('click', () => submitAnswer(input.value));
   actionRow.appendChild(saveBtn);
 
