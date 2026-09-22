@@ -17,3 +17,15 @@ chybejici payload validace - dict/is_error/subtype/result-str/usage-dict;
 uzky exception-wrapping rozsiren o OSError/UnicodeError; chybejici eager
 claude CLI dostupnost/login kontrola - nova _claude_cli_preflight();
 ignorovany stop_reason signal pro truncated).
+
+## Round 2
+
+- Codex: [round-2-codex.md](round-2-codex.md) — CHANGES_NEEDED
+- Claude: [round-2-claude.md](round-2-claude.md) — CHANGES_NEEDED
+
+Opraveno: 1 BLOCKING (count_tokens test ocekaval 4, implementace //4
+vraci 2 - opraven test) + 3 IMPORTANT (_claude_cli_preflight() chybela
+v _cmd_polish/polish_server.py regenerate, oboje taky volaji kritika
+PO drahem Codex volani - pridana; preflight funkce sama nevalidovala
+returncode/dict JSON tvar - opraveno; usage poli input_tokens/
+output_tokens nevalidovana jako nezaporna cela cisla - opraveno).

@@ -361,6 +361,24 @@ def test_exec_claude_raises_on_non_string_result(monkeypatch):
         claude_cli._exec_claude("s", "u", claude_cmd=["claude"], model="m", timeout=30)
 
 
+def test_exec_claude_raises_on_non_numeric_usage_fields(monkeypatch):
+    """Kolo 2 IMPORTANT (plan-consensus) - `isinstance(usage, dict)`
+    (kolo 1's fix) nestačí - `input_tokens`/`output_tokens` musí být
+    nezáporná celá čísla, jinak `PipelineLLMClient`'s aritmetika
+    (`it / 1e6 * in_rate`) spadne UVNITŘ `finally` bloku."""
+    for bad_usage in ('"5"', "-3", "true", "1.5"):
+        class FakeProc:
+            pid = 1
+            returncode = 0
+            def communicate(self, input, timeout, _u=bad_usage):
+                return (f'{{"result": "ok", "is_error": false, '
+                        f'"subtype": "success", '
+                        f'"usage": {{"input_tokens": {_u}, "output_tokens": 1}}}}', "")
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: FakeProc())
+        with pytest.raises(claude_cli.ClaudeCliExecError):
+            claude_cli._exec_claude("s", "u", claude_cmd=["claude"], model="m", timeout=30)
+
+
 def test_exec_claude_kills_process_tree_on_timeout(monkeypatch):
     killed = {"n": 0}
     class FakeProc:
@@ -502,10 +520,27 @@ def _exec_claude(system: str, user: str, *, claude_cmd: list, model: str,
             f"claude -p's 'result' pole musí být řetězec, ne "
             f"{type(payload.get('result')).__name__}.")
     usage = payload.get("usage")
-    if usage is not None and not isinstance(usage, dict):
-        raise ClaudeCliExecError(
-            f"claude -p's 'usage' pole musí být objekt, ne "
-            f"{type(usage).__name__}.")
+    if usage is not None:
+        if not isinstance(usage, dict):
+            raise ClaudeCliExecError(
+                f"claude -p's 'usage' pole musí být objekt, ne "
+                f"{type(usage).__name__}.")
+        # Kolo 2 IMPORTANT (plan-consensus) - `isinstance(usage, dict)`
+        # samo nestačí - `input_tokens`/`output_tokens` mohou být
+        # string/bool/float/záporné číslo. `PipelineLLMClient.complete()`
+        # s nimi počítá aritmeticky VE `finally` bloku (`it / 1e6 *
+        # in_rate`) - string tam spadne na `TypeError` UVNITŘ finally
+        # (maskuje původní výjimku), `bool` projde tiše (Python `bool`
+        # je `int` podtřída, ale sémanticky nesmyslné), záporné číslo
+        # by zapsalo nesmyslný audit řádek (záporná cena/tokeny).
+        for field in ("input_tokens", "output_tokens"):
+            value = usage.get(field)
+            if value is not None and (isinstance(value, bool)
+                                      or not isinstance(value, int)
+                                      or value < 0):
+                raise ClaudeCliExecError(
+                    f"claude -p's usage.{field} musí být nezáporné "
+                    f"celé číslo, ne {value!r}.")
     return payload
 ```
 
@@ -583,9 +618,11 @@ def test_claude_cli_client_billed_model_has_cli_suffix():
 
 
 def test_claude_cli_client_count_tokens_is_conservative_estimate():
+    """Kolo 2 BLOCKING (plan-consensus) - `//4` (implementace), ne
+    `//2` (CodexLLMClient's jiná aproximace) - `(4+4)//4 == 2`."""
     from src.llm.client import ClaudeCliClient
     c = ClaudeCliClient(["claude"], "m")
-    assert c.count_tokens(system="abcd", user="efgh", model="m") == 4   # (4+4)//2
+    assert c.count_tokens(system="abcd", user="efgh", model="m") == 2   # (4+4)//4
 
 
 def test_claude_cli_client_wraps_exec_errors_as_fatal_run_error(monkeypatch):
@@ -775,8 +812,8 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ### Task 3: `main._client_factory` - kritik natvrdo na `ClaudeCliClient`
 
 **Files:**
-- Modify: `main.py`
-- Test: `tests/test_cli.py`
+- Modify: `main.py`, `src/review_ui/polish_server.py`
+- Test: `tests/test_cli.py`, `tests/test_polish_server.py`
 
 **Interfaces:**
 - Consumes: `ClaudeCliClient` (Task 2).
@@ -926,10 +963,27 @@ def _claude_cli_preflight() -> tuple:
     try:
         result = subprocess.run(claude_cmd + ["auth", "status", "--json"],
                                 capture_output=True, text=True, timeout=10)
+        # Kolo 2 IMPORTANT (plan-consensus) - `returncode` se PŘED touhle
+        # opravou vůbec nekontroloval - nenulový exit kód (např. `claude`
+        # binárka existuje, ale je rozbitá/nekompatibilní verze) by
+        # nechal `json.loads` selhat na PRÁZDNÉM/nesmyslném stdoutu
+        # matoucím způsobem, MÍSTO jasné "returncode != 0" hlášky.
+        if result.returncode != 0:
+            return None, (f"`claude auth status` skončilo s kódem "
+                          f"{result.returncode}: {result.stderr.strip()}")
         status = json.loads(result.stdout)
     except (subprocess.TimeoutExpired, OSError, ValueError) as e:
         return None, (f"Nepodařilo se ověřit přihlášení claude CLI "
                       f"({type(e).__name__}: {e}).")
+    # Kolo 2 IMPORTANT (plan-consensus) - STEJNÁ třída chyby jako
+    # `_exec_claude()`'s kolo-1 payload validace (viz Task 2) - validní
+    # JSON může být `[]`/`null`/string na nejvyšší úrovni, ne jen objekt.
+    # `status.get(...)` na non-dict by spadlo na neklasifikovaný
+    # `AttributeError`, MIMO tenhle funkce zdokumentovaný `(None,
+    # chyba)` kontrakt.
+    if not isinstance(status, dict):
+        return None, (f"`claude auth status` vrátilo neočekávaný JSON "
+                      f"tvar ({type(status).__name__}, ne objekt).")
     if not status.get("loggedIn"):
         return None, "claude CLI není přihlášené - spusť `claude login`."
     return claude_cmd, None
@@ -977,25 +1031,160 @@ def test_run_claude_cli_preflight_failure_blocks_queue_before_translation(
     monkeypatch.setattr(P, "process_chapter", boom)
     assert _run(["run"], tmp_path, monkeypatch) == 1
     assert calls["n"] == 0   # zadny preklad se vubec nespustil
+
+
+def test_claude_cli_preflight_nonzero_exit_returns_error(monkeypatch):
+    """Kolo 2 IMPORTANT (plan-consensus) - `claude auth status` může
+    selhat (rozbitá instalace, nekompatibilní verze) s nenulovým exit
+    kódem, aniž by stdout obsahoval JSON vůbec."""
+    import subprocess
+    class FakeResult:
+        returncode = 1
+        stdout = ""
+        stderr = "unknown command"
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeResult())
+    claude_cmd, err = main._claude_cli_preflight()
+    assert claude_cmd is None
+    assert "1" in err or "unknown command" in err
+
+
+def test_claude_cli_preflight_non_dict_json_returns_error(monkeypatch):
+    """Kolo 2 IMPORTANT (plan-consensus) - validní JSON, ale ne objekt
+    (`[]`) - `status.get("loggedIn")` by jinak spadlo na `AttributeError`
+    MIMO tenhle funkce zdokumentovaný `(None, chyba)` kontrakt."""
+    import subprocess
+    class FakeResult:
+        returncode = 0
+        stdout = "[]"
+        stderr = ""
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeResult())
+    claude_cmd, err = main._claude_cli_preflight()
+    assert claude_cmd is None
+    assert err is not None
+
+
+def test_claude_cli_preflight_malformed_json_returns_error(monkeypatch):
+    import subprocess
+    class FakeResult:
+        returncode = 0
+        stdout = "not json"
+        stderr = ""
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeResult())
+    claude_cmd, err = main._claude_cli_preflight()
+    assert claude_cmd is None
+    assert err is not None
+
+
+def test_claude_cli_preflight_not_logged_in_returns_error(monkeypatch):
+    import subprocess
+    class FakeResult:
+        returncode = 0
+        stdout = '{"loggedIn": false}'
+        stderr = ""
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeResult())
+    claude_cmd, err = main._claude_cli_preflight()
+    assert claude_cmd is None
+    assert "přihlášené" in err
 ```
+
+**Kolo 2 IMPORTANT (plan-consensus) - `_claude_cli_preflight()` patří
+i do `polish`/polish-server, NE JEN `run`:** `_run_critic()` (a tedy
+`agent=="critic"` → `ClaudeCliClient`) se volá i z `_polish_one_
+chapter` (`_cmd_polish`'s dávka - "kolo 15 NIT" v `critic.review()`'s
+docstring to výslovně zmiňuje) A z `polish_server.py`'s regenerate
+endpointu (`main._client_factory(rid, ...)` volání tam, řádek ~379) -
+OBOJÍ nejdřív provede DRAHÉ Codex stylizační volání, PAK teprve
+kritika. Bez eager kontroly na těchhle DVOU dalších místech by
+chybějící/nepřihlášené `claude` CLI nechalo proběhnout celou (draze
+zaplacenou) stylizaci, než by selhalo na kritikovi - STEJNÉ riziko,
+co `_cmd_run`'s kontrola řeší, jen jinde.
+
+**Oprava:** Stejná `_claude_cli_preflight()` volaná i v `_cmd_polish`
+(main.py) a `polish_server.py`'s regenerate handleru, HNED ZA jejich
+existující `_polish_preflight()` kontrolou.
+
+V `main.py`, `_cmd_polish`, najdi:
+
+```python
+def _cmd_polish(args) -> int:
+    db = config.DB_PATH
+    model, codex_cmd, preflight_err = _polish_preflight()
+    if preflight_err:
+        _say(preflight_err)
+        return 1
+```
+
+nahraď:
+
+```python
+def _cmd_polish(args) -> int:
+    db = config.DB_PATH
+    model, codex_cmd, preflight_err = _polish_preflight()
+    if preflight_err:
+        _say(preflight_err)
+        return 1
+    # Kolo 2 IMPORTANT (plan-consensus) - stejný důvod jako `_cmd_run`'s
+    # kontrola (viz Global Constraints/Task 3 výš) - `_polish_one_
+    # chapter` volá kritika PO drahé Codex stylizaci, ne před ní.
+    _, claude_preflight_err = _claude_cli_preflight()
+    if claude_preflight_err:
+        _say(f"Kritik vyžaduje funkční claude CLI: {claude_preflight_err}")
+        return 1
+```
+
+V `src/review_ui/polish_server.py`, regenerate handler, najdi:
+
+```python
+        model, codex_cmd, preflight_err = main._polish_preflight()
+        if preflight_err:
+            return JSONResponse({"error": preflight_err}, status_code=503)
+```
+
+nahraď:
+
+```python
+        model, codex_cmd, preflight_err = main._polish_preflight()
+        if preflight_err:
+            return JSONResponse({"error": preflight_err}, status_code=503)
+        # Kolo 2 IMPORTANT (plan-consensus) - stejný důvod jako `_cmd_
+        # run`/`_cmd_polish` (main.py) - regenerate taky volá kritika
+        # PO drahé Codex stylizaci.
+        _, claude_preflight_err = main._claude_cli_preflight()
+        if claude_preflight_err:
+            return JSONResponse({"error": claude_preflight_err}, status_code=503)
+```
+
+Přidej regresní testy (`tests/test_cli.py` pro `_cmd_polish`,
+`tests/test_polish_server.py` pro regenerate) analogické `test_run_
+claude_cli_preflight_failure_blocks_queue_before_translation` výš -
+mockni `_claude_cli_preflight` na selhání, ověř že se `stylist.polish`/
+Codex volání VŮBEC nespustí.
 
 - [ ] **Step 4: Ověř úspěch**
 
-Run: `pytest tests/test_cli.py -v`
+Run: `pytest tests/test_cli.py tests/test_polish_server.py -v`
 Expected: PASS (zkontroluj especially, že KAŽDÝ existující `_run(["run"...`
 test má `_claude_cli_preflight` mockovanou na úspěch, jinak selže na
-NOVÉ eager kontrole, ne na tom, co skutečně testuje)
+NOVÉ eager kontrole, ne na tom, co skutečně testuje - STEJNĚ pro
+existující `_cmd_polish`/polish-server testy)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add main.py tests/test_cli.py
+git add main.py src/review_ui/polish_server.py tests/test_cli.py tests/test_polish_server.py
 git commit -m "feat: kritik natvrdo pres claude CLI, zrusena ANTHROPIC_API_KEY eager kontrola
 
 _client_factory's agent==critic vetev staví ClaudeCliClient MISTO
 AnthropicClient, nezavisle na translator_backend. _cmd_run's eager
 ANTHROPIC_API_KEY kontrola (zavedena minulym planem pro kritika) se
-rusi - kritik uz zadny API klic nepotrebuje.
+rusi, nahrazena novou _claude_cli_preflight() (resolvne binarku +
+overi claude auth status --json) - volana v _cmd_run, _cmd_polish I
+polish_server.py's regenerate handleru (kritik se pouziva ze VSECH
+tri mist, po draze zaplacenem Codex volani).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
