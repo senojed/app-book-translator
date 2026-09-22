@@ -126,3 +126,11 @@ pridano encoding + UnicodeError do obou volani preflightu, novy test).
   teď povinný dict s validovanými poli na úspěšné cestě
   (`_exec_claude()`), hodnoty se přenášejí přímo bez `or`. 3 nové
   testy (chybí usage, chybí jedno pole, nula se zachová).
+
+## Round 11 — 2026-09-22T07:55:17+0200
+
+- Codex: [round-11-codex.md](round-11-codex.md) — VERDICT: CONSENSUS
+- Claude: [round-11-claude.md](round-11-claude.md) — VERDICT: CONSENSUS
+- Summary: oba nezávisle nenašli žádný BLOCKING/IMPORTANT. CONSENSUS
+  dosaženo ve stejném kole poprvé od začátku smyčky (kola 1-10 měly
+  vždy aspoň jeden reálný, opravený nález).
