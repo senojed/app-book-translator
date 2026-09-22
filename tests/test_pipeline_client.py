@@ -672,3 +672,55 @@ def test_claude_cli_client_wraps_os_and_unicode_errors_as_fatal_run_error(monkey
         c = ClaudeCliClient(["claude"], "m")
         with pytest.raises(ClaudeCliFatalError):
             c.complete(system="s", user="u", max_tokens=10, model="m")
+
+
+def test_claude_cli_client_appends_reinforcement_to_user_when_set(monkeypatch):
+    """`--translator claude-cli` (spike 2026-09-22) - `claude -p --safe-mode`
+    nedodrží striktní výstupní formát ze samotného system promptu (ověřeno
+    0/4 selhání bez reinforcementu), ale s reinforcementem PŘIPOJENÝM na
+    konec USER zprávy uspěl 5/5. Kritik reinforcement NEPOUŽÍVÁ (`None`
+    default) - jen translator ho potřebuje."""
+    from src.llm.client import ClaudeCliClient
+    seen = {}
+    def fake_exec(system, user, *, claude_cmd, model, timeout):
+        seen["user"] = user
+        return {"result": "ok", "is_error": False, "subtype": "success",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}}
+    monkeypatch.setattr("src.llm.claude_cli._exec_claude", fake_exec)
+    c = ClaudeCliClient(["claude"], "m", reinforcement="DODRŽ FORMÁT")
+    c.complete(system="s", user="USR", max_tokens=10, model="m")
+    assert seen["user"] == "USRDODRŽ FORMÁT"
+
+
+def test_claude_cli_client_no_reinforcement_by_default(monkeypatch):
+    from src.llm.client import ClaudeCliClient
+    seen = {}
+    def fake_exec(system, user, *, claude_cmd, model, timeout):
+        seen["user"] = user
+        return {"result": "ok", "is_error": False, "subtype": "success",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}}
+    monkeypatch.setattr("src.llm.claude_cli._exec_claude", fake_exec)
+    c = ClaudeCliClient(["claude"], "m")
+    c.complete(system="s", user="USR", max_tokens=10, model="m")
+    assert seen["user"] == "USR"
+
+
+def test_claude_cli_client_uses_custom_fatal_error_cls(monkeypatch):
+    """`--translator claude-cli` potřebuje ROZLIŠIT translator-side selhání
+    od kritikova (stejný důvod jako `CodexTranslatorFatalError` u Codexu) -
+    `_client_factory` (main.py) předá jinou třídu při stavbě translator-role
+    klienta, kritik zůstává na výchozí `ClaudeCliFatalError`."""
+    from src.llm.client import ClaudeCliClient, ClaudeCliFatalError
+    from src.llm.claude_cli import ClaudeCliExecError
+
+    class _CustomFatal(ClaudeCliFatalError):
+        pass
+
+    def boom(*a, **k):
+        raise ClaudeCliExecError("claude -p skončilo s kódem 1: X")
+    monkeypatch.setattr("src.llm.claude_cli._exec_claude", boom)
+    c = ClaudeCliClient(["claude"], "m", fatal_error_cls=_CustomFatal)
+    with pytest.raises(_CustomFatal):
+        c.complete(system="s", user="u", max_tokens=10, model="m")

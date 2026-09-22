@@ -34,9 +34,9 @@ from src import ingest, pipeline, polish_store, requeue, state
 from src import reference as reference_mod
 from src import reference_mine, textnorm
 from src.agents import scout, stylist, translator
-from src.llm.client import (AnthropicClient, ClaudeCliClient, CodexLLMClient,
-                           CodexTranslatorFatalError, FatalRunError, LockLostError,
-                           OutputTruncated, PipelineLLMClient)
+from src.llm.client import (AnthropicClient, ClaudeCliClient, ClaudeCliTranslatorFatalError,
+                           CodexLLMClient, CodexTranslatorFatalError, FatalRunError,
+                           LockLostError, OutputTruncated, PipelineLLMClient)
 
 _MUTATING = {"init", "scan", "run", "answer", "review", "reference", "polish",
             "polish-review"}
@@ -101,6 +101,21 @@ def _client_factory(run_id: int, *, interactive: bool, require_lock=None,
                 # označí `flagged`, ne nechá kapitolu uvízlou.
                 raise CodexTranslatorFatalError(preflight_err)
             inner = CodexLLMClient(codex_cmd, config.CODEX_MODEL)
+        elif agent == "translator" and translator_backend == "claude-cli":
+            # `--translator claude-cli` (spike 2026-09-22) - stejný
+            # `claude_cmd` (preflightem resolvnutý, viz kritikova větev
+            # níž) a stejný `ClaudeCliClient`, jen jiný model/timeout/
+            # reinforcement/fatal_error_cls - translator potřebuje delší
+            # timeout (celá scéna, ne jedno review) a reinforcement text
+            # (bez něj `claude -p` formát nedodrží, ověřeno spikem 0/4 →
+            # 5/5). `ClaudeCliTranslatorFatalError` odlišuje translator-
+            # side selhání od kritikova (stejný důvod jako
+            # `CodexTranslatorFatalError` u Codexu).
+            inner = ClaudeCliClient(
+                claude_cmd or ["claude"], config.MODEL_TRANSLATOR,
+                timeout=config.CLAUDE_CLI_TRANSLATOR_TIMEOUT_SECONDS,
+                reinforcement=translator.CLI_FORMAT_REINFORCEMENT,
+                fatal_error_cls=ClaudeCliTranslatorFatalError)
         elif agent == "critic":
             # Kritik VŽDY `claude` CLI (předplatné) - žádný fallback na
             # AnthropicClient/API klíč, nezávisle na `translator_backend`
@@ -1239,16 +1254,21 @@ def _cmd_run(args) -> int:
         for ch in queue:
             try:
                 summary = pipeline.process_chapter(db, ch, client_factory=cf, guide=g)
-            except CodexTranslatorFatalError as e:
+            except (CodexTranslatorFatalError, ClaudeCliTranslatorFatalError) as e:
                 # Kolo 11 IMPORTANT (plan-consensus) - SAMOSTATNÁ větev
                 # PŘED obecným `except FatalRunError` níž - TYP sám
-                # garantuje, že chyba vznikla PŘÍMO v Codex-translator
-                # volání (CodexLLMClient), NE v kritikovi (VŽDY Claude,
-                # i při `--translator codex`, viz Global Constraints) -
-                # žádná `if args.translator == "codex":` běhová podmínka
-                # potřeba, typ to už zaručuje (na rozdíl od kola 10's
-                # původní verze, co gatovala podle `args.translator`
-                # a omylem flagovala i Claude-side kritikovy chyby).
+                # garantuje, že chyba vznikla PŘÍMO v translator volání
+                # (CodexLLMClient NEBO ClaudeCliClient v translator roli),
+                # NE v kritikovi (ten je VŽDY `ClaudeCliFatalError`, ne
+                # translator podtřída, i při `--translator claude-cli`,
+                # viz Global Constraints) - žádná `if args.translator ==
+                # "codex":` běhová podmínka potřeba, typ to už zaručuje
+                # (na rozdíl od kola 10's původní verze, co gatovala
+                # podle `args.translator` a omylem flagovala i Claude-
+                # side kritikovy chyby). `--translator claude-cli`
+                # (2026-09-22) rozšířilo tuhle větev o
+                # `ClaudeCliTranslatorFatalError` - stejná logika, jiný
+                # backend.
                 #
                 # Kolo 10 IMPORTANT (plan-consensus) - BEZ týhle opravy
                 # zůstane kapitola v `processing` - příští `run` (main.py,
@@ -1284,7 +1304,7 @@ def _cmd_run(args) -> int:
                                          {"error": f"fatální chyba běhu: "
                                                   f"{type(e).__name__}: {detail}"},
                                          ensure_ascii=False))
-                raise CodexTranslatorFatalError(detail) from e   # celý běh KONČÍ i tak
+                raise type(e)(detail) from e   # zachová podtřídu, celý běh KONČÍ i tak
             except FatalRunError:
                 raise                      # BEZE ZMĚNY - kritikova chyba
                                            # (cost guard, LockLostError),
@@ -1301,22 +1321,32 @@ def _cmd_run(args) -> int:
                 # (Kolo 23's `try/except` kolem scénové smyčky řeší JEN
                 # obnovu starých otevřených otázek, ne tenhle status
                 # problém - jiná vrstva ochrany, viz Task 2.)
-                # Gated JEN na `codex` - Claude formát-drift riziko je out
-                # of scope (spike ho nepozoroval), Claude cesta spadne do
-                # existující generické větve níž, beze změny.
-                if args.translator == "codex":
-                    # `CodexTranslatorFatalError` (kolo 11), NE holý
+                # Gated na `codex`/`claude-cli` - Claude-API formát-drift
+                # riziko je out of scope (spike ho nepozoroval), Claude
+                # cesta spadne do existující generické větve níž, beze
+                # změny. `claude-cli` (2026-09-22) přidáno - reinforcement
+                # text (translator.CLI_FORMAT_REINFORCEMENT) drift výrazně
+                # sníží, ale NEGARANTUJE ho na nulu (spike 5/5 na malém
+                # vzorku, ne 100% jistota) - stejná ochranná síť jako
+                # Codex potřeba.
+                if args.translator in ("codex", "claude-cli"):
+                    # `CodexTranslatorFatalError`/`ClaudeCliTranslatorFatalError`
+                    # (kolo 11, rozšířeno 2026-09-22), NE holý
                     # `FatalRunError` - `raise` UVNITŘ týhle except větve
-                    # neprojde přes sesterskou `except CodexTranslatorFatalError`
-                    # výš (raise uvnitř except propadá z CELÉHO try/except),
-                    # takže flagged logiku duplikujeme (stejná jako výš).
+                    # neprojde přes sesterskou `except (CodexTranslatorFatalError,
+                    # ClaudeCliTranslatorFatalError)` výš (raise uvnitř
+                    # except propadá z CELÉHO try/except), takže flagged
+                    # logiku duplikujeme (stejná jako výš).
+                    fatal_cls = (CodexTranslatorFatalError if args.translator == "codex"
+                                else ClaudeCliTranslatorFatalError)
+                    backend_label = "Codexu" if args.translator == "codex" else "claude CLI"
                     detail = stylist._redact_detail(str(e))
                     state.update_chapter(db, ch["idx"], status="flagged",
                                          notes=json.dumps(
                                              {"error": f"neplatný formát překladu: {detail}"},
                                              ensure_ascii=False))
-                    raise CodexTranslatorFatalError(
-                        f"Neplatný formát překladu od Codexu: {detail}") from e
+                    raise fatal_cls(
+                        f"Neplatný formát překladu od {backend_label}: {detail}") from e
                 state.update_chapter(db, ch["idx"], status="error",
                                      notes=json.dumps(
                                          {"error": f"{type(e).__name__}: {e}"},
@@ -1330,10 +1360,10 @@ def _cmd_run(args) -> int:
                 # jako `_cmd_polish` (`stylist._redact_detail`), jinak
                 # by `chapters.notes` dostalo raw Codex výstup bez ohledu
                 # na `config.STYLIST_REPORT_REJECTED_TEXT`. Gated JEN na
-                # `codex` - Claude-only `run` (default) zůstává beze
-                # změny, žádná regrese v debugovatelnosti.
+                # `codex`/`claude-cli` - Claude-API `run` (default)
+                # zůstává beze změny, žádná regrese v debugovatelnosti.
                 detail = (stylist._redact_detail(str(e))
-                         if args.translator == "codex" else str(e))
+                         if args.translator in ("codex", "claude-cli") else str(e))
                 state.update_chapter(db, ch["idx"], status="error",
                                      notes=json.dumps(
                                          {"error": f"{type(e).__name__}: {detail}"},
@@ -1868,10 +1898,12 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="vrať flagged kapitoly do fronty (bez IDX = všechny)")
     p_run.add_argument("--only", nargs="+", type=int, default=None,
                        help="přelož jen tyhle kapitoly (pilot); zbytek zůstane ve frontě")
-    p_run.add_argument("--translator", choices=["claude", "codex"],
+    p_run.add_argument("--translator", choices=["claude", "codex", "claude-cli"],
                        default="claude",
                        help="překladatelský backend (default claude; "
-                            "codex vyžaduje STYLIST_ACCEPT_FS_RISK=True)")
+                            "codex vyžaduje STYLIST_ACCEPT_FS_RISK=True; "
+                            "claude-cli jede přes uživatelovo Claude Code "
+                            "předplatné, ne placené API)")
     p_run.set_defaults(func=_cmd_run)
 
     p_pol = sub.add_parser("polish", help="stylistický průchod přes Codex (nad hotovými kapitolami)")

@@ -1725,6 +1725,26 @@ def test_client_factory_critic_uses_claude_cli_even_with_codex_translator(monkey
     assert isinstance(client._inner, ClaudeCliClient)
 
 
+def test_client_factory_translator_backend_claude_cli_uses_claude_cli_client(monkeypatch):
+    """`--translator claude-cli` (spike 2026-09-22) - translator dostane
+    `ClaudeCliClient` s translator-specifickým `reinforcement`/
+    `fatal_error_cls`, kritik stejného runu zůstává na jeho vlastním
+    `ClaudeCliFatalError` (žádná křížová kontaminace mezi rolemi)."""
+    from src.llm.client import ClaudeCliClient, ClaudeCliFatalError, ClaudeCliTranslatorFatalError
+    from src.agents import translator as translator_mod
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    factory = main._client_factory(1, interactive=False, translator_backend="claude-cli")
+    t_client = factory("translator")
+    assert isinstance(t_client._inner, ClaudeCliClient)
+    assert t_client._inner._model == config.MODEL_TRANSLATOR
+    assert t_client._inner._timeout == config.CLAUDE_CLI_TRANSLATOR_TIMEOUT_SECONDS
+    assert t_client._inner._reinforcement == translator_mod.CLI_FORMAT_REINFORCEMENT
+    assert t_client._inner._fatal_error_cls is ClaudeCliTranslatorFatalError
+    c_client = factory("critic")
+    assert c_client._inner._fatal_error_cls is ClaudeCliFatalError
+    assert c_client._inner._reinforcement is None
+
+
 def test_client_factory_translator_default_claude_unaffected_by_critic_change(
         monkeypatch):
     """Translator (--translator claude, default) zůstává na AnthropicClient -
@@ -2004,6 +2024,64 @@ def test_run_translator_codex_fatal_error_flags_chapter_not_silently_retried(
     assert _run(["run", "--translator", "codex"], tmp_path, monkeypatch) == 1
     assert state.get_chapter("data/state.sqlite3", 1)["status"] == "flagged"
     assert calls["n"] == 1
+
+
+def test_run_translator_claude_cli_invalid_translation_output_is_fatal(tmp_path, monkeypatch):
+    """`--translator claude-cli` (spike 2026-09-22) - stejné riziko jako
+    Codex (kolo 6/10): reinforcement text SNIŽUJE formát-drift, ale
+    NEGARANTUJE ho na nulu - InvalidTranslationOutput musí dostat stejnou
+    flagged-status ochranu jako Codex, ne skončit jako tichý per-kapitolový
+    error, co by `state.queue_for_run` navěky zkoušel znovu."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
+    import src.pipeline as P
+    from src.agents.translator import InvalidTranslationOutput
+    def boom(db_path, chapter, *, client_factory, guide):
+        raise InvalidTranslationOutput("chybí ===METADATA===")
+    monkeypatch.setattr(P, "process_chapter", boom)
+    assert _run(["run", "--translator", "claude-cli"], tmp_path, monkeypatch) == 1
+    assert state.get_chapter("data/state.sqlite3", 1)["status"] == "flagged"
+
+
+def test_run_translator_claude_cli_fatal_error_flags_chapter_not_silently_retried(
+        tmp_path, monkeypatch):
+    """Mirror `test_run_translator_codex_fatal_error_flags_chapter_not_
+    silently_retried` pro `claude-cli` backend - `ClaudeCliTranslatorFatalError`
+    musí dostat stejnou flagged-status ochranu jako `CodexTranslatorFatalError`."""
+    from src.llm.client import ClaudeCliTranslatorFatalError
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
+    import src.pipeline as P
+    calls = {"n": 0}
+    def boom(db_path, chapter, *, client_factory, guide):
+        calls["n"] += 1
+        raise ClaudeCliTranslatorFatalError("claude cli auth expired")
+    monkeypatch.setattr(P, "process_chapter", boom)
+    assert _run(["run", "--translator", "claude-cli"], tmp_path, monkeypatch) == 1
+    assert state.get_chapter("data/state.sqlite3", 1)["status"] == "flagged"
+    assert calls["n"] == 1
+
+
+def test_run_translator_claude_cli_error_notes_are_redacted(tmp_path, monkeypatch):
+    """Mirror `test_run_translator_codex_error_notes_are_redacted` pro
+    `claude-cli` backend - raw modelová odpověď v `ValueError` nesmí
+    skončit nezredigovaná v `chapters.notes`."""
+    book = tmp_path / "k.txt"
+    book.write_text("Chapter 1\n" + "t " * 60, encoding="utf-8")
+    _run(["init", str(book)], tmp_path, monkeypatch)
+    monkeypatch.setattr("main._claude_cli_preflight", lambda: (["claude"], None))
+    import src.pipeline as P
+    def boom(db_path, chapter, *, client_factory, guide):
+        raise ValueError("Nevalidní JSON. Raw:\ntajny-obsah-z-claude-cli")
+    monkeypatch.setattr(P, "process_chapter", boom)
+    assert _run(["run", "--translator", "claude-cli"], tmp_path, monkeypatch) == 0
+    notes = state.get_chapter("data/state.sqlite3", 1)["notes"]
+    assert "tajny-obsah-z-claude-cli" not in notes
+    assert "potlačeny" in notes
 
 
 def test_run_translator_codex_fatal_error_console_output_is_redacted(

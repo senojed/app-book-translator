@@ -177,3 +177,10 @@ STYLIST_ACCEPT_FS_RISK = True
 # (`False`) pořád dá reject rate + rozpad podle `reason_types`; plný text
 # zapni, jen když ten konkrétní běh potřebuješ prozkoumat očima.
 STYLIST_REPORT_REJECTED_TEXT = False
+# `claude` CLI jako backend i pro TRANSLATOR (--translator claude-cli),
+# ne jen kritika - ověřeno spikem 2026-09-22 (5/5 úspěšné, i na reálné
+# délce scény ~8000 znaků/142s), s reinforcement textem v uživatelské
+# zprávě (translator.CLI_FORMAT_REINFORCEMENT). Delší timeout než kritik
+# (CLAUDE_CLI_CRITIC_TIMEOUT_SECONDS=180) - překlad celé scény trvá déle
+# než jedno review, stejná úvaha jako CODEX_TRANSLATE_TIMEOUT_SECONDS.
+CLAUDE_CLI_TRANSLATOR_TIMEOUT_SECONDS = 300

@@ -60,6 +60,27 @@ nezmiňuje, neměň zbytečně.
 
 {_FORMAT_RULES}"""
 
+# `--translator claude-cli` (spike 2026-09-22) - `claude -p --safe-mode`
+# nedodrží formát ze SAMOTNÉHO system promptu spolehlivě (0/4 úspěch bez
+# tohohle textu, i s `_FORMAT_RULES` v system promptu). Zopakování
+# instrukce v USER zprávě (kam se ve `ClaudeCliClient.complete()`
+# připojuje, viz `reinforcement` parametr) + PŘESNÝ příklad tvaru
+# metadat (model bez příkladu vracel `rendered_terms` jako seznam
+# řetězců, ne objektů) dalo 5/5 úspěch, i na reálné délce scény
+# (~8000 znaků/142s). Kritik tenhle text nepoužívá (jeho JSON kontrakt
+# je jednodušší, žádné vnořené markery).
+CLI_FORMAT_REINFORCEMENT = f"""
+
+DŮLEŽITÉ: Odpověz VÝHRADNĚ v požadovaném formátu, VČETNĚ bloku
+{MARK_METADATA} s JSON objektem. PRVNÍ ŘÁDEK tvé odpovědi MUSÍ být
+přesně "{MARK_TRANSLATION}" (bez uvozovek), úplně bez úvodu před ním.
+Mezi překladem a koncem MUSÍ být řádek "{MARK_METADATA}" následovaný
+JSON objektem PŘESNĚ tohoto tvaru (každá položka v poli je OBJEKT
+s těmito klíči, NIKDY holý řetězec):
+{{"new_terms": [], "rendered_terms": [{{"term_id": "term_priklad", "cz_as_used": "priklad"}}], "questions": []}}
+Pokud jsi žádný nový termín/otázku nenašel, dej tam prázdné pole [],
+NIKDY seznam řetězců. Poslední řádek MUSÍ být přesně "{MARK_END}"."""
+
 
 @dataclass
 class TranslationResult:

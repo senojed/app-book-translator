@@ -49,14 +49,31 @@ class MissingPriceError(FatalRunError):
 class ClaudeCliFatalError(FatalRunError):
     """Fatální chyba VZNIKLÁ PŘÍMO v `ClaudeCliClient.complete()` volání
     (nenulový exit kód, nečitelný/špatně tvarovaný JSON výstup, `OSError`/
-    `UnicodeError` při čtení výstupu) - podtřída `FatalRunError`. NENÍ
-    translator-specifická jako `CodexTranslatorFatalError` - kritik je
-    teď VŽDY tenhle backend, nezávisle na `--translator`, takže
-    `_cmd_run` (main.py) ji NEROZLIŠUJE zvlášť, spadá do obecné `except
-    FatalRunError: raise` větve stejně jako dřívější `AnthropicClient`
-    chyby (auth, rate limit atd.). Timeout NENÍ součástí týhle třídy -
-    `ClaudeCliTimeoutError` zůstává samostatná, nefatální (viz Global
-    Constraints)."""
+    `UnicodeError` při čtení výstupu) - podtřída `FatalRunError`. Výchozí
+    třída pro kritika (`agent="critic"`, VŽDY tenhle backend, nezávisle
+    na `--translator`) - `_cmd_run` (main.py) ji NEROZLIŠUJE zvlášť,
+    spadá do obecné `except FatalRunError: raise` větve stejně jako
+    dřívější `AnthropicClient` chyby (auth, rate limit atd.). Timeout
+    NENÍ součástí týhle třídy - `ClaudeCliTimeoutError` zůstává
+    samostatná, nefatální (viz Global Constraints).
+
+    `ClaudeCliClient` (níž) od `--translator claude-cli` (spike
+    2026-09-22) může sloužit i TRANSLATOR roli - tam se místo týhle
+    třídy použije `ClaudeCliTranslatorFatalError` (konstruktorem
+    předaný `fatal_error_cls`), ať `_cmd_run` umí translator-side
+    selhání rozlišit od kritikova stejně, jako to dnes dělá
+    `CodexTranslatorFatalError` pro Codex."""
+
+
+class ClaudeCliTranslatorFatalError(ClaudeCliFatalError):
+    """Fatální chyba VZNIKLÁ PŘÍMO v Claude-CLI-translator volání
+    (`--translator claude-cli`) - podtřída `ClaudeCliFatalError` (samo
+    podtřída `FatalRunError`), takže VŠECHNO, co dnes odchytává `except
+    FatalRunError`/`except ClaudeCliFatalError` funguje beze změny.
+    `_cmd_run` (main.py) ji rozlišuje SAMOSTATNĚ od obecné
+    `ClaudeCliFatalError` (kritikovy chyby - ty jsou VŽDY Claude-CLI-
+    critic-side, i při `--translator claude-cli`) - stejný vzor jako
+    `CodexTranslatorFatalError` u Codexu, jen pro tenhle backend."""
 
 
 @dataclass
@@ -289,18 +306,33 @@ class CodexLLMClient:
 
 class ClaudeCliClient:
     """`LLMClient` obal nad `claude -p` subprocess voláním
-    (`src.llm.claude_cli._exec_claude`) - kritik jede přes uživatelovo
+    (`src.llm.claude_cli._exec_claude`) - jede přes uživatelovo
     předplatné (OAuth session), ne přes placené Anthropic API. Používá
     se VŽDY pro `agent="critic"` (main.py `_client_factory`), nezávisle
     na `--translator` - viz docs/superpowers/specs/2026-09-21-claude-cli-
-    critic-design.md."""
+    critic-design.md. Od `--translator claude-cli` (spike 2026-09-22)
+    ho `_client_factory` staví i pro `agent="translator"` - viz
+    `reinforcement`/`fatal_error_cls` níž."""
     provider = "claude-cli"
 
     def __init__(self, claude_cmd: list[str], model: str,
-                 timeout: int | None = None):
+                 timeout: int | None = None, reinforcement: str | None = None,
+                 fatal_error_cls: type = ClaudeCliFatalError):
         self._claude_cmd = claude_cmd
         self._model = model
         self._timeout = timeout
+        # `claude -p --safe-mode` nedodrží striktní výstupní formát
+        # ze SAMOTNÉHO system promptu spolehlivě (ověřeno spikem
+        # 2026-09-22 - 0/4 úspěch bez tohohle, 5/5 S NÍM) - `translator.
+        # CLI_FORMAT_REINFORCEMENT` se připojí na konec `user` PŘED
+        # odesláním. Kritik (`None` default) reinforcement nepotřebuje -
+        # jeho JSON kontrakt je jednodušší (žádné vnořené markery).
+        self._reinforcement = reinforcement
+        # `--translator claude-cli` potřebuje ROZLIŠIT translator-side
+        # selhání od kritikova - `_client_factory` (main.py) předá
+        # `ClaudeCliTranslatorFatalError` při stavbě translator-role
+        # klienta, kritik zůstává na výchozí `ClaudeCliFatalError`.
+        self._fatal_error_cls = fatal_error_cls
         # `-cli` suffix - viz Global Constraints v plánu - NESMÍ
         # kolidovat s `config.MODEL_CRITIC`'s SKUTEČNÝM API cenovým
         # záznamem (translator při --translator claude volá STEJNÝ
@@ -313,6 +345,11 @@ class ClaudeCliClient:
         # Kolo 1 BLOCKING (plan-consensus) - `system`/`user` se posílají
         # ODDĚLENĚ do `_exec_claude()` (`--system-prompt` flag +
         # STDIN), NIKDY spojené do jednoho blobu - viz Global Constraints.
+        # Reinforcement (translator-role, viz __init__) se připojuje
+        # PŘÍMO na `user`, ne na `system` - `_exec_claude()`'s vlastní
+        # rozdělení (system=flag/user=stdin) se tím neruší.
+        if self._reinforcement:
+            user = user + self._reinforcement
         timeout = self._timeout or config.CLAUDE_CLI_CRITIC_TIMEOUT_SECONDS
         try:
             payload = claude_cli._exec_claude(
@@ -335,7 +372,7 @@ class ClaudeCliClient:
             # `CodexLLMClient`'s kolo 7 IMPORTANT (minulý plán), stejná
             # oprava (širší `except`, stejná redakce).
             from src.agents import stylist
-            raise ClaudeCliFatalError(stylist._redact_detail(str(e))) from e
+            raise self._fatal_error_cls(stylist._redact_detail(str(e))) from e
         # Kolo 10 IMPORTANT (plan-consensus) - `_exec_claude()` (Task 2,
         # kolo-10 fix) teď GARANTUJE `usage` jako dict s VALIDOVANÝMI
         # `input_tokens`/`output_tokens` (nezáporná int) na ÚSPĚŠNÉ
