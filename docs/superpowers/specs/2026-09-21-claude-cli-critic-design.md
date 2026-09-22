@@ -38,6 +38,12 @@ vůbec nepotřebuje.
   **Tohle je správná volba, ne `--bare`.**
 - `--tools ""` (doslovně prázdný string) vypíná VŠECHNY nástroje -
   ověřeno, kritik nemá žádný přístup k disku/Bash ani náhodou.
+- **DOPLŇUJÍCÍ ověření (plan-consensus kolo 9, implementační plán):**
+  `--no-session-persistence` MUSÍ být v příkazu - bez něj `claude` CLI
+  persistuje CELÝ prompt (kritikův vstup = kapitola EN+CZ) do lokální
+  historie relací; `--safe-mode` tohle NEŘEŠÍ (jen CLAUDE.md/pluginy/
+  hooky). Ověřeno přímo (`claude --help` má `--no-session-persistence
+  - Disable session persistence`). Finální argv (níž) tenhle flag má.
 - `--output-format json` vrací `usage` (`input_tokens`/`output_tokens`)
   a `total_cost_usd` - `total_cost_usd` je JEN informativní "list price"
   odhad (`costBasis: "list"` v `modelUsage`), NE skutečná fakturace -
@@ -76,8 +82,9 @@ zvládne BEZE ZMĚNY - `ClaudeCliClient` je jen DALŠÍ klient s
 ### Subprocess volání
 
 ```python
-argv = [claude_bin, "-p", "--safe-mode", "--tools", "", "--output-format",
-       "json", "--model", model, "--system-prompt", system]
+argv = [claude_bin, "-p", "--safe-mode", "--no-session-persistence",
+       "--tools", "", "--output-format", "json", "--model", model,
+       "--system-prompt", system]
 # `user` NENÍ v argv - jde STDINEM (`subprocess.Popen(argv, stdin=PIPE,
 # ...).communicate(input=user, ...)`) - plan-consensus kolo 1 IMPORTANT
 # (implementační plán) - kapitola EN+CZ text může snadno přesáhnout

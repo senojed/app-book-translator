@@ -294,6 +294,7 @@ def test_exec_claude_calls_popen_with_system_prompt_flag_and_stdin_user(monkeypa
     assert seen["stdin"] == "USR"          # JEN user, ne "SYS\n\nUSR"
     assert seen["timeout"] == 30
     assert "-p" in seen["cmd"] and "--safe-mode" in seen["cmd"]
+    assert "--no-session-persistence" in seen["cmd"]  # kolo 9 IMPORTANT
     assert "--tools" in seen["cmd"]
     tools_idx = seen["cmd"].index("--tools")
     assert seen["cmd"][tools_idx + 1] == ""
@@ -474,10 +475,18 @@ def _exec_claude(system: str, user: str, *, claude_cmd: list, model: str,
     instrukce jsou statické, 805 znaků - bezpečně pod Windows argv
     limitem), `user` (kapitola EN+CZ, může být velké) STDINEM - NIKDY
     spojené do jednoho blobu (ověřeno spikem 2026-09-21 - obojí
-    dohromady funguje správně)."""
+    dohromady funguje správně).
+
+    Kolo 9 IMPORTANT (plan-consensus) - `--no-session-persistence`
+    DOPLNĚN: bez něj `claude` CLI persistuje CELÝ prompt (kapitola
+    EN+CZ) do lokální historie relací - ověřeno přímo
+    (`claude --help` má `--no-session-persistence - Disable session
+    persistence`), `--safe-mode` tohle NEŘEŠÍ (jen vypíná CLAUDE.md/
+    pluginy/hooky, ne perzistenci relace)."""
     cmd = _resolve_claude_cmd(claude_cmd) + [
-        "-p", "--safe-mode", "--tools", "", "--output-format", "json",
-        "--model", model, "--system-prompt", system,
+        "-p", "--safe-mode", "--no-session-persistence", "--tools", "",
+        "--output-format", "json", "--model", model,
+        "--system-prompt", system,
     ]
     try:
         # Popen+communicate (NE subprocess.run(timeout=)) - stejný důvod
@@ -1079,13 +1088,24 @@ def _claude_cli_preflight() -> tuple:
     # Kolo 7 IMPORTANT (plan-consensus) - prostý `"-p" in help_result.stdout`
     # je chybný: `"-p"` je i SUBSTRING `"--print"` (Claude CLI dlouhý
     # alias), takže by CLI, co "-p" zrušilo a mělo JEN "--print", prošlo
-    # kontrolou falešně. Ostatních 5 flagů jsou dlouhé/unikátní řetězce
-    # bez podobné kolize - jen `-p` potřebuje přesnější kontrolu:
-    # hraniční regex (mezera/čárka/konec řádku po `-p`, ne další
-    # písmeno), NE substring.
-    _REQUIRED_LONG_FLAGS = ("--model", "--safe-mode", "--tools",
-                           "--system-prompt", "--output-format")
-    _SHORT_FLAG_RE = re.compile(r"(?<![A-Za-z-])-p(?![A-Za-z-])")
+    # kontrolou falešně.
+    # Kolo 9 IMPORTANT (plan-consensus) - STEJNÁ třída bugu platí i pro
+    # DLOUHÉ flagy: `claude --help` samo obsahuje `--system-prompt-snapshot`
+    # (ověřeno přímo - reálný, existující flag), takže substring
+    # `"--system-prompt" in stdout` by prošel i na hypotetické CLI, co
+    # by mělo JEN `--system-prompt-snapshot`/`--system-prompt-file`
+    # variantu a ZRUŠILO holé `--system-prompt`. Kolo-7 fix (regex jen
+    # pro `-p`) byl neúplný - hraniční kontrola potřebná pro VŠECHNY
+    # flagy, ne jen krátký alias. `_flag_present()` používá stejnou
+    # "žádné písmeno/číslice/pomlčka hned před ani po" hranici pro
+    # krátký i dlouhé flagy jednotně.
+    _REQUIRED_FLAGS = ("-p", "--model", "--safe-mode",
+                      "--no-session-persistence", "--tools",
+                      "--system-prompt", "--output-format")
+
+    def _flag_present(flag: str, text: str) -> bool:
+        pattern = r"(?<![A-Za-z0-9-])" + re.escape(flag) + r"(?![A-Za-z0-9-])"
+        return re.search(pattern, text) is not None
     try:
         # Kolo 6 IMPORTANT (plan-consensus) - `encoding="utf-8"`
         # EXPLICITNĚ (stejný důvod jako `_exec_claude()`'s vlastní
@@ -1108,9 +1128,8 @@ def _claude_cli_preflight() -> tuple:
     if help_result.returncode != 0:
         return None, (f"`claude --help` skončilo s kódem "
                       f"{help_result.returncode}: {help_result.stderr.strip()}")
-    missing = [f for f in _REQUIRED_LONG_FLAGS if f not in help_result.stdout]
-    if not _SHORT_FLAG_RE.search(help_result.stdout):
-        missing.append("-p")
+    missing = [f for f in _REQUIRED_FLAGS
+              if not _flag_present(f, help_result.stdout)]
     if missing:
         return None, (f"claude CLI nepodporuje potřebné volby "
                       f"({', '.join(missing)}) - aktualizuj Claude Code "
@@ -1248,7 +1267,7 @@ def _fake_help_result():
     volání."""
     class FakeHelpResult:
         returncode = 0
-        stdout = "-p --model --safe-mode --tools --system-prompt --output-format"
+        stdout = "-p --model --safe-mode --no-session-persistence --tools --system-prompt --output-format"
         stderr = ""
     return FakeHelpResult()
 
@@ -1280,14 +1299,38 @@ def test_claude_cli_preflight_print_alias_does_not_satisfy_dash_p(monkeypatch):
     import subprocess
     class FakeHelpResultPrintOnly:
         returncode = 0
-        stdout = ("--print --model --safe-mode --tools --system-prompt "
-                  "--output-format")
+        stdout = ("--print --model --safe-mode --no-session-persistence "
+                  "--tools --system-prompt --output-format")
         stderr = ""
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeHelpResultPrintOnly())
     claude_cmd, err = main._claude_cli_preflight()
     assert claude_cmd is None
     assert "-p" in err
+
+
+def test_claude_cli_preflight_system_prompt_snapshot_does_not_satisfy_system_prompt(
+        monkeypatch):
+    """Kolo 9 IMPORTANT (plan-consensus) - kolo-7 fix (regex jen pro
+    `-p`) byl neúplný: `"--system-prompt" in stdout` substring kontrola
+    je STEJNĚ chybná pro dlouhé flagy - `claude --help` SKUTEČNĚ
+    obsahuje `--system-prompt-snapshot` (ověřeno přímo), takže CLI, co
+    by mělo JEN `--system-prompt-snapshot` (žádný holý `--system-prompt`),
+    by substring kontrolou falešně prošlo. `--system-prompt-snapshot`
+    se zde objevuje MÍSTO holého `--system-prompt` - preflight musí
+    `--system-prompt` i tak nahlásit jako chybějící."""
+    import subprocess
+    class FakeHelpResultSnapshotOnly:
+        returncode = 0
+        stdout = ("-p --model --safe-mode --no-session-persistence "
+                  "--tools --system-prompt-snapshot --output-format")
+        stderr = ""
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: FakeHelpResultSnapshotOnly())
+    claude_cmd, err = main._claude_cli_preflight()
+    assert claude_cmd is None
+    assert "--system-prompt" in err
 
 
 def test_claude_cli_preflight_unicode_decode_error_returns_error(monkeypatch):
@@ -1314,7 +1357,7 @@ def test_claude_cli_preflight_help_nonzero_exit_returns_error(monkeypatch):
     import subprocess
     class FakeHelpResultFailed:
         returncode = 1
-        stdout = "-p --model --safe-mode --tools --system-prompt --output-format"
+        stdout = "-p --model --safe-mode --no-session-persistence --tools --system-prompt --output-format"
         stderr = "segfault"
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeHelpResultFailed())

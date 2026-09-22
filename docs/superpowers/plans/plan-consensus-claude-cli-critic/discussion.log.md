@@ -102,3 +102,16 @@ pridano encoding + UnicodeError do obou volani preflightu, novy test).
   proti plánu a našel další nesoulad sám (`ClaudeCliClient.__init__`/
   `_client_factory` skeleton chybí `claude_cmd` z kolo-3 fixu) -
   opraveno. Plán samotný beze změny oba nálezy - jen spec dohnán.
+
+## Round 9 — 2026-09-22T07:47:48+0200
+
+- Codex: [round-9-codex.md](round-9-codex.md) — VERDICT: CHANGES_NEEDED
+- Claude: [round-9-claude.md](round-9-claude.md) — VERDICT: CHANGES_NEEDED
+- Summary: dva IMPORTANT, oba ověřeny přímo proti reálnému
+  `claude --help` výstupu. (1) chybějící `--no-session-persistence`
+  flag (session by jinak persistovala celý EN+CZ prompt) - přidán do
+  argv, preflightu, spec, fixtures. (2) substring bug z kola 7 (jen
+  pro `-p`) byl neúplný - stejná kolize existuje i pro dlouhé flagy
+  (`--system-prompt-snapshot` je reálný flag obsahující substring
+  `--system-prompt`) - zobecněno na jednotnou `_flag_present()`
+  hraniční kontrolu pro všechny flagy, přidán regresní test.
