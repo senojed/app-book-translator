@@ -188,3 +188,24 @@ def test_release_lock_deletes_our_own_lock(tmp_path):
     state.acquire_lock(lp)
     state.release_lock(lp)
     assert not __import__("os").path.exists(lp)
+
+
+def test_save_chapter_draft_does_not_change_status_or_translated_text(tmp_path):
+    db = _db(tmp_path)
+    state.seed_chapters(db, [_Ch(1)])
+    state.save_chapter_draft(db, 1, "rozpracovaný text")
+    ch = state.get_chapter(db, 1)
+    assert ch["draft_text"] == "rozpracovaný text"
+    assert ch["draft_updated_at"] is not None
+    assert ch["status"] == "pending"   # beze změny
+    assert ch["translated_text"] is None   # beze změny
+
+
+def test_clear_chapter_draft(tmp_path):
+    db = _db(tmp_path)
+    state.seed_chapters(db, [_Ch(1)])
+    state.save_chapter_draft(db, 1, "koncept")
+    state.clear_chapter_draft(db, 1)
+    ch = state.get_chapter(db, 1)
+    assert ch["draft_text"] is None
+    assert ch["draft_updated_at"] is None

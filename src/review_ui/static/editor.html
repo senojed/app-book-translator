@@ -31,12 +31,21 @@
   #history table { width: 100%; border-collapse: collapse; font-size: .85rem; margin-top: .5rem; }
   #history td, #history th { padding: .3rem .5rem; border-bottom: 1px solid #eee; text-align: left; }
   .stale-msg { color: #b35c00; font-weight: 600; }
+  #draft-banner { background: #fff8e1; border: 1px solid #e0c674; border-radius: 4px;
+                 padding: .5rem .8rem; margin: .5rem 0; font-size: .85rem; display: none; }
+  #draft-banner.show { display: block; }
+  #draft-banner button { margin-left: .5rem; }
 </style>
 </head>
 <body>
 <a class="back" href="/">&larr; Seznam kapitol</a>
 <h1 id="chapter-title">Kapitola</h1>
 <ul id="findings" class="findings"></ul>
+<div id="draft-banner">
+  Máš rozpracovaný koncept (<span id="draft-time"></span>).
+  <button id="btn-load-draft">Načíst koncept</button>
+  <button id="btn-discard-draft">Zahodit koncept</button>
+</div>
 <div class="panes">
   <div class="pane"><h4>Originál EN</h4><pre id="en-pane" class="pane-content"></pre></div>
   <div class="pane"><h4>Aktuální CZ</h4><pre id="cz-pane" class="pane-content"></pre></div>
@@ -47,7 +56,8 @@
   <button id="btn-orig">Vrať na originál</button>
   <button id="btn-codex">Vrať na Codex</button>
   <button id="btn-regen">Znovu polish</button>
-  <button id="btn-save" class="primary">Uložit</button>
+  <button id="btn-save-draft">Uložit koncept</button>
+  <button id="btn-save" class="primary">Uložit a dokončit</button>
 </div>
 <div id="err-box" class="error"></div>
 
@@ -300,6 +310,15 @@ async function loadChapter() {
   document.getElementById('en-pane').textContent = body.raw_text != null ? body.raw_text : '(originál nedostupný)';
   document.getElementById('cz-pane').textContent = body.translated_text;
   document.getElementById('text-area').value = body.translated_text;
+  // Koncept z jiného sezení/počítače (2026-09-23) - nabídni, nepřepisuj
+  // automaticky (uživatel může chtít začít od hotového textu místo).
+  const banner = document.getElementById('draft-banner');
+  if (body.draft_text != null && body.draft_text !== body.translated_text) {
+    document.getElementById('draft-time').textContent = body.draft_updated_at || '?';
+    banner.classList.add('show');
+  } else {
+    banner.classList.remove('show');
+  }
   renderFindings();
   refreshDiff();
   renderHistory(body.history);
@@ -353,6 +372,7 @@ function lockEditor(locked) {
   document.getElementById('text-area').disabled = noEdit;
   document.getElementById('btn-regen').disabled = noEdit;
   document.getElementById('btn-save').disabled = noEdit;
+  document.getElementById('btn-save-draft').disabled = noEdit;
   document.getElementById('btn-orig').disabled = noEdit || CH.cz_before_original === null;
   document.getElementById('btn-codex').disabled = noEdit || CH.styled_by_codex_latest === null;
   // Zaškrtávátka nálezů (kolo 3/4 IMPORTANT) - dynamicky vykreslená
@@ -469,6 +489,46 @@ document.getElementById('btn-save').addEventListener('click', async () => {
     alert('Uložení proběhlo, ale nepodařilo se načíst čerstvý stav. '
          + 'Stránka se teď načte znovu.');
     window.location.reload();
+  }
+});
+
+// --- koncept (2026-09-23) - ukládá se BEZ CAS, beze změny status/
+// translated_text, dostupné z jiného počítače/prohlížeče. Jednodušší
+// než Uložit - žádný reload/CURRENT_FINDINGS merge potřeba, jen banner
+// se skryje (koncept je teď stejný jako to, co je v textarea).
+document.getElementById('btn-save-draft').addEventListener('click', async () => {
+  const errBox = document.getElementById('err-box');
+  errBox.textContent = '';
+  try {
+    const r = await fetch('/api/chapter/' + encodeURIComponent(IDX) + '/draft', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: document.getElementById('text-area').value }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) { errBox.textContent = body.error || `HTTP ${r.status}`; return; }
+    document.getElementById('draft-banner').classList.remove('show');
+  } catch (e) {
+    errBox.textContent = 'Síťová chyba - koncept se možná neuložil, zkus to znovu.';
+  }
+});
+
+document.getElementById('btn-load-draft').addEventListener('click', () => {
+  document.getElementById('text-area').value = CH.draft_text;
+  document.getElementById('draft-banner').classList.remove('show');
+  refreshDiff();
+});
+
+document.getElementById('btn-discard-draft').addEventListener('click', async () => {
+  const errBox = document.getElementById('err-box');
+  errBox.textContent = '';
+  try {
+    const r = await fetch('/api/chapter/' + encodeURIComponent(IDX) + '/draft/discard',
+                          { method: 'POST' });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) { errBox.textContent = body.error || `HTTP ${r.status}`; return; }
+    document.getElementById('draft-banner').classList.remove('show');
+  } catch (e) {
+    errBox.textContent = 'Síťová chyba - koncept se možná nezahodil, zkus to znovu.';
   }
 });
 

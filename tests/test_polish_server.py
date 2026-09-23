@@ -481,6 +481,75 @@ def test_get_chapter_detail_returns_current_text_and_findings(tmp_path):
     assert body["styled_by_codex_latest"] is None
 
 
+def test_get_chapter_detail_includes_draft_fields(tmp_path):
+    app, db, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    body = client.get("/api/chapter/1").json()
+    assert body["draft_text"] is None
+    assert body["draft_updated_at"] is None
+
+
+def test_post_draft_saves_without_changing_status_or_translated_text(tmp_path):
+    app, db, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/draft", json={"text": "rozpracovaný text"})
+    assert r.status_code == 200
+    row = state.get_chapter(db, 1)
+    assert row["draft_text"] == "rozpracovaný text"
+    assert row["status"] == "done"          # beze změny
+    assert row["translated_text"] == "Věta 1."   # beze změny
+
+    body = client.get("/api/chapter/1").json()
+    assert body["draft_text"] == "rozpracovaný text"
+    assert body["draft_updated_at"] is not None
+
+
+def test_post_draft_404_for_missing_chapter(tmp_path):
+    app, db, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/chapter/99/draft", json={"text": "x"})
+    assert r.status_code == 404
+
+
+def test_post_draft_400_on_bad_shape(tmp_path):
+    app, db, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/draft", json={})
+    assert r.status_code == 400
+
+
+def test_post_discard_draft_clears_without_touching_translated_text(tmp_path):
+    app, db, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    client.post("/api/chapter/1/draft", json={"text": "koncept k zahození"})
+    r = client.post("/api/chapter/1/draft/discard")
+    assert r.status_code == 200
+    row = state.get_chapter(db, 1)
+    assert row["draft_text"] is None
+    assert row["translated_text"] == "Věta 1."   # beze změny
+
+
+def test_post_discard_draft_404_for_missing_chapter(tmp_path):
+    app, db, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    r = client.post("/api/chapter/99/draft/discard")
+    assert r.status_code == 404
+
+
+def test_save_chapter_clears_draft_on_finalize(tmp_path):
+    """Uložením "a dokončit" se koncept smaže - je teď součástí
+    translated_text, staré znění by matlo příští otevření."""
+    app, db, history_path, lock_path = _app(tmp_path, chapters=1)
+    client = TestClient(app)
+    client.post("/api/chapter/1/draft", json={"text": "starý koncept"})
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Finální věta.", "findings": []})
+    assert r.status_code == 200
+    row = state.get_chapter(db, 1)
+    assert row["draft_text"] is None
+    assert row["translated_text"] == "Finální věta."
+
+
 def test_get_chapter_detail_404_for_missing_chapter(tmp_path):
     app, db, history_path, lock_path = _app(tmp_path, chapters=1)
     client = TestClient(app)

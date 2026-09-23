@@ -187,6 +187,7 @@ def build_app(db_path: str, history_path: str, lock_path: str) -> FastAPI:
         return {
             "idx": row["idx"], "title": row["title"], "raw_text": row["raw_text"],
             "translated_text": row["translated_text"], "status": row["status"],
+            "draft_text": row["draft_text"], "draft_updated_at": row["draft_updated_at"],
             "findings": notes_findings,
             "cz_before_original": chain_start["cz_before"] if chain_start else None,
             "styled_by_codex_latest": (latest["styled_by_codex"]
@@ -259,6 +260,36 @@ def build_app(db_path: str, history_path: str, lock_path: str) -> FastAPI:
             merged_by_id[fid] = f
         return list(merged_by_id.values())
 
+    @app.post("/api/chapter/{idx}/draft")
+    def post_draft_chapter(idx: int, payload: dict):
+        """Uloží ROZPRACOVANÝ koncept (2026-09-23) - beze změny status/
+        translated_text, dostupné z JINÉHO počítače/prohlížeče (na rozdíl
+        od localStorage). Bez CAS kontroly ("cz_before") záměrně - koncept
+        je nízko-rizikový, poslední zápis vyhrává, na rozdíl od finálního
+        "Uložit a dokončit" (post_save_chapter), co CAS potřebuje."""
+        text = payload.get("text")
+        if not isinstance(text, str):
+            return JSONResponse({"error": "text musí být string"}, status_code=400)
+        row = state.get_chapter(db_path, idx)
+        if row is None:
+            return JSONResponse({"error": "kapitola neexistuje"}, status_code=404)
+        with write_lock:
+            if not app.state.require_lock():
+                return JSONResponse({"error": "zámek ztracen"}, status_code=503)
+            state.save_chapter_draft(db_path, idx, text)
+        return {"ok": True}
+
+    @app.post("/api/chapter/{idx}/draft/discard")
+    def post_discard_draft(idx: int):
+        row = state.get_chapter(db_path, idx)
+        if row is None:
+            return JSONResponse({"error": "kapitola neexistuje"}, status_code=404)
+        with write_lock:
+            if not app.state.require_lock():
+                return JSONResponse({"error": "zámek ztracen"}, status_code=503)
+            state.clear_chapter_draft(db_path, idx)
+        return {"ok": True}
+
     @app.post("/api/chapter/{idx}/save")
     def post_save_chapter(idx: int, payload: dict):
         cz_before = payload.get("cz_before")
@@ -309,6 +340,9 @@ def build_app(db_path: str, history_path: str, lock_path: str) -> FastAPI:
                             "UPDATE chapters SET notes=?, status='done', "
                             "updated_at=CURRENT_TIMESTAMP WHERE idx=?",
                             (json.dumps(light_findings, ensure_ascii=False), idx))
+                    # Finalizace (i beze změny textu) - starý koncept by
+                    # jinak matl příští otevření editoru (2026-09-23).
+                    state.clear_chapter_draft(db_path, idx)
                 except Exception as e:
                     return JSONResponse(
                         {"error": f"Nálezy/stav se nepodařilo uložit "
@@ -339,6 +373,10 @@ def build_app(db_path: str, history_path: str, lock_path: str) -> FastAPI:
                 return JSONResponse(
                     {"error": f"Text NEBYL uložen ({type(e).__name__}: {e}) - "
                               "zkus to znovu."}, status_code=500)
+            # Finalizace - starý koncept by jinak matl příští otevření
+            # editoru (2026-09-23). `_commit_polish_result` už DB commit
+            # dokončil úspěšně, tohle je nezávislý, ne-kritický úklid.
+            state.clear_chapter_draft(db_path, idx)
         return {"ok": True}
 
     @app.post("/api/polish/regenerate")

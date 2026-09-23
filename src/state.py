@@ -12,7 +12,9 @@ CREATE TABLE IF NOT EXISTS chapters (
     status TEXT NOT NULL DEFAULT 'pending',
     revision_rounds INTEGER NOT NULL DEFAULT 0,
     notes TEXT,
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    draft_text TEXT,
+    draft_updated_at TEXT
 );
 CREATE TABLE IF NOT EXISTS glossary (
     term_id TEXT PRIMARY KEY,
@@ -93,11 +95,29 @@ def connect(db_path: str):
         conn.close()
 
 
+def _migrate_chapters_draft_columns(conn) -> None:
+    """PRVNÍ migrace týhle DB (2026-09-23) - `CREATE TABLE IF NOT EXISTS`
+    v `_SCHEMA` samo o sobě existující tabulku o nový sloupec nedoplní
+    (SQLite ho jen tiše ignoruje, tabulka už "existuje"). Bez tyhle
+    migrace by reálná projektová DB (založená PŘED přidáním
+    `draft_text`/`draft_updated_at`) zůstala navždy bez nich - ukládání
+    konceptu (editor.html "Uložit koncept") by spadlo na `sqlite3.
+    OperationalError: no such column`. `PRAGMA table_info` + `ALTER
+    TABLE ADD COLUMN` je bezpečné - nemaže ani nemění existující řádky,
+    jen přidá sloupec s `NULL` výchozí hodnotou."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(chapters)")}
+    if "draft_text" not in cols:
+        conn.execute("ALTER TABLE chapters ADD COLUMN draft_text TEXT")
+    if "draft_updated_at" not in cols:
+        conn.execute("ALTER TABLE chapters ADD COLUMN draft_updated_at TEXT")
+
+
 def init_db(db_path: str) -> None:
     """Vytvoří celé schéma. Idempotentní - lze volat při každém startu."""
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     with connect(db_path) as conn:
         conn.executescript(_SCHEMA)
+        _migrate_chapters_draft_columns(conn)
 
 
 # --- běhy a účtování LLM volání -------------------------------------------
@@ -165,6 +185,28 @@ def get_chapter(db_path: str, idx: int):
     with connect(db_path) as conn:
         r = conn.execute("SELECT * FROM chapters WHERE idx = ?", (idx,)).fetchone()
     return dict(r) if r else None
+
+
+def save_chapter_draft(db_path: str, idx: int, text: str) -> None:
+    """Uloží ROZPRACOVANÝ koncept (editor.html "Uložit koncept",
+    2026-09-23) - NA ROZDÍL od `commit_chapter_result`/`_commit_polish_
+    result` NEMĚNÍ `status` ani `translated_text` - jen `draft_text`,
+    ať se dá dodělat z JINÉHO počítače/prohlížeče (na rozdíl od
+    localStorage varianty, co zůstává jen v jednom prohlížeči)."""
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE chapters SET draft_text=?, draft_updated_at=CURRENT_TIMESTAMP "
+            "WHERE idx=?", (text, idx))
+
+
+def clear_chapter_draft(db_path: str, idx: int) -> None:
+    """Smaže koncept PO finalizaci (uložení jako `done`) - je teď součástí
+    `translated_text`, staré rozpracované znění by jinak matlo příští
+    otevření editoru."""
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE chapters SET draft_text=NULL, draft_updated_at=NULL "
+            "WHERE idx=?", (idx,))
 
 
 def chapters_by_status(db_path: str, statuses: tuple) -> list:
