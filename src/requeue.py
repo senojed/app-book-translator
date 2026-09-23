@@ -29,6 +29,26 @@ def _chapters_from(db_path: str, from_idx) -> list:
             if from_idx is None or ch["idx"] >= from_idx]
 
 
+def preview_affected_chapters(db_path: str, question: dict) -> list:
+    """Kolik/které kapitoly by se přepočítaly, KDYBY se na tuhle otázku
+    odpovědělo jinak než model hádal - STEJNÁ logika jako `apply_answer`'s
+    `requeue_idxs` větev, ale BEZ zápisu (žádná odpověď, žádný glosář
+    zápis, žádné DB update). Pro UI náhled (questions-review, 2026-09-23) -
+    uživatel chce vidět dopad PŘED tím, než se rozhodne odpovědět."""
+    kind = question["kind"]
+    scope_key = question["scope_key"]
+    if kind in ("term", "name"):
+        tid = glossary.resolve_term_or_surface(db_path, scope_key)
+        if not tid:
+            return []   # nový termín - žádné existující zmínky
+        return state.chapters_mentioning_term(db_path, tid)
+    elif kind == "relationship":
+        a, _, b = scope_key.partition("|")
+        return _chapters_with_both_names(db_path, a, b)
+    else:
+        return _chapters_from(db_path, question.get("chapter_idx"))
+
+
 def apply_answer(db_path: str, guide_path: str, qid: int, answer_text: str) -> dict:
     if not answer_text or not answer_text.strip():
         raise ValueError("Prázdná odpověď - napiš, co se má zapsat.")

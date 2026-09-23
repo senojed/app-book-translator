@@ -135,6 +135,16 @@ let PENDING_RESOLVE_PROMISES = new Map();
 // kapitoly bez smysluplného textu.
 const EDITABLE_STATUSES = new Set(['done', 'flagged', 'needs_human', 'error']);
 
+// ZRCADLÍ `_chapter_is_editable` v `polish_server.py` - `pending` je
+// editovatelná JEN když MÁ existující `translated_text` (requeue po
+// odpovědi na otázku text nemaže, jen mění status - ruční oprava přímo
+// tady je platná alternativa k čekání na `run`, 2026-09-23).
+function isChapterEditable(ch) {
+  if (!ch) return false;
+  if (EDITABLE_STATUSES.has(ch.status)) return true;
+  return ch.status === 'pending' && ch.translated_text !== null;
+}
+
 function renderFindings() {
   const root = document.getElementById('findings');
   root.textContent = '';
@@ -339,8 +349,7 @@ function lockEditor(locked) {
   // NEBO `CH` neexistuje NEBO status kapitoly není editovatelný.
   // `translated_text == null` (kolo 5 IMPORTANT) - `status='error'` z
   // `run`u nezaručuje reálný text (první neúspěšný pokus o překlad).
-  const noEdit = locked || !CH || !EDITABLE_STATUSES.has(CH.status)
-                || CH.translated_text === null;
+  const noEdit = locked || !isChapterEditable(CH);
   document.getElementById('text-area').disabled = noEdit;
   document.getElementById('btn-regen').disabled = noEdit;
   document.getElementById('btn-save').disabled = noEdit;

@@ -31,7 +31,13 @@ def build_app(db_path: str, guide_path: str) -> FastAPI:
 
     @app.get("/api/questions")
     def get_questions():
-        return state.unanswered_questions(db_path)
+        # `affected_chapters` (2026-09-23) - náhled dopadu PŘED odpovědí,
+        # ať uživatel vidí, kolik kapitol se přepočítá, dřív než klikne
+        # Uložit. `preview_affected_chapters` NIC nezapisuje.
+        rows = state.unanswered_questions(db_path)
+        for q in rows:
+            q["affected_chapters"] = requeue.preview_affected_chapters(db_path, q)
+        return rows
 
     @app.post("/api/answer")
     def post_answer(payload: dict):

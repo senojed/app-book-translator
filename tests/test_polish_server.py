@@ -551,6 +551,35 @@ def test_save_chapter_persists_findings_and_approves_flagged_without_text_change
     assert history["entries"] == []   # žádná NOVÁ historie položka - text se nezměnil
 
 
+def test_save_chapter_allows_pending_with_existing_translation(tmp_path):
+    """`pending` po odpovědi na otázku (requeue) NEMAŽE `translated_text`
+    (viz `state.commit_answer` - jen mění `status`) - ruční oprava přímo
+    v editoru bez čekání na `run` je platná cesta, pokud text existuje."""
+    app, db, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET status='pending' WHERE idx=1")
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "Věta 1.", "text": "Opravená věta 1.", "findings": []})
+    assert r.status_code == 200
+    row = state.get_chapter(db, 1)
+    assert row["translated_text"] == "Opravená věta 1."
+    assert row["status"] == "done"   # uložením se stav posune, jako u done/flagged
+
+
+def test_save_chapter_409_on_pending_without_translation(tmp_path):
+    """`pending`, co NIKDY nebyla přeložena (translated_text NULL) - není
+    co editovat, stejná 409 cesta jako jiné needitovatelné stavy."""
+    app, db, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute(
+            "UPDATE chapters SET status='pending', translated_text=NULL WHERE idx=1")
+    client = TestClient(app)
+    r = client.post("/api/chapter/1/save", json={
+        "cz_before": "", "text": "X", "findings": []})
+    assert r.status_code == 409
+
+
 def test_save_chapter_409_on_cas_mismatch(tmp_path):
     app, db, history_path, lock_path = _app(tmp_path, chapters=1)
     client = TestClient(app)
@@ -800,16 +829,38 @@ def test_regenerate_404_for_missing_chapter(tmp_path):
     assert r.status_code == 404
 
 
-def test_regenerate_400_for_pending_chapter(tmp_path):
-    """`pending` nemá smysluplný `translated_text` k polishi - `flagged`/
-    `needs_human`/`error` naopak PROJDOU (stejné `_EDITABLE_STATUSES`
-    jako Task 9 save)."""
+def test_regenerate_400_for_pending_chapter_without_translation(tmp_path):
+    """`pending` BEZ existujícího `translated_text` (nikdy nepřeložená) -
+    není co polishovat. `pending` S textem (requeue po odpovědi na otázku,
+    2026-09-23) naopak PROJDE - viz test níž."""
     app, db, history_path, lock_path = _app(tmp_path, chapters=1)
     with state.connect(db) as conn:
-        conn.execute("UPDATE chapters SET status='pending' WHERE idx=1")
+        conn.execute(
+            "UPDATE chapters SET status='pending', translated_text=NULL WHERE idx=1")
     client = TestClient(app)
     r = client.post("/api/polish/regenerate", json={"idx": 1})
     assert r.status_code == 400
+
+
+def test_regenerate_200_for_pending_chapter_with_existing_translation(tmp_path, monkeypatch):
+    """`pending` po requeue (odpověď na otázku) NEMAŽE `translated_text` -
+    regenerace/ruční oprava přímo v editoru je platná cesta bez čekání
+    na `run` (uživatelův požadavek, 2026-09-23)."""
+    app, db, history_path, lock_path = _app(tmp_path, chapters=1)
+    with state.connect(db) as conn:
+        conn.execute("UPDATE chapters SET status='pending' WHERE idx=1")
+    monkeypatch.setattr(config, "DB_PATH", db)
+    monkeypatch.setattr("main._polish_preflight", lambda: ("m", ["codex"], None))
+    def _fake_polish_one_chapter(c, gr, cf, db_, model, codex_cmd, rendered_terms=None):
+        return {"idx": 1, "title": "K1", "cz_before": "Věta 1.",
+               "styled": "Vylepšená věta 1.", "revision_rounds": 0,
+               "reason_types": [], "findings": [], "rendered_terms": [],
+               "draft_id": "d1"}
+    monkeypatch.setattr("main._polish_one_chapter", _fake_polish_one_chapter)
+    client = TestClient(app)
+    r = client.post("/api/polish/regenerate", json={"idx": 1})
+    assert r.status_code == 200
+    assert r.json()["styled"] == "Vylepšená věta 1."
 
 
 def test_regenerate_400_for_error_status_without_translated_text(tmp_path):

@@ -1,6 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
-from src import state
+from src import glossary, state
 from src.review_ui import questions_server
 
 
@@ -37,6 +37,28 @@ def test_get_questions_returns_unanswered_list(tmp_path):
     assert rows[0]["text"] == "Sedí to?"
     assert rows[0]["guess_answer"] == "Chicago"
     assert rows[0]["chapter_idx"] == 2
+    assert rows[0]["affected_chapters"] == []   # nový termín, žádné zmínky zatím
+
+
+def test_get_questions_includes_affected_chapters_for_known_term(tmp_path):
+    db = _db(tmp_path, questions=[
+        {"kind": "term", "text": "Termín se překládá různě: Bob, Bobem "
+         "(kapitoly 2). Který tvar je správný?", "scope_key": "term_bob",
+         "guess_answer": "Bob", "chapter_idx": None},
+    ])
+    with state.connect(db) as conn:
+        conn.execute("INSERT INTO chapters (idx,title,raw_text,status) "
+                     "VALUES (2,'K2','Bob left.','done')")
+    tid = glossary.add_candidate(db, "Bob", "Bob")
+    state.replace_term_mentions(db, 2, [
+        {"term_id": tid, "cz_form": "Bobem", "scene_idx": None, "source": "detected"}])
+    with state.connect(db) as conn:
+        conn.execute("UPDATE questions SET scope_key=? WHERE scope_key='term_bob'", (tid,))
+    guide_path = str(tmp_path / "guide.json")
+    app = questions_server.build_app(db, guide_path)
+    client = TestClient(app)
+    rows = client.get("/api/questions").json()
+    assert rows[0]["affected_chapters"] == [2]
 
 
 def test_post_answer_writes_and_returns_requeue_info(tmp_path):

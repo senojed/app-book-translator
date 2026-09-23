@@ -91,3 +91,27 @@ def test_process_chapter_then_answer_requeues_original_chapter(tmp_path, monkeyp
     out = requeue.apply_answer(db, gp, q["id"], "Fúa")   # jiné než guess
     assert 1 in out["requeued"]
     assert state.get_chapter(db, 1)["status"] == "pending"
+
+
+def test_preview_affected_chapters_for_known_term(tmp_path):
+    """Otázka o existujícím termínu - náhled ukáže kapitoly, co ho zmiňují,
+    BEZ zápisu odpovědi (na rozdíl od apply_answer)."""
+    db, gp, tid = _setup(tmp_path)
+    q = state.get_question(db, state.upsert_open_question(db, {
+        "chapter_idx": 2, "kind": "term", "text": "Bob?", "scope_key": tid,
+        "guess_answer": "Bob", "severity": "guess"}))
+    affected = requeue.preview_affected_chapters(db, q)
+    assert affected == [2]
+    # otázka zůstává nezodpovězená - preview nic nezapisuje
+    assert state.get_question(db, q["id"])["answer"] is None
+
+
+def test_preview_affected_chapters_for_brand_new_term_is_empty(tmp_path):
+    """Nový termín (dosud v glosáři není) nemá žádné existující zmínky -
+    prázdný seznam, ne chyba."""
+    db, gp, tid = _setup(tmp_path)
+    q = state.get_question(db, state.upsert_open_question(db, {
+        "chapter_idx": 1, "kind": "term", "text": "Nový termín?",
+        "scope_key": "Nikdy neviděný povrch", "guess_answer": "X",
+        "severity": "guess"}))
+    assert requeue.preview_affected_chapters(db, q) == []

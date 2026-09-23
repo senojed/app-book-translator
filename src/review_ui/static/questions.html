@@ -15,6 +15,7 @@
   .badge-guess { background: #eef; color: #33c; }
   .badge-blocking { background: #fee; color: #b3261e; }
   .scope { color: #666; font-size: .85rem; }
+  .affected { color: #a66; font-size: .8rem; margin-top: .15rem; }
   input[type=text] { width: 100%; box-sizing: border-box; padding: .3rem .4rem;
                      font-size: .85rem; border: 1px solid #ccc; border-radius: 4px;
                      margin-bottom: .35rem; }
@@ -109,6 +110,13 @@ function renderRow(q) {
     sevBadge,
     el('div', { class: 'scope', text: `${q.kind} / ${scope}` }),
   ]);
+  const affected = q.affected_chapters || [];
+  if (affected.length) {
+    scopeCell.appendChild(el('div', {
+      class: 'affected',
+      text: `zasáhne kapitoly: ${affected.join(', ')}`,
+    }));
+  }
   const textCell = el('td', { text: q.text });
 
   const input = el('input', { type: 'text', value: q.guess_answer || '' });

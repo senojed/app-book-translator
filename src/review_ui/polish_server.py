@@ -196,6 +196,18 @@ def build_app(db_path: str, history_path: str, lock_path: str) -> FastAPI:
 
     _EDITABLE_STATUSES = ("done", "flagged", "needs_human", "error")
 
+    def _chapter_is_editable(row) -> bool:
+        """`pending` je editovatelná JEN když MÁ existující `translated_text`
+        - `state.commit_answer` (requeue po odpovědi na otázku) mění JEN
+        `status`, text nemaže, takže "pending kvůli requeue" má co
+        editovat, ale "pending, co nikdy nebyla přeložena" ne. Ruční
+        oprava přímo v editoru je pak platná alternativa k čekání na
+        `run` - uživatelův požadavek (2026-09-23): "problém přeložím
+        jinak, žádná otázka nezbyde, kapitola nemusí čekat na retranslate"."""
+        if row["status"] in _EDITABLE_STATUSES:
+            return True
+        return row["status"] == "pending" and row["translated_text"] is not None
+
     def _valid_finding_shape(f) -> bool:
         if not isinstance(f, dict):
             return False
@@ -275,7 +287,7 @@ def build_app(db_path: str, history_path: str, lock_path: str) -> FastAPI:
                 return JSONResponse({"error": "zámek ztracen"}, status_code=503)
             row = state.get_chapter(db_path, idx)
             if (row is None or row["translated_text"] != cz_before
-                    or row["status"] not in _EDITABLE_STATUSES):
+                    or not _chapter_is_editable(row)):
                 return JSONResponse(
                     {"error": "kapitola se mezitím změnila mimo tenhle editor, "
                               "nebo nemá stav vhodný k uložení - načti stránku "
@@ -345,7 +357,7 @@ def build_app(db_path: str, history_path: str, lock_path: str) -> FastAPI:
         # (main.py, `_cmd_run`/`pipeline.process_chapter`). `stylist.
         # polish(en, cz, ...)` s `cz=None` by spadlo na typové chybě
         # hluboko uvnitř `_polish_one_chapter`, ne na čitelné 400 tady.
-        if row["status"] not in _EDITABLE_STATUSES or row["translated_text"] is None:
+        if not _chapter_is_editable(row) or row["translated_text"] is None:
             return JSONResponse(
                 {"error": f"kapitola má status {row['status']!r} bez použitelného "
                           "textu, nelze polishovat"}, status_code=400)
