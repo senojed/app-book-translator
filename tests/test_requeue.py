@@ -115,3 +115,36 @@ def test_preview_affected_chapters_for_brand_new_term_is_empty(tmp_path):
         "scope_key": "Nikdy neviděný povrch", "guess_answer": "X",
         "severity": "guess"}))
     assert requeue.preview_affected_chapters(db, q) == []
+
+
+def test_questions_for_chapter_includes_own_chapter_scoped(tmp_path):
+    """Kapitolová otázka (chapter_idx=X) se ukáže v editoru TÝHLE
+    kapitoly, i když dosud nemá žádné zmínky jinde (nový termín)."""
+    db, gp, tid = _setup(tmp_path)
+    qid = state.upsert_open_question(db, {"chapter_idx": 1, "kind": "term",
+        "text": "Sedí to?", "scope_key": "Nový povrch", "guess_answer": "X",
+        "severity": "guess"})
+    result = requeue.questions_for_chapter(db, 1)
+    assert [q["id"] for q in result] == [qid]
+    assert requeue.questions_for_chapter(db, 2) == []
+
+
+def test_questions_for_chapter_includes_multi_chapter_drift(tmp_path):
+    """Globální drift otázka (chapter_idx=None) se ukáže VE VŠECH
+    kapitolách, co termín zmiňujou - ne jen v jedné."""
+    db, gp, tid = _setup(tmp_path)
+    qid = state.upsert_open_question(db, {"chapter_idx": None, "kind": "term",
+        "text": "Drift?", "scope_key": tid, "guess_answer": "Bob",
+        "severity": "guess"})
+    result_ch2 = requeue.questions_for_chapter(db, 2)   # Bob zmíněn v kap. 2
+    assert [q["id"] for q in result_ch2] == [qid]
+    assert requeue.questions_for_chapter(db, 1) == []   # Bob v kap. 1 NENÍ zmíněn
+
+
+def test_questions_for_chapter_includes_affected_chapters_field(tmp_path):
+    db, gp, tid = _setup(tmp_path)
+    state.upsert_open_question(db, {"chapter_idx": None, "kind": "term",
+        "text": "Drift?", "scope_key": tid, "guess_answer": "Bob",
+        "severity": "guess"})
+    result = requeue.questions_for_chapter(db, 2)
+    assert result[0]["affected_chapters"] == [2]

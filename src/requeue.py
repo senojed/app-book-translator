@@ -49,6 +49,29 @@ def preview_affected_chapters(db_path: str, question: dict) -> list:
         return _chapters_from(db_path, question.get("chapter_idx"))
 
 
+def questions_for_chapter(db_path: str, idx: int) -> list:
+    """Otevřené otázky RELEVANTNÍ pro tuhle kapitolu - buď je přímo
+    kapitolová (`chapter_idx == idx`, typicky "nový termín, sedí
+    odhad?"), NEBO je globální/víc-kapitolová a `idx` je mezi jejími
+    `preview_affected_chapters` (drift napříč knihou). Pro editor.html
+    (2026-09-23) - "chci vidět otázky s kontextem EN/CZ týhle kapitoly",
+    ne slepý seznam na samostatné stránce. Každá otázka dostane navíc
+    `affected_chapters` (stejné pole jako `questions_server.py`'s GET
+    /api/questions), ať editor ukáže "tahle otázka se týká i kapitol
+    X, Y" i uvnitř jedné konkrétní kapitoly."""
+    result = []
+    for q in state.unanswered_questions(db_path):
+        if q.get("chapter_idx") == idx:
+            q["affected_chapters"] = preview_affected_chapters(db_path, q)
+            result.append(q)
+            continue
+        affected = preview_affected_chapters(db_path, q)
+        if idx in affected:
+            q["affected_chapters"] = affected
+            result.append(q)
+    return result
+
+
 def apply_answer(db_path: str, guide_path: str, qid: int, answer_text: str) -> dict:
     if not answer_text or not answer_text.strip():
         raise ValueError("Prázdná odpověď - napiš, co se má zapsat.")

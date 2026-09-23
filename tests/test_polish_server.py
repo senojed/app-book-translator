@@ -28,8 +28,12 @@ def _app(tmp_path, chapters=1):
     db = _db(tmp_path, chapters)
     history_path = str(tmp_path / "polish.history.json")
     lock_path = str(tmp_path / ".lock")
+    guide_path = str(tmp_path / "guide.json")
+    from src import guide as guide_mod
+    guide_mod.save_guide(guide_path, {"characters": [], "places": [], "terms": [],
+                                      "relationships": [], "style": "", "rules": []})
     state.acquire_lock(lock_path)
-    app = polish_server.build_app(db, history_path, lock_path)
+    app = polish_server.build_app(db, history_path, lock_path, guide_path=guide_path)
     _LIVE_APPS.append(app)
     return app, db, history_path, lock_path
 
@@ -479,6 +483,46 @@ def test_get_chapter_detail_returns_current_text_and_findings(tmp_path):
     assert body["translated_text"] == "Věta 1."
     assert body["cz_before_original"] is None    # žádná historie zatím
     assert body["styled_by_codex_latest"] is None
+
+
+def test_get_chapter_detail_includes_open_questions(tmp_path):
+    """Otázky vázané na tuhle kapitolu (i drift, co ji zasahuje mezi
+    jinými) se ukážou přímo v odpovědi GET /api/chapter/{idx} - editor
+    je má rovnou s EN/CZ kontextem (2026-09-23 sloučení)."""
+    app, db, history_path, lock_path = _app(tmp_path, chapters=1)
+    state.upsert_open_question(db, {"chapter_idx": 1, "kind": "term",
+        "text": "Sedí to?", "scope_key": "Nový povrch", "guess_answer": "X",
+        "severity": "guess"})
+    client = TestClient(app)
+    body = client.get("/api/chapter/1").json()
+    assert len(body["open_questions"]) == 1
+    assert body["open_questions"][0]["text"] == "Sedí to?"
+    assert body["open_questions"][0]["affected_chapters"] == []
+
+
+def test_post_answer_on_polish_server_writes_and_requeues(tmp_path):
+    app, db, history_path, lock_path = _app(tmp_path, chapters=2)
+    from src import glossary as glossary_mod
+    tid = glossary_mod.add_candidate(db, "Bob", "Bob")
+    state.replace_term_mentions(db, 2, [
+        {"term_id": tid, "cz_form": "Bobem", "scene_idx": None, "source": "detected"}])
+    qid = state.upsert_open_question(db, {"chapter_idx": 2, "kind": "term",
+        "text": "Bob?", "scope_key": tid, "guess_answer": "Bob", "severity": "guess"})
+    client = TestClient(app)
+    r = client.post("/api/answer", json={"qid": qid, "text": "Robert"})
+    assert r.status_code == 200
+    assert 2 in r.json()["requeued"]
+    assert state.get_chapter(db, 2)["status"] == "pending"
+
+
+def test_post_dismiss_on_polish_server(tmp_path):
+    app, db, history_path, lock_path = _app(tmp_path, chapters=1)
+    qid = state.upsert_open_question(db, {"chapter_idx": 1, "kind": "term",
+        "text": "Šum?", "scope_key": "x", "guess_answer": "x", "severity": "guess"})
+    client = TestClient(app)
+    r = client.post("/api/dismiss", json={"qid": qid, "note": "šum"})
+    assert r.status_code == 200
+    assert state.get_question(db, qid)["answer"] is not None
 
 
 def test_get_chapter_detail_includes_draft_fields(tmp_path):

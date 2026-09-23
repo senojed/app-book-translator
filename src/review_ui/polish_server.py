@@ -11,7 +11,8 @@ import webbrowser
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 
-from src import concordance, findings, findings_report, glossary, polish_store, state
+from src import (concordance, findings, findings_report, glossary, polish_store,
+                requeue, state)
 
 _STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -77,7 +78,8 @@ def _annotate_history(db_path: str, full_entries: list, rows: list) -> list:
     return out
 
 
-def build_app(db_path: str, history_path: str, lock_path: str) -> FastAPI:
+def build_app(db_path: str, history_path: str, lock_path: str, *,
+             guide_path: "str | None" = None) -> FastAPI:
     app = FastAPI(title="Book translator - polish review")
     write_lock = threading.Lock()          # kolo 2 - serializuje HTTP requesty
     # Preflight validace historie PŘI STARTU (kolo 2 plán-ping-pongu
@@ -188,6 +190,7 @@ def build_app(db_path: str, history_path: str, lock_path: str) -> FastAPI:
             "idx": row["idx"], "title": row["title"], "raw_text": row["raw_text"],
             "translated_text": row["translated_text"], "status": row["status"],
             "draft_text": row["draft_text"], "draft_updated_at": row["draft_updated_at"],
+            "open_questions": requeue.questions_for_chapter(db_path, idx),
             "findings": notes_findings,
             "cz_before_original": chain_start["cz_before"] if chain_start else None,
             "styled_by_codex_latest": (latest["styled_by_codex"]
@@ -259,6 +262,33 @@ def build_app(db_path: str, history_path: str, lock_path: str) -> FastAPI:
                 f["resolved"] = current_by_id[fid].get("resolved", f.get("resolved"))
             merged_by_id[fid] = f
         return list(merged_by_id.values())
+
+    @app.post("/api/answer")
+    def post_answer(payload: dict):
+        """Odpověď na otázku PŘÍMO z editoru kapitoly (2026-09-23
+        sloučení) - stejný mechanismus jako `questions_server.py`'s
+        vlastní `/api/answer` (`requeue.apply_answer`). Editor po
+        úspěchu volá `loadChapter()` znovu - pokud odpověď requeuovala
+        i tuhle kapitolu (byla mezi zasaženými), `status` se v novém
+        GET projeví jako `pending`, textarea zůstane editovatelná
+        (`_chapter_is_editable`), žádná ztráta rozepsané práce."""
+        qid = payload.get("qid")
+        text = payload.get("text") or ""
+        try:
+            out = requeue.apply_answer(db_path, guide_path, qid, text)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        return out
+
+    @app.post("/api/dismiss")
+    def post_dismiss(payload: dict):
+        qid = payload.get("qid")
+        note = payload.get("note") or ""
+        try:
+            state.dismiss_question(db_path, qid, note)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        return {"ok": True}
 
     @app.post("/api/chapter/{idx}/draft")
     def post_draft_chapter(idx: int, payload: dict):
@@ -704,12 +734,12 @@ def build_app(db_path: str, history_path: str, lock_path: str) -> FastAPI:
 
 
 def run_polish_review_server(db_path: str, history_path: str,
-                             lock_path: str, *, host: str = "127.0.0.1",
-                             port: int = 8766) -> int:
+                             lock_path: str, *, guide_path: "str | None" = None,
+                             host: str = "127.0.0.1", port: int = 8766) -> int:
     """Vrací VŽDY 0 - žádný CLI krok po `polish-review` nezávisí na tom,
     jestli něco bylo rozhodnuto (spec)."""
     import uvicorn
-    app = build_app(db_path, history_path, lock_path)
+    app = build_app(db_path, history_path, lock_path, guide_path=guide_path)
     # CELÝ setup PO `build_app()` (včetně `uvicorn.Server`/`Config`
     # konstrukce) je uvnitř `try/finally` (kolo 14 plán-ping-pongu
     # IMPORTANT - dřív `uvicorn.Server(uvicorn.Config(...))` běželo PŘED

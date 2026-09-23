@@ -35,6 +35,30 @@
                  padding: .5rem .8rem; margin: .5rem 0; font-size: .85rem; display: none; }
   #draft-banner.show { display: block; }
   #draft-banner button { margin-left: .5rem; }
+  #open-questions { margin: .8rem 0; }
+  #open-questions h3 { font-size: .9rem; margin: 0 0 .4rem; }
+  .q-row { border: 1px solid #eee; border-radius: 4px; padding: .5rem .7rem;
+          margin-bottom: .5rem; font-size: .85rem; }
+  .q-row.done { opacity: .4; }
+  .q-row.discuss { background: #fff8e1; }
+  .q-badge { display: inline-block; padding: .1rem .5rem; border-radius: 3px;
+            font-size: .7rem; font-weight: 600; margin-right: .3rem; }
+  .q-badge-guess { background: #eef; color: #33c; }
+  .q-badge-blocking { background: #fee; color: #b3261e; }
+  .q-scope { color: #666; font-size: .8rem; }
+  .q-affected { color: #a66; font-size: .75rem; }
+  .q-text { margin: .3rem 0; }
+  .q-input { width: 100%; box-sizing: border-box; padding: .3rem .4rem;
+            font-size: .85rem; border: 1px solid #ccc; border-radius: 4px;
+            margin-bottom: .3rem; }
+  .q-chips { margin-bottom: .3rem; }
+  .q-chip { background: #f0f0ee; border-color: #ddd; font-size: .78rem;
+           padding: .1rem .5rem; margin-right: .25rem; }
+  .q-chip.active { background: #1a6b3c; color: #fff; border-color: #1a6b3c; }
+  .q-actions button { font-size: .78rem; padding: .25rem .55rem; }
+  .q-msg { font-size: .78rem; margin-top: .2rem; }
+  .q-msg.error { color: #b3261e; }
+  .q-msg.ok { color: #1a6b3c; }
 </style>
 </head>
 <body>
@@ -46,6 +70,7 @@
   <button id="btn-load-draft">Načíst koncept</button>
   <button id="btn-discard-draft">Zahodit koncept</button>
 </div>
+<div id="open-questions"></div>
 <div class="panes">
   <div class="pane"><h4>Originál EN</h4><pre id="en-pane" class="pane-content"></pre></div>
   <div class="pane"><h4>Aktuální CZ</h4><pre id="cz-pane" class="pane-content"></pre></div>
@@ -74,6 +99,147 @@ function el(tag, opts, children) {
   }
   for (const c of children || []) e.appendChild(c);
   return e;
+}
+
+// --- otevřené otázky (2026-09-23 sloučení) - stejná logika jako
+// questions.html, jen zjednodušená a napojená na loadChapter() reload
+// po odpovědi (ať se okamžitě projeví, kdyby odpověď requeuovala i
+// TUHLE kapitolu - viz `isChapterEditable`/`_chapter_is_editable`).
+const Q_DISCUSS_KEY = 'bt-questions-discuss';
+function loadQDiscussSet() {
+  try { return new Set(JSON.parse(localStorage.getItem(Q_DISCUSS_KEY) || '[]')); }
+  catch (e) { return new Set(); }
+}
+function saveQDiscussSet(set) {
+  try { localStorage.setItem(Q_DISCUSS_KEY, JSON.stringify([...set])); } catch (e) {}
+}
+const qDiscussSet = loadQDiscussSet();
+
+function isConfirmQuestion(text) { return /sedí to\?\s*$/i.test(text.trim()); }
+function parseDriftForms(text) {
+  const m = text.match(/různě:\s*(.+?)\s*\(kapitoly/i);
+  return m ? m[1].split(',').map(s => s.trim()).filter(Boolean) : null;
+}
+
+function renderQuestionRow(q) {
+  const scope = q.chapter_idx != null ? `kapitola ${q.chapter_idx}` : 'globální';
+  const row = el('div', { class: 'q-row', 'data-qid': q.id });
+  if (qDiscussSet.has(q.id)) row.classList.add('discuss');
+  row.appendChild(el('span', {
+    class: 'q-badge ' + (q.severity === 'blocking' ? 'q-badge-blocking' : 'q-badge-guess'),
+    text: q.severity,
+  }));
+  row.appendChild(el('span', { class: 'q-scope', text: `${q.kind} / ${scope}` }));
+  const affected = q.affected_chapters || [];
+  if (affected.length) {
+    row.appendChild(el('div', { class: 'q-affected',
+      text: `zasáhne kapitoly: ${affected.join(', ')}` }));
+  }
+  row.appendChild(el('div', { class: 'q-text', text: q.text }));
+
+  const input = el('input', { type: 'text', class: 'q-input', value: q.guess_answer || '' });
+  const driftForms = parseDriftForms(q.text);
+  if (driftForms && driftForms.length > 1) {
+    const selected = new Set();
+    const chipsWrap = el('div', { class: 'q-chips' });
+    const chipEls = [];
+    function syncInput() { input.value = driftForms.filter(f => selected.has(f)).join(' | '); }
+    for (const form of driftForms) {
+      const chip = el('button', { class: 'q-chip', text: form });
+      chip.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        if (selected.has(form)) { selected.delete(form); chip.classList.remove('active'); }
+        else { selected.add(form); chip.classList.add('active'); }
+        syncInput();
+      });
+      chipEls.push(chip);
+      chipsWrap.appendChild(chip);
+    }
+    const allBtn = el('button', { class: 'q-chip', text: 'Vše správně' });
+    allBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      driftForms.forEach(f => selected.add(f));
+      chipEls.forEach(c => c.classList.add('active'));
+      syncInput();
+    });
+    chipsWrap.appendChild(allBtn);
+    row.appendChild(chipsWrap);
+  }
+  row.appendChild(input);
+
+  const msg = el('div', { class: 'q-msg' });
+  const actions = el('div', { class: 'q-actions' });
+
+  async function submitAnswer(text) {
+    msg.textContent = ''; msg.className = 'q-msg';
+    let r, body;
+    try {
+      r = await fetch('/api/answer', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ qid: q.id, text }),
+      });
+      body = await r.json();
+    } catch (e) {
+      msg.textContent = 'Chyba spojení - zkus znovu.'; msg.classList.add('error'); return;
+    }
+    if (!r.ok) {
+      msg.textContent = body.error || 'Nepodařilo se uložit.'; msg.classList.add('error'); return;
+    }
+    // Reload CELÉ kapitoly - pokud odpověď requeuovala i tuhle (byla
+    // mezi zasaženými), status/otázky/textarea se hned zaktualizují,
+    // žádné tiché přehození za zády uživatele.
+    await loadChapter();
+  }
+
+  const hasConfirm = isConfirmQuestion(q.text) && !!q.guess_answer;
+  if (hasConfirm) {
+    const yesBtn = el('button', { class: 'primary', text: '✓ Ano' });
+    yesBtn.addEventListener('click', () => submitAnswer(q.guess_answer));
+    actions.appendChild(yesBtn);
+  }
+  const saveBtn = el('button', { class: hasConfirm ? 'ghost' : 'primary', text: 'Uložit' });
+  saveBtn.addEventListener('click', () => submitAnswer(input.value));
+  actions.appendChild(saveBtn);
+
+  const dismissBtn = el('button', { text: 'Zahodit (šum)' });
+  dismissBtn.addEventListener('click', async () => {
+    msg.textContent = ''; msg.className = 'q-msg';
+    let r, body;
+    try {
+      r = await fetch('/api/dismiss', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ qid: q.id, note: 'ruční zahození z editoru' }),
+      });
+      body = await r.json();
+    } catch (e) {
+      msg.textContent = 'Chyba spojení - zkus znovu.'; msg.classList.add('error'); return;
+    }
+    if (!r.ok) {
+      msg.textContent = body.error || 'Nepodařilo se zahodit.'; msg.classList.add('error'); return;
+    }
+    await loadChapter();
+  });
+  actions.appendChild(dismissBtn);
+
+  const discussBtn = el('button', { text: 'K diskuzi' });
+  discussBtn.addEventListener('click', () => {
+    if (qDiscussSet.has(q.id)) { qDiscussSet.delete(q.id); row.classList.remove('discuss'); }
+    else { qDiscussSet.add(q.id); row.classList.add('discuss'); }
+    saveQDiscussSet(qDiscussSet);
+  });
+  actions.appendChild(discussBtn);
+
+  row.appendChild(actions);
+  row.appendChild(msg);
+  return row;
+}
+
+function renderOpenQuestions(list) {
+  const root = document.getElementById('open-questions');
+  root.textContent = '';
+  if (!list || !list.length) return;
+  root.appendChild(el('h3', { text: `Otevřené otázky (${list.length})` }));
+  for (const q of list) root.appendChild(renderQuestionRow(q));
 }
 
 const DIFF_TOKEN_CAP = 6000;
@@ -320,6 +486,7 @@ async function loadChapter() {
     banner.classList.remove('show');
   }
   renderFindings();
+  renderOpenQuestions(body.open_questions);
   refreshDiff();
   renderHistory(body.history);
   lockEditor(false);   // odemkne text-area/btn-regen/btn-save + btn-orig/

@@ -1058,7 +1058,8 @@ def _cmd_polish_review(args) -> int:
     # ne holý traceback.
     try:
         return polish_server.run_polish_review_server(
-            config.DB_PATH, config.POLISH_HISTORY_PATH, config.LOCK_PATH)
+            config.DB_PATH, config.POLISH_HISTORY_PATH, config.LOCK_PATH,
+            guide_path=config.GUIDE_PATH)
     except (polish_store.PolishStoreError, OSError, TimeoutError) as e:
         _say(f"polish-review se nepodařilo spustit ({type(e).__name__}: {e}) - "
              f"zkontroluj {config.POLISH_HISTORY_PATH} a DB ({config.DB_PATH}), "
