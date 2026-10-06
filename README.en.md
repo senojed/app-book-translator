@@ -15,10 +15,21 @@ Before a first real run, go through [`docs/pilot-checklist.md`](docs/pilot-check
 
 ```bash
 pip install -e ".[dev]"
+```
+
+Python 3.11+. You also need these CLIs installed and logged in:
+
+- `claude` (Claude Code) - critic and optionally the translator (`--translator claude-cli`), runs on a subscription
+- `codex` (OpenAI Codex CLI) - the `polish` style pass, runs on a subscription
+
+Two parts still call the paid Anthropic API and need a key: the `scan` phase
+(scout) and the meaning check `stylist_check` inside `polish`.
+
+```bash
 export ANTHROPIC_API_KEY=sk-...        # Windows PowerShell: $env:ANTHROPIC_API_KEY="sk-..."
 ```
 
-Python 3.11+.
+Keep the key in `.env` (gitignored), never commit it.
 
 ## Run phases
 
@@ -29,6 +40,10 @@ python tools/check_draft.py                   # sanity-check the draft (report-o
 python main.py reference --dir "<path to references>"   # mine terminology
 python main.py review             # web UI: confirm/edit the guide -> data/guide.json
 python main.py run                # translation loop over chapters
+python main.py run --translator claude-cli   # same via the Claude Code subscription, not the API
+python main.py polish             # style pass via Codex over finished chapters
+python main.py polish-review      # web UI: manual review of the style pass, apply/revert per chapter
+python main.py questions-review   # web UI: answer open questions
 python main.py questions          # questions raised during the run
 python main.py answer 7 "White Council"   # answer -> glossary/rule + recompute chapters
 python main.py status             # chapter status overview
@@ -37,6 +52,8 @@ python main.py export             # finished chapters -> output/book_cz.txt
 
 Useful variants:
 
+- `run --only 1 2 3` - translates only the chosen chapters (pilot), the rest stays queued
+- `polish --only IDX... [--force]` - styles only the chosen finished chapters, `--force` overwrites an earlier style pass
 - `init book.epub --reset` - discards existing book state and loads a new one
 - `scan --chunked` - when the book doesn't fit into a single scout call
 - `run --retry-flagged [IDX...]` - returns flagged chapters to the queue (resets review rounds)
@@ -82,8 +99,9 @@ are one transaction. The guide (`guide.json`) is a file - a human edits it via t
 
 ## Money
 
-Every call is logged into the `llm_calls` table (tokens + cost). A cost guard
-estimates the price before each call; if `MAX_SPEND_USD` is exceeded, `run`
+Every call is logged into the `llm_calls` table (tokens + cost). Calls through the
+`claude` CLI and `codex` cost 0 (subscription). A cost guard
+estimates the price before each API call; if `MAX_SPEND_USD` is exceeded, `run`
 asks for a new cap, `scan` stops hard.
 
 ```sql

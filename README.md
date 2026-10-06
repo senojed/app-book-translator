@@ -15,10 +15,21 @@ Před prvním reálným během projdi [`docs/pilot-checklist.md`](docs/pilot-che
 
 ```bash
 pip install -e ".[dev]"
+```
+
+Python 3.11+. Potřebuješ nainstalované a přihlášené CLI nástroje:
+
+- `claude` (Claude Code) - kritik a volitelně překladatel (`--translator claude-cli`), běží na předplatném
+- `codex` (OpenAI Codex CLI) - stylistický průchod `polish`, běží na předplatném
+
+Dvě části zatím volají placené Anthropic API a vyžadují klíč:
+fáze `scan` (scout) a kontrola významu `stylist_check` v `polish`.
+
+```bash
 export ANTHROPIC_API_KEY=sk-...        # Windows PowerShell: $env:ANTHROPIC_API_KEY="sk-..."
 ```
 
-Python 3.11+.
+Klíč patří do `.env` (je v `.gitignore`), nikdy ho necommituj.
 
 ## Fáze běhu
 
@@ -29,6 +40,10 @@ python tools/check_draft.py                   # zkontroluj draft (report-only)
 python main.py reference --dir "<cesta k referencím>"   # vytěž terminologii
 python main.py review             # web UI: potvrdíš/upravíš návod → data/guide.json
 python main.py run                # překladová smyčka přes kapitoly
+python main.py run --translator claude-cli   # totéž přes předplatné Claude Code, ne API
+python main.py polish             # stylistický průchod přes Codex nad hotovými kapitolami
+python main.py polish-review      # web UI: ruční review stylizace, apply/revert po kapitolách
+python main.py questions-review   # web UI: odpovídání na otevřené otázky
 python main.py questions          # otázky nadhozené během běhu
 python main.py answer 7 "Bílá rada"   # odpověď → glosář/pravidlo + přepočet kapitol
 python main.py status             # přehled stavu kapitol
@@ -37,6 +52,8 @@ python main.py export             # hotové kapitoly → output/kniha_cz.txt
 
 Užitečné varianty:
 
+- `run --only 1 2 3` - přeloží jen vybrané kapitoly (pilot), zbytek zůstane ve frontě
+- `polish --only IDX... [--force]` - stylizuje jen vybrané hotové kapitoly, `--force` přepíše dřívější stylizaci
 - `init kniha.epub --reset` - zahodí dosavadní stav knihy a nahraje novou
 - `scan --chunked` - když se kniha nevejde do jednoho volání scouta
 - `run --retry-flagged [IDX...]` - vrátí označené kapitoly do fronty (vynuluje kola revize)
@@ -81,8 +98,9 @@ jedna transakce. Návod (`guide.json`) je soubor - edituje ho člověk přes rev
 
 ## Peníze
 
-Každé volání se zapisuje do tabulky `llm_calls` (tokeny + cena). Cost guard
-před každým voláním odhadne cenu; při překročení `MAX_SPEND_USD` se `run`
+Každé volání se zapisuje do tabulky `llm_calls` (tokeny + cena). Volání přes
+`claude` CLI a `codex` mají cenu 0 (běží na předplatném). Cost guard
+před každým API voláním odhadne cenu; při překročení `MAX_SPEND_USD` se `run`
 zeptá na nový strop, `scan` tvrdě zastaví.
 
 ```sql
